@@ -1,595 +1,295 @@
 # Turb GPT Free Register
 
-ChatGPT / OpenAI 账号自动注册与 Codex OAuth 授权工具。当前项目支持三套注册驱动：
+ChatGPT / OpenAI 账号注册与 Codex OAuth 授权工具。项目提供本地 Web 管理服务和 CLI 两种入口，注册驱动、邮箱来源和浏览器自动化实现均以独立模块组织；运行时业务数据统一保存在 SQLite。
 
-- **protocol**：原纯协议注册，基于 `curl_cffi` + Sentinel/PoW。
-- **roxy**：RoxyBrowser 指纹浏览器 + Selenium 自动化注册，兼容新版页面流，例如 `create-account/password`、`about-you` 年龄/生日表单、地区本地化页面等。
-- **cloak**：CloakBrowser + Playwright 适配层自动化注册，支持免费 binary、无头模式、humanize、固定 fingerprint seed、代理 geoip。
-- **browser_use**：Browser Use Cloud stealth Chromium + Playwright（可选住宅代理，无需本机安装 Roxy）。
-- **skyvern**：Skyvern Browser Sessions 云端浏览器 + Playwright CDP。
+> 本项目仅适用于你拥有合法授权的测试、研发和自动化场景。使用前请确认符合目标服务的服务条款、当地法律和第三方服务商的使用政策。
 
-项目提供 **CLI** 和 **本地 WebUI** 两种使用方式。日常推荐使用 WebUI。
+## 1. 项目简介
 
-> 项目说明：本项目基于 [xiaoguzuiniu/gpt-free-register](https://github.com/xiaoguzuiniu/gpt-free-register) 进行改造与扩展。
+### 1.1 项目定位
 
----
+项目解决的是一套本地注册任务的编排问题：准备邮箱素材，选择注册驱动，执行邮箱/手机验证，保存账号状态，并按需继续完成 Codex OAuth。管理服务和注册执行服务相互独立：
 
-## 功能概览
+- **Web 管理服务**：Flask 后端位于 `apps/web/`，负责鉴权、任务编排、配置编辑和 API；React/Vite 前端位于 `web/`。
+- **注册模拟服务**：注册用例位于 `registration/application/`，浏览器和协议适配器位于 `registration/drivers/`，可单独替换或扩展。
+- **基础业务模块**：`core/` 提供邮箱、短信、OAuth、浏览器客户端和业务数据访问能力。
+- **唯一运行时数据源**：`data/turb_gpt.sqlite3` 保存账号、邮箱池、任务、凭证、日志和批次归档。
 
-### 注册
+项目基于 [xiaoguzuiniu/gpt-free-register](https://github.com/xiaoguzuiniu/gpt-free-register) 改造，并已将历史 JSON/TXT/日志镜像收敛到 SQLite。历史文件仍可作为一次性导入输入，但正常运行不会在项目目录生成散落数据文件。
 
-- 批量注册 ChatGPT 账号。
-- 支持注册驱动切换：
-  - `REGISTRATION_DRIVER = "protocol"`
-  - `REGISTRATION_DRIVER = "roxy"`
-  - `REGISTRATION_DRIVER = "cloak"`
-  - `REGISTRATION_DRIVER = "browser_use"`
-  - `REGISTRATION_DRIVER = "skyvern"`
-- 支持 RoxyBrowser 一号一环境：自动创建、打开、关闭、删除 Roxy Profile。
-- 支持 Roxy 无头启动：`ROXY_OPEN_HEADLESS=True`。
-- 支持 CloakBrowser：免费 binary、无头模式、humanize、固定 fingerprint seed、按出口 IP 自动匹配语言/时区/WebRTC。
-- Roxy / Cloak 浏览器注册已兼容：
-  - 填邮箱后直接进入邮箱验证码页；
-  - 填邮箱后先进入 `create-account/password`，自动设置密码再继续；
-  - `about-you/profile` 页面直接输入年龄数字；
-  - `about-you/profile` 页面输入年月日生日；
-  - React Aria birthday select / spinbutton 年月日控件；
-  - 不同出口 IP / 不同页面语言下按钮顺序变化导致的三方登录误点问题。
+### 1.2 运行入口
 
-### 邮箱来源
+| 入口 | 适用场景 | 启动命令 |
+|---|---|---|
+| WebUI | 日常配置、批量任务、账号和日志管理 | `./webui.sh start` |
+| CLI | 自动化脚本、无界面批量任务 | `python main.py` |
+| Codex 补跑 | 对已注册账号单独重试 OAuth | `python scripts/operations/codex_oauth.py ...` |
 
-支持多种邮箱来源：
+生产 WebUI 只使用 `http://127.0.0.1:5000` 一个监听器。开发前端使用 Vite 的 `5173` 端口，并将 API 代理到 `5000`。
 
-- Outlook 邮箱池：`email----password----clientId----refreshToken`
-- Cloudflare 域名邮箱 + QQ 邮箱 IMAP 收信（`cloudflare_domain`）
-- Cloudflare Worker 临时邮箱：自动创建 + JWT 取码（`cloudflare`，兼容 cloudflare_temp_email）
-- 通用 API 邮箱：`email----取码地址`
-- GPTMail 临时邮箱 API：运行时随机生成邮箱并自动收取验证码
-- `EMAIL_SOURCE` 支持多个来源组合，例如：
+## 2. 功能概览
 
-```python
-EMAIL_SOURCE = "outlook,generic_api"
-```
+### 2.1 注册驱动
 
-- MailNest-迈巢：Outlook 临时邮箱
+注册驱动通过 `config/roxybrowser.py` 的 `REGISTRATION_DRIVER` 选择，当前支持五种实现：
 
-### Codex OAuth
+| 驱动 | 说明 | 典型依赖 |
+|---|---|---|
+| `protocol` | `curl_cffi` 协议流程，结合 Sentinel/PoW | 代理、协议客户端 |
+| `roxy` | RoxyBrowser 指纹浏览器 + Selenium | 本机 RoxyBrowser API |
+| `cloak` | CloakBrowser + Playwright 适配层 | Cloak binary，支持免费版 |
+| `browser_use` | Browser Use Cloud stealth Chromium | `BROWSER_USE_API_KEY` |
+| `skyvern` | Skyvern Browser Sessions 云端浏览器 | `SKYVERN_API_KEY` |
 
-- 注册成功后可自动跑 Codex OAuth。
-- Codex 授权驱动可选：
-  - `CODEX_OAUTH_DRIVER = "protocol"`
-  - `CODEX_OAUTH_DRIVER = "roxy"`
-  - `CODEX_OAUTH_DRIVER = "cloak"`
-  - `CODEX_OAUTH_DRIVER = "browser_use"`
-  - `CODEX_OAUTH_DRIVER = "same_as_registration"`
-- 支持 CPA 管理接口生成授权 URL，并提交 OAuth callback。
-- 支持接码平台：
-  - GrizzlySMS
-  - 本地 L 取号服务，见 `L_API.md`
-- 手机验证支持自动取号、填号、收码、提交、失败换号重试。
-- Codex 凭证写入 `data/turb_gpt.sqlite3` 的 `codex_credentials` 文件集合。
+浏览器驱动通过 `registration/drivers/registry.py` 注册，业务用例不直接依赖某个浏览器实现。这样可以为不同环境切换驱动，也可以在不改动 WebUI 和任务服务的情况下添加新驱动。
 
-### WebUI
+### 2.2 邮箱与验证码
 
-- 批量启动注册任务。
-- 实时查看任务日志。
-- 动态调整注册线程数，提交后新任务立即使用最新值。
-- 批量补跑 Codex，补跑线程数每次提交即时生效。
-- 管理账号、邮箱池、Codex 凭证；账号页支持复制全部/选中整行，邮箱池列表展示导入时间、已用时间和状态。
-- 配置页支持热加载，保存后无需重启。
-- Roxy 团队/项目可在配置页获取并保存。
+`config/email.py` 中的 `EMAIL_SOURCE` 支持多个来源组合：
 
----
+- **Outlook**：素材格式为 `email----password----clientId----refreshToken`。
+- **通用 API**：素材格式为 `email----code_url`。
+- **GPTMail**：运行时创建临时邮箱并通过 API 取码。
+- **Cloudflare Worker**：使用 Worker API 创建地址并轮询验证码，标识为 `cloudflare`。
+- **Cloudflare 域名邮箱**：本地生成地址，通过 QQ IMAP 收信，标识为 `cloudflare_domain`。
+- **MailNest / CloudMail**：按对应服务的 API 配置获取临时邮箱。
 
-## 环境要求
+邮箱素材可以从 WebUI 导入，也可以显式指定历史文本作为一次性导入入口。导入后，邮箱池正文存储在 SQLite，不依赖根目录文本文件持续运行。
 
-- Python 3.10+
-- Node.js 18+
-- 可用代理、系统代理/VPN，或 RoxyBrowser 代理环境
-- 如使用 Roxy 注册：需要本机 RoxyBrowser API 可访问
-- 如使用 Cloak 注册：首次运行会自动下载 Cloak Chromium binary；`CLOAK_GEOIP=True` 需要 `cloakbrowser[geoip]` 依赖
-- 如启用 Codex 自动授权：需要接码平台配置
+### 2.3 Codex OAuth 与接码
 
-安装依赖：
+- 注册完成后可选自动执行 Codex OAuth：`ENABLE_CODEX_AUTO = True`。
+- 授权驱动支持 `protocol`、`roxy`、`cloak`、`browser_use`、`skyvern` 和 `same_as_registration`。
+- 支持 CPA 管理接口或本地 PKCE 授权地址。
+- 手机验证支持 GrizzlySMS、本地 L 服务和 H 服务，可执行取号、发送、收码、提交和失败重试。
+- Codex 凭证、授权回执和重试日志写入 SQLite 的 `codex_credentials`、`codex_retry_logs` 等文件类别。
 
-```bash
-pip install -r requirements.txt
-node --version
-```
+### 2.4 WebUI 管理能力
 
-### 密钥配置（.env）
+React WebUI 由 Flask 在生产环境提供，主要页面包括：
 
-重要 API Key 请放在项目根目录 `.env`，不要写进 `config/*.py`。
+- **注册**：设置数量和线程，启动任务并查看实时日志。
+- **账号**：查看状态、备注、套餐、查活、归档、批量删除和敏感信息复制。
+- **Codex 授权**：查看、下载、删除 SQLite 中的凭证，并执行补跑。
+- **邮箱池**：按来源和状态筛选，导入、标记可用/已用/失败和删除。
+- **配置**：编辑邮箱、浏览器、代理、Codex、短信和人工节奏配置，并热加载常用设置。
+- **Relay**：管理接码账号、手机号、任务、Sub2API 同步和状态检查。
+
+### 2.5 数据与安全特性
+
+- SQLite 是运行时唯一事实来源，数据库文件默认位于 `data/turb_gpt.sqlite3`，权限按 `0600` 处理。
+- 项目不再生成 `accounts/`、`codex_accounts/`、`logs/`、`run/`、`注册日志/` 或 `codex_接码日志/` 等旧物理目录。
+- WebUI 列表接口默认不返回完整 token、TOTP secret 等敏感字段，下载或复制时按需读取。
+- `.env`、数据库、凭证和运行时文件均被 `.gitignore` 排除，禁止提交到仓库。
+
+## 3. 使用指南
+
+### 3.1 环境准备
+
+要求：
+
+- Python 3.10 或更高版本。
+- Node.js 18 或更高版本（仅前端开发/构建需要）。
+- 可用的网络出口和代理；使用云端浏览器时还需要对应服务的 API Key。
+- 使用 RoxyBrowser 时，本机 Roxy API 必须可访问。
+
+安装 Python 依赖并创建本地配置：
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate       # Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 cp .env.example .env
-# 编辑 .env，例如：
-# BROWSER_USE_API_KEY=...
-# ROXY_API_TOKEN=...
 ```
 
-当前支持从 `.env` 读取的密钥：
+不要把真实密钥写入 `config/*.py`、README、Issue 或提交记录。优先将密钥放入根目录 `.env`；WebUI 配置页保存密钥时也会写入 `.env`。
 
-- `WEBUI_AUTH_CODE`（WebUI 登录授权码）
-- `WEBUI_SESSION_SECRET`（可选，Session Cookie 签名密钥）
-- `BROWSER_USE_API_KEY`
-- `SKYVERN_API_KEY`
-- `ROXY_API_TOKEN`
-- `QQ_IMAP_PASSWORD`
-- `CLOUDFLARE_API_KEY` / `CLOUDFLARE_CUSTOM_AUTH`（`EMAIL_SOURCE=cloudflare` 时）
-- `CPA_MANAGEMENT_KEY`
-- `SMS_API_KEY`
-- `L_ADMIN_AUTH_CODE`
-- `H_ADMIN_AUTH_CODE`
-
-WebUI 配置页保存这些字段时会写入 `.env`（不是 config 源码）。
-
----
-
-## 快速开始
-
-### WebUI 授权码
-
-WebUI 启动后，除 `/login` 外所有页面和 `/api/*` 接口都会校验授权码。推荐在 `.env` 中配置：
+常用 `.env` 字段包括：
 
 ```dotenv
-WEBUI_AUTH_CODE=你的授权码
+WEBUI_AUTH_CODE=设置一个本地授权码
+WEBUI_SESSION_SECRET=可选的固定 session 密钥
+BROWSER_USE_API_KEY=可选
+SKYVERN_API_KEY=可选
+ROXY_API_TOKEN=可选
+CPA_MANAGEMENT_KEY=可选
+SMS_API_KEY=可选
 ```
 
-也可以启动时直接传入：
+### 3.2 配置邮箱来源
 
-```bash
-python web.py --auth-code 你的授权码
-```
-
-优先级：`--auth-code` > `.env`/环境变量。若都未设置，启动时会在日志中生成并打印本次临时授权码。接口调用可使用登录后的 Cookie，或传 `X-Auth-Code: <授权码>` / `Authorization: Bearer <授权码>`。
-
-`WEBUI_SESSION_SECRET` 可选；未设置时会从固定授权码派生稳定的 Session 签名密钥，修改授权码后已有登录会自动失效。
-
-### 1. 配置邮箱源
-
-#### Outlook 邮箱池
-
-复制示例文件：
+推荐使用 WebUI「邮箱池」页面导入素材。也可以复制示例文件后再导入：
 
 ```bash
 cp 用于注册的邮箱.txt.example 用于注册的邮箱.txt
 ```
 
-每行格式：
+Outlook 素材示例：
 
 ```text
-email----password----clientId----refreshToken
+email@example.com----mail-password----client-id----refresh-token
 ```
 
-也可以在 WebUI 的「邮箱池」页面导入。
-
-#### 通用 API 邮箱
-
-每行格式：
+通用 API 素材示例：
 
 ```text
-email----code_url
+email@example.com----https://mail.example.com/code?id=...
 ```
 
-在 `config/email.py` 设置：
-
-```python
-EMAIL_SOURCE = "generic_api"
-```
-
-或使用组合来源：
+在 `config/email.py` 选择来源，例如：
 
 ```python
 EMAIL_SOURCE = "outlook,generic_api,mailnest"
 ```
 
-#### GPTMail 临时邮箱
+GPTMail、Cloudflare、Cloudflare 域名邮箱、MailNest 和 CloudMail 的密钥、地址、项目代码等字段可在 WebUI 配置页填写；字段说明也可直接查看 `config/email.py` 和 `.env.example`。
 
-在 WebUI 的「配置 → 邮箱 / OTP」填写 `GPTMail API Key`，然后将邮箱来源设置为：
+### 3.3 选择注册驱动
 
-```python
-EMAIL_SOURCE = "gptmail"
-```
-
-也可以在项目根目录 `.env` 中填写：
-
-```dotenv
-GPTMAIL_API_KEY=你的_GPTMail_API_Key
-```
-
-服务地址固定为 `https://mail.chatgpt.org.uk`。未填写 Key 时，任务会提示填写 `GPTMail API Key`，不会使用公共测试 Key。
-
-#### Cloudflare Worker 临时邮箱（`cloudflare`）
-
-兼容 `cloudflare_temp_email` 类 Worker：注册时自动创建域名邮箱，并用 JWT 轮询收件箱提取 OpenAI 六位验证码。
-（与下方 `cloudflare_domain` / QQ IMAP 方案不同，请勿混用标识。）
-
-```dotenv
-EMAIL_SOURCE=cloudflare
-CLOUDFLARE_API_BASE=https://你的-worker-api-域名
-CLOUDFLARE_API_KEY=你的_ADMIN_PASSWORD
-CLOUDFLARE_AUTH_MODE=x-admin-auth
-# admin 创建时常用：
-# CLOUDFLARE_PATH_ACCOUNTS=/admin/new_address
-CLOUDFLARE_DEFAULT_DOMAINS=你的收信域名.com
-```
-
-匿名模式可将 `CLOUDFLARE_AUTH_MODE=none` 且 Key 留空，创建路径默认 `/api/new_address`；若被 Turnstile 拦截请改用 admin 模式。更多字段见 WebUI「配置 → 邮箱 / OTP」或 `.env.example`。
-
-#### Cloudflare 域名邮箱（`cloudflare_domain`）
-
-在 `config/email.py` 设置：
+最小配置示例：
 
 ```python
-EMAIL_SOURCE = "cloudflare_domain"
-EMAIL_DOMAIN = "你的域名"
-QQ_EMAIL = "你的QQ邮箱"
-QQ_IMAP_PASSWORD = "QQ邮箱IMAP授权码"
+# config/roxybrowser.py
+REGISTRATION_DRIVER = "protocol"
 ```
 
-Cloudflare Email Routing 需要把域名邮件转发到 QQ 邮箱。此模式不调用 Worker 创建接口，仅本地生成地址并通过 QQ IMAP 取件。
-
-#### MailNest-迈巢 Outlook 临时邮箱
-
-可直接在 Web-UI 中配置 API Key 与项目代码`MAIL_NEST_PROJECT_CODE`，也可以在配置文件中配置。
-
-- `api-key`获取页面：https://mailnest.top/account
-- 项目代码获取页面：https://mailnest.top/buy-email。默认为`chatgpt001`，可以直接使用
-
----
-
-### 2. 配置注册驱动
-
-编辑 `config/roxybrowser.py`，或直接在 WebUI「配置」页修改。
-
-#### 使用 RoxyBrowser 注册
+RoxyBrowser：
 
 ```python
-REGISTRATION_DRIVER = "roxy"  # 可选 protocol / roxy / cloak
+REGISTRATION_DRIVER = "roxy"
 ROXY_API_BASE = "http://127.0.0.1:50100"
-ROXY_API_TOKEN = "你的Roxy API Key"
-ROXY_WORKSPACE_ID = "你的workspaceId"
-ROXY_PROJECT_ID = "你的projectId"
+ROXY_API_TOKEN = "你的 Roxy API Key"
+ROXY_WORKSPACE_ID = "你的 workspaceId"
+ROXY_PROJECT_ID = "你的 projectId"
 ROXY_ONE_PROFILE_PER_ACCOUNT = True
 ROXY_DELETE_PROFILE_AFTER_RUN = True
-ROXY_CREATE_USE_PROXY_POOL = True
+ROXY_OPEN_HEADLESS = False
 ```
 
-如要无头：
-
-```python
-ROXY_OPEN_HEADLESS = True
-```
-
-
-#### 使用 CloakBrowser 注册
-
-如需改用 CloakBrowser，先安装依赖：
-
-```bash
-pip install -r requirements.txt
-```
-
-然后在 `config/roxybrowser.py` 或 WebUI 配置页把注册驱动改为：
+CloakBrowser：
 
 ```python
 REGISTRATION_DRIVER = "cloak"
 ```
 
-再在 `config/codex.py` 或 WebUI「CPA / Codex」分组设置 Codex 授权驱动：
+其无头、代理、GeoIP、语言、时区和 fingerprint seed 配置位于 `config/cloakbrowser.py`。使用 Browser Use Cloud 或 Skyvern 时，分别设置：
 
 ```python
-CODEX_OAUTH_DRIVER = "same_as_registration"  # 跟随注册驱动
-# 或单独指定："protocol" / "roxy" / "cloak" / "browser_use"
+REGISTRATION_DRIVER = "browser_use"  # 或 "skyvern"
 ```
 
-CloakBrowser 专用配置在 `config/cloakbrowser.py`：
+并在 `.env` 设置对应 API Key。Browser Use 默认通过远端 CDP 连接；Skyvern 使用 Browser Sessions。详细字段以 `config/browser_use.py`、`config/skyvern.py` 为准。
 
-```python
-CLOAK_HEADLESS = False          # True=无头；False=显示窗口
-CLOAK_HUMANIZE = True           # 人工鼠标/键盘/滚动行为
-CLOAK_GEOIP = True              # 按当前出口 IP 自动匹配语言/时区/WebRTC
-CLOAK_LOCALE = ""               # 留空自动；也可强制如 ja-JP / en-US
-CLOAK_TIMEZONE = ""             # 留空自动；也可强制如 Asia/Tokyo
-CLOAK_LICENSE_KEY = ""          # 留空使用免费 binary；填 Pro key 使用最新版
-CLOAK_FINGERPRINT_SEED = ""     # 留空每次随机；固定值=固定指纹
-CLOAK_USER_DATA_DIR = ""        # 留空临时环境；填路径可持久化 profile
-```
+### 3.4 配置代理和 Codex
 
-说明：
-
-- `CLOAK_GEOIP=True` 会按当前出口 IP 自动生成 `locale / timezone / Accept-Language`，并传给 CloakBrowser 与 Playwright context。
-- 如果你通过项目代理池使用代理，请在 `config/proxy.py` 的 `PROXY_POOL` 填写代理；如果你使用系统代理/VPN，也会按当前实际出口 IP 自动定位。
-- 免费版没有在项目侧限制窗口数；本项目每个注册任务会启动一个 CloakBrowser 实例，即一个实例一套指纹。
-- WebUI 中，`Codex授权驱动` 位于「CPA / Codex」分组，对应 `config/codex.py` 的 `CODEX_OAUTH_DRIVER`。
-
-#### 使用协议注册
-
-```python
-REGISTRATION_DRIVER = "protocol"
-```
-
-协议注册会使用 `curl_cffi`、Sentinel/PoW、代理池等配置。
-
-#### 使用 Browser Use Cloud 注册
-
-```python
-REGISTRATION_DRIVER = "browser_use"
-```
-
-并在 `config/browser_use.py` 或 WebUI「配置 → Browser Use」填写：
-
-```python
-BROWSER_USE_API_KEY = "你的 Browser Use API Key"
-BROWSER_USE_PROXY_COUNTRY_CODE = "jp"   # 可选：us/sg/de...
-BROWSER_USE_USE_PROXY = True
-BROWSER_USE_FAST_MODE = True       # 推荐开启：减少 Browser Use 额外等待
-BROWSER_USE_LOG_TIMING = True      # 输出阶段耗时日志，方便定位慢点
-BROWSER_USE_SESSION_TIMEOUT = 240  # Browser Use keepAlive/timeout，单位分钟；创建远端浏览器时保持活跃更久
-```
-
-如希望注册成功后也用 Browser Use 自动跑 Codex OAuth：
-
-```python
-ENABLE_CODEX_AUTO = True
-CODEX_OAUTH_DRIVER = "browser_use"
-# 或 CODEX_OAUTH_DRIVER = "same_as_registration"，当 REGISTRATION_DRIVER="browser_use" 时自动跟随
-```
-
-依赖：
-
-```bash
-uv pip install playwright --python .venv/bin/python
-# 或
-pip install playwright
-```
-
-说明：
-
-- Browser Use 走远端 stealth Chromium，通过 Playwright `connect_over_cdp` 控制。
-- `BROWSER_USE_SESSION_TIMEOUT=240` 会在 Browser Use 创建/连接远端浏览器时设置较长 keepAlive（connect URL 的 `timeout` 参数，单位分钟），避免等待邮箱 OTP、短信或 callback 时云端会话提前回收；代码会限制到 `1~240`。
-- 如果第一次进入邮箱验证码页且邮箱里实际已有验证码，但程序没取到，通常是 Outlook 取件链路抖动：Graph TLS/REST/IMAP 某一轮失败、短轮询切片过短、或 `after_ts` 过滤边界过紧。Browser Use 驱动已放宽 Outlook 单轮取件切片、提前记录验证码过滤时间，并会在等待邮箱 OTP 超时后尝试点击重发继续等待；重发入口使用 DOM 结构/位置/属性启发式定位，不依赖页面文案或 OCR/文字识别。可在「邮箱 / OTP」把 `OTP_MAX_WAIT` 调大到 `180~240`，`OUTLOOK_FETCH_MODE` 优先用 `auto`。
-- Outlook 取件日志会显示验证码来源：`source=graph`、`source=outlook_rest`、`source=imap_new`、`source=imap_entra_outlook`、`source=remote_graph` 或 `source=remote_imap`，便于判断是哪条链路成功取码。
-- `BROWSER_USE_FAST_MODE=True` 会跳过大部分人工节奏等待；`BROWSER_USE_LOG_TIMING=True` 会打印连接、打开页面、邮箱、OTP、手机、callback 等阶段耗时。
-- 支持作为 Codex OAuth 授权驱动：`CODEX_OAUTH_DRIVER="browser_use"`，可完成授权页面、邮箱 OTP、手机短信验证与 callback 捕获。
-- 适合不想安装本机 Roxy、又想要 session 隔离 + 云端代理的场景。
-- 免费额度/并发以 Browser Use 官方定价页为准。
-
----
-
-### 3. 配置代理
-
-编辑 `config/proxy.py`：
+代理池在 `config/proxy.py`：
 
 ```python
 PROXY_POOL = [
-    "http://user:pass@host:port",
+    "http://user:password@host:port",
 ]
 ```
 
-Roxy 一号一环境开启 `ROXY_CREATE_USE_PROXY_POOL=True` 时，会从这里随机取代理写入 Roxy Profile。
-
----
-
-### 4. 配置 Codex OAuth
-
-如不需要 Codex，关闭：
+不需要 Codex 时保持默认关闭：
 
 ```python
+# config/codex.py
 ENABLE_CODEX_AUTO = False
 ```
 
-如需要自动授权：
+需要自动授权时：
 
 ```python
 ENABLE_CODEX_AUTO = True
-# config/codex.py
-CODEX_OAUTH_DRIVER = "browser_use"  # 可选 protocol / roxy / cloak / browser_use / skyvern / same_as_registration
-```
-
-接码配置在 `config/codex.py`：
-
-```python
-SMS_PROVIDER = "l"        # 可选 grizzly / l / h
-SMS_API_KEY = "你的 GrizzlySMS key"  # 仅 GrizzlySMS 需要
+CODEX_OAUTH_DRIVER = "same_as_registration"
+SMS_PROVIDER = "l"       # grizzly / l / h
 SMS_SERVICE = "openai"
 SMS_COUNTRY = "国家代码"
 SMS_MAX_RETRIES = 10
 SMS_CODE_WAIT = 120
-SMS_POLL_INTERVAL = 5
-
-# 若 SMS_PROVIDER="h"，H 固定复用：
-#   SMS_SERVICE -> H projectId
-#   SMS_COUNTRY -> H country
-H_API_BASE = "http://localhost:8788"
-H_ADMIN_AUTH_CODE = "你的H后台授权码"
 ```
 
-CPA 授权地址来源：
+如果使用 CPA：
 
 ```python
 CODEX_AUTH_URL_SOURCE = "cpa"
-CPA_MANAGEMENT_URL = "你的CPA管理地址"
-CPA_MANAGEMENT_KEY = "你的CPA管理密钥"
+CPA_MANAGEMENT_URL = "https://你的-cpa-地址"
+CPA_MANAGEMENT_KEY = "你的 CPA 管理密钥"
 ```
 
----
+短信服务的地址和鉴权字段见 `config/codex.py` 与 [L_API.md](L_API.md)。
 
-## 使用方式
+### 3.5 启动 WebUI
 
-## WebUI 推荐方式
-
-推荐使用项目根目录单脚本后台管理：
+推荐使用根目录管理脚本：
 
 ```bash
-./webui.sh start      # 启动
-./webui.sh stop       # 关闭
-./webui.sh restart    # 重启
-./webui.sh status     # 状态
-./webui.sh logs       # 查看实时日志
+./webui.sh start
+./webui.sh status
+./webui.sh logs
+./webui.sh restart
+./webui.sh stop
 ```
 
-脚本固定启动 `http://127.0.0.1:5000`；PID 文件位于 `data/runtime/`，日志正文写入 SQLite。
+服务固定监听：<http://127.0.0.1:5000>。同一工作区只允许一个 WebUI 进程，不能通过参数改成其他端口。
 
-可通过环境变量调整授权码和是否自动打开浏览器；地址和端口不可修改：
+可选环境变量：
 
 ```bash
 OPEN_BROWSER=1 ./webui.sh start
 AUTH_CODE=你的授权码 ./webui.sh start
+VERBOSE=1 ./webui.sh start
 ```
 
-也可以直接前台启动：
-
-启动：
+也可以前台启动：
 
 ```bash
 python web.py --open-browser
 ```
 
-默认地址：
+前台启动同样使用 `127.0.0.1:5000`。启动前请先执行 `./webui.sh status`，避免多个进程同时读写同一份数据。
 
-```text
-http://127.0.0.1:5000
-```
+### 3.6 使用 CLI
 
-WebUI 页面说明：
-
-| 页面 | 功能 |
-|---|---|
-| 注册 | 设置注册数量、线程数，启动批量注册，查看任务和日志 |
-| 账号 | 查看账号、复制 token、补跑 Codex、批量删除账号 |
-| Codex 授权 | 查看/下载/删除 SQLite 中的 Codex 凭证 |
-| 邮箱池 | 导入邮箱、筛选来源、标记可用/失败、删除邮箱 |
-| 配置 | 修改运行配置并热加载，含 Roxy、Codex、邮箱、代理、人工节奏等 |
-
-### 线程数说明
-
-- 注册线程数在每次点击「开始注册」时读取。
-- 如果线程数和上次不同，新提交任务会使用新线程池。
-- 旧线程池里已经排队/运行的任务会继续跑完，不会被强制取消。
-- Codex 批量补跑每次都会按本次提交的补跑线程数创建独立线程池。
-
----
-
-## CLI 使用方式
-
-注册 1 个：
+注册一个账号：
 
 ```bash
 python main.py
 ```
 
-批量注册 10 个，3 线程：
+批量注册 10 个账号、3 个并发线程，并在单个失败后继续：
 
 ```bash
 python main.py -n 10 --workers 3 --continue-on-fail
 ```
 
-详细日志：
+查看详细日志：
 
 ```bash
 python main.py -n 1 --verbose
 ```
 
-参数：
+常用参数：
 
-| 参数 | 说明 | 默认 |
+| 参数 | 说明 | 默认值 |
 |---|---|---|
-| `-n, --count` | 注册数量 | 1 |
-| `--workers` | 并发线程数 | 1 |
-| `--delay` | 每次注册结束后的间隔秒数 | 0 |
-| `--continue-on-fail` | 单个失败后继续 | False |
-| `--verbose` | DEBUG 日志 | False |
+| `-n, --count` | 注册数量 | `1` |
+| `--workers` | 并发线程数 | `1` |
+| `--delay` | 注册之间的间隔秒数 | `0` |
+| `--continue-on-fail` | 失败后继续 | 关闭 |
+| `--verbose` | 输出详细日志和错误堆栈 | 关闭 |
 
----
+CLI 批次归档也写入 SQLite；返回的 `accounts/...` 路径是稳定的逻辑键，不代表项目中会创建同名目录。
 
-## Codex 补跑
+### 3.7 Codex 补跑、查活和数据读取
 
-WebUI 账号页可单个或批量补跑 Codex。
-
-CLI 单独补跑：
+对已注册账号单独补跑 Codex：
 
 ```bash
 python scripts/operations/codex_oauth.py --email <已注册邮箱> --verbose
 ```
 
-补跑会消耗：
-
-- 1 次邮箱 OTP
-- 1 个接码号码
-
-补跑日志保存在 SQLite 的 `codex_retry_logs` 文件集合中，WebUI 会按需读取。
-
----
-
-## 注册密码说明
-
-Roxy 注册如果遇到新版流程：
-
-```text
-/create-account/password
-```
-
-会自动设置密码。
-
-密码来源：
-
-1. 优先使用 `config/register.py`：
-
-```python
-REGISTER_PASSWORD = "你的固定密码"
-```
-
-2. 如果为空，自动生成 14 位强密码，包含大写、小写、数字、符号。
-
-保存位置：
-
-- 账号 `extra_json.registration_password`
-- 批次归档记录保存在 SQLite 的 `batch_archives` 集合中，字段为 `extra.registration_password`
-
-注意：账号表里的 `password` 字段仍用于 Outlook 邮箱素材密码，不会被 OpenAI 注册密码覆盖。
-
----
-
-## 重要配置文件
-
-| 文件 | 说明 |
-|---|---|
-| `config/roxybrowser.py` | 注册驱动、Roxy API、Roxy 环境生命周期 |
-| `config/cloakbrowser.py` | CloakBrowser 无头/humanize/geoip/语言时区/指纹 seed |
-| `config/codex.py` | Codex OAuth、授权驱动、CPA 管理接口、接码平台 |
-| `config/email.py` | 邮箱来源、OTP 轮询、QQ IMAP、域名邮箱、Cloudflare Worker 临时邮箱 |
-| `config/proxy.py` | 代理池 |
-| `config/register.py` | 默认邮箱、密码、显示名 |
-| `config/twofa.py` | 2FA 开关 |
-| `config/humanize.py` | 随机停顿/人工节奏 |
-| `config/flow_trigger.py` | 注册成功后触发 Flow |
-| `config/browser.py` | 协议模式浏览器指纹 |
-| `config/openai_protocol.py` | OpenAI OAuth/Sentinel 参数 |
-
-WebUI 配置页保存后会调用热加载；Roxy、Codex、邮箱、代理、人工节奏等常用项可立即生效。
-
----
-
-## 数据与产物
-
-| 路径 | 内容 |
-|---|---|
-| `data/turb_gpt.sqlite3` | 唯一运行时数据源：账号、邮箱池、任务、凭证、日志和批次归档 |
-| `data/runtime/` | WebUI 进程 PID；进程日志正文存于 SQLite，日志文件名只作为逻辑键 |
-
-### SQLite 存储
-
-运行时数据唯一存储在 `data/turb_gpt.sqlite3`。启动时只会对仍存在的历史 JSON/TXT/凭证/日志执行一次性幂等导入；之后生产代码只读写 SQLite，不创建旧目录或散落 JSON/TXT/HTML。需要文件时通过 WebUI 下载接口或显式导出工具生成，导出文件由调用方自行指定位置。
-
-可以用 `TURB_SQLITE_PATH` 指定数据库位置：
-
-```bash
-TURB_SQLITE_PATH=/path/to/turb_gpt.sqlite3 ./webui.sh start
-```
-
-直接读取数据库（不需要启动 WebUI）：
+无需启动 WebUI，也可以只读查询 SQLite：
 
 ```bash
 sqlite3 data/turb_gpt.sqlite3 '.tables'
@@ -597,7 +297,7 @@ sqlite3 data/turb_gpt.sqlite3 'select id, email, status from v_registered_accoun
 sqlite3 data/turb_gpt.sqlite3 'select collection, count(*) from storage_items group by collection;'
 ```
 
-Python 调用也可复用同一个连接：
+Python 读取示例：
 
 ```python
 from core.sqlite_store import connect
@@ -608,182 +308,123 @@ with connect() as conn:
     ).fetchall()
 ```
 
-`config/*.py`、`.env` 等配置文件仍由配置编辑器维护；根目录的 `.example` 文件只是模板。命令行显式指定的 TXT/JSON 只作为外部导入入口，不是运行时主数据源。
+可以用 `TURB_SQLITE_PATH=/path/to/turb_gpt.sqlite3` 指定数据库位置。导出账号、token 或凭证时，使用 WebUI 下载接口或显式导出工具，并由调用方指定目标路径；不要把导出文件放回仓库根目录。
 
-批次归档通过 `storage_files.category = 'batch_archives'` 保存，文件名仅作为 SQLite 中的逻辑键。
+### 3.8 常见问题
 
----
+**配置保存后没有生效？** 通过 WebUI 保存的常用字段会热加载；直接修改 `config/*.py` 后需要重启 CLI 或 WebUI。
 
-## 当前主流程
+**没有接码平台能否注册？** 可以，将 `ENABLE_CODEX_AUTO` 设为 `False`。接码只用于 Codex 手机验证，不影响主注册流程。
 
-### Roxy 注册流程
+**Codex 失败但注册成功怎么办？** 账号会保留并标记 Codex 失败，可在 WebUI 账号页补跑，或执行上面的 Codex CLI 命令。
 
-```text
-创建/打开 Roxy Profile
-  ↓
-打开 chatgpt.com/auth/login
-  ↓
-按 DOM 技术属性定位邮箱输入框，避免误点 Google/Apple/Microsoft
-  ↓
-提交邮箱表单
-  ↓
-如进入 create-account/password：设置密码并提交
-  ↓
-等待邮箱验证码页
-  ↓
-读取邮箱 OTP 并提交
-  ↓
-如进入 about-you/profile：填写姓名 + 年龄或生日
-  ↓
-进入 ChatGPT，读取 /api/auth/session accessToken
-  ↓
-可选 2FA
-  ↓
-可选 Codex OAuth
-  ↓
-保存账号与批次归档
-  ↓
-关闭/删除 Roxy Profile
-```
+**Roxy 无头模式仍弹出窗口？** 检查 `ROXY_OPEN_HEADLESS = True`，并确认本机 RoxyBrowser 版本支持对应 API 参数。
 
-### Codex Roxy 授权流程
+**Cloudflare Worker 和域名邮箱有什么区别？** `cloudflare` 使用 Worker API 创建地址并取码；`cloudflare_domain` 使用域名转发到 QQ IMAP，二者配置和收信链路不同，不能混用。
 
-```text
-获取 Codex 授权地址（CPA 或 local PKCE）
-  ↓
-Roxy 打开授权页
-  ↓
-邮箱登录 + 邮箱 OTP
-  ↓
-手机号验证：取号 → 填号 → 发送 → 等短信 → 填 OTP
-  ↓
-等待 consent/workspace/callback
-  ↓
-提交 callback 给 CPA 或本地换 token
-  ↓
-保存到 SQLite 的 `codex_credentials` 集合
-```
+## 4. 开发指南
 
----
-
-## 常见问题
-
-### 配置保存后没生效？
-
-WebUI 配置页保存后会热加载。Codex 补跑线程启动前也会重新热加载一次配置。
-
-如果你直接手改 `config/*.py`，CLI 进程需要重启；WebUI 建议在配置页修改。
-
-### Roxy 无头保存后仍弹窗口？
-
-检查：
-
-```python
-ROXY_OPEN_HEADLESS = True
-```
-
-并确认 Roxy 版本支持 `/browser/open` 的 `headless` 参数。日志会打印实际传入的 `headless`。
-
-### 出口 IP 不是日本时点到 Google 登录？
-
-当前 Roxy 注册邮箱入口已改为只按 DOM 技术属性定位，并排除三方登录按钮。不会再靠按钮文字匹配“Continue”。
-
-### Codex 显示 `Check your phone` 被误判失败？
-
-已兼容：`Check your phone / Enter the verification code...` 会识别为手机验证码页，进入等待短信验证码流程。
-
-### 手机 OTP 提交后日志曾显示失败，但后面成功？
-
-已修复：提交手机 OTP 后会等待页面离开手机号流程或 callback，不再 3 秒后用旧页面文案误判失败。
-
-### Codex 失败但注册成功怎么办？
-
-账号会保存，Codex 状态会标记失败。可以在 WebUI 账号页点击补跑，或使用：
-
-```bash
-python scripts/operations/codex_oauth.py --email <邮箱> --verbose
-```
-
-### Cloudflare Worker 邮箱怎么配？
-
-将 `EMAIL_SOURCE` 设为 `cloudflare`，并配置 `CLOUDFLARE_API_BASE` 等（见上文「Cloudflare Worker 临时邮箱」）。
-注意与 `cloudflare_domain`（QQ IMAP 转发）不是同一来源。
-
-### 没有接码平台能注册吗？
-
-可以。关闭：
-
-```python
-ENABLE_CODEX_AUTO = False
-```
-
-注册主流程不依赖接码，Codex 自动授权才需要。
-
----
-
-## 项目结构
+### 4.1 工程结构
 
 ```text
 .
-├── main.py                         # CLI 兼容入口（实现位于 apps/cli）
-├── web.py                          # Web 管理服务启动入口
+├── main.py                         # CLI 兼容入口
+├── web.py                          # WebUI 启动入口
+├── webui.sh                        # 单实例 WebUI 管理脚本
 ├── apps/
-│   ├── cli/main.py                 # CLI 批处理编排
-│   └── web/                        # Flask 管理服务与鉴权
-├── config/                         # 配置
-│   ├── roxybrowser.py              # RoxyBrowser 注册/Codex 驱动
-│   ├── cloakbrowser.py             # CloakBrowser 注册驱动配置
-│   ├── browser_use.py              # Browser Use Cloud 配置
-│   ├── codex.py                    # Codex OAuth / 授权驱动 / CPA / 接码
-│   ├── email.py                    # 邮箱来源/OTP
-│   ├── proxy.py                    # 代理池
-│   ├── register.py                 # 默认注册信息
-│   └── ...
-├── core/                           # 基础客户端、协议与持久化组件
-│   ├── cloakbrowser_driver.py      # Cloak Playwright→Selenium 风格适配层
-│   ├── browser_use_client.py       # Browser Use CDP 客户端
-│   ├── roxy_codex_oauth.py         # Roxy / Cloak 浏览器 Codex OAuth 页面流程
-│   ├── roxybrowser_client.py       # Roxy API 客户端
-│   ├── codex_oauth.py              # Codex 协议/Roxy/Cloak 调度
-│   ├── email_provider.py           # 邮箱来源调度
-│   ├── cf_temp_mail_client.py      # Cloudflare Worker 临时邮箱
-│   ├── sms_provider.py             # 接码平台
-│   ├── account_export.py           # 保存账号/批次归档
-│   ├── db.py                       # 业务数据访问层
-│   └── sqlite_store.py             # SQLite 存储与旧数据幂等迁移
+│   ├── cli/main.py                 # CLI 参数和批处理编排
+│   └── web/                        # Flask 管理服务、鉴权、配置编辑
+├── config/                         # 可热加载的配置模块
+├── core/                           # 邮箱、OAuth、浏览器客户端、SQLite 数据访问
 ├── registration/
-│   ├── application/                # 注册用例、任务服务与请求模型
-│   ├── drivers/                    # protocol/Roxy/Cloak/Browser Use/Skyvern 插件
-│   └── ports/                      # 停止信号等框架无关端口
-├── web/                            # React/Vite 前端与构建产物
-├── sentinel/
-│   ├── sdk.js
-│   └── sentinel-runner.js
+│   ├── application/                # 注册用例、任务服务、领域模型
+│   ├── drivers/                    # protocol/Roxy/Cloak/Browser Use/Skyvern 适配器
+│   └── ports/                      # 与具体驱动无关的端口
+├── web/                            # React/Vite 前端、源码和 dist 构建产物
+├── sentinel/                       # Sentinel JavaScript 运行组件
 ├── scripts/
-│   ├── operations/codex_oauth.py   # Codex 单独补跑
-│   └── diagnostics/                # 协议/接口诊断脚本
+│   ├── operations/                 # 运维和 Codex 补跑脚本
+│   └── diagnostics/                # 协议、接口和 HAR 诊断脚本
+├── tests/                          # pytest 测试
+├── docs/                           # 架构和历史决策文档
+├── data/turb_gpt.sqlite3           # 本地运行时数据，不提交
 └── L_API.md                        # 本地 L 接码接口说明
 ```
 
----
+### 4.2 模块边界
 
-## 使用建议
+- `apps/web` 只负责 HTTP、鉴权、任务入口和展示所需的数据整形，不直接实现浏览器步骤。
+- `registration/application` 负责注册任务生命周期；`registration/drivers` 通过统一接口实现具体浏览器或协议流程。
+- `core` 提供可复用客户端和业务服务；`core/db.py` 是业务数据访问层，`core/sqlite_store.py` 是通用 SQLite 存储适配器。
+- Web 管理服务和 CLI 都调用注册应用层，避免为两个入口复制注册逻辑。
+- 浏览器驱动之间不共享具体实现；新增驱动时优先新增 `registration/drivers/<name>/`，并在 registry 中注册。
 
-- 日常批量使用 WebUI，不建议直接同时开多个 CLI 进程。
-- 注册线程数建议不超过可用代理数。
-- Roxy 一号一环境建议保持开启，降低环境污染。
-- 调试页面问题时可临时设置：
+### 4.3 前端开发
 
-```python
-ROXY_KEEP_BROWSER_OPEN = True
-ROXY_OPEN_HEADLESS = False
+安装并启动 Vite 开发服务器：
+
+```bash
+cd web
+npm ci
+npm run dev
 ```
 
-- 调试完再改回自动关闭/删除环境。
+Vite 默认运行在 `http://127.0.0.1:5173`，`/api`、`/login` 和 `/logout` 代理到运行中的 Flask `127.0.0.1:5000`。生产构建：
 
----
-## React WebUI
+```bash
+npm run build
+```
 
-The WebUI is built from the React application in [`web/`](web/). Flask serves the checked-in `web/dist/` bundle at `http://127.0.0.1:5000/` and keeps all existing `/api/*` endpoints, session authentication, and download behavior. The previous Flask template frontend has been removed.
+`web/dist/` 是 Flask 生产服务使用的构建产物；`web/node_modules/` 只属于本地开发环境，不应提交。
 
-For frontend development, see [`web/README.md`](web/README.md). The repository WebUI listener remains the single `http://127.0.0.1:5000` process managed by `./webui.sh`.
+### 4.4 测试与质量检查
+
+在项目根目录执行：
+
+```bash
+source .venv/bin/activate
+PYTHONDONTWRITEBYTECODE=1 pytest -q
+bash -n webui.sh
+git diff --check
+```
+
+测试使用 `pytest.ini` 中的 `tests/` 路径。涉及 SQLite 的测试会使用临时数据库，不应修改本地真实 `data/turb_gpt.sqlite3`。
+
+提交前至少确认：
+
+1. 未提交 `.env`、数据库、token、凭证或导出文件。
+2. 新增功能有对应测试或清晰的手工验证步骤。
+3. WebUI 仍只监听 `127.0.0.1:5000`，没有启动第二个生产实例。
+4. 浏览器驱动能通过统一注册接口调用，未把驱动细节泄漏到 Web/API 层。
+
+### 4.5 SQLite 与迁移约定
+
+`core/sqlite_store.py` 提供 JSON 集合和文件内容的统一读写 API：
+
+- `storage_collections` / `storage_items` 保存结构化业务数据。
+- `storage_files` 保存日志、凭证、批次归档等二进制或文本内容。
+- `v_registered_accounts`、`v_outlook_pool`、`v_registration_jobs`、`v_relay_*` 提供常用查询视图。
+- 历史 JSON/TXT 只在集合不存在时执行一次性幂等导入。
+- 生产写入使用 `mirror=False`，兼容文件镜像只允许测试或调用方明确指定的外部导出路径。
+
+新增业务数据时，优先设计 SQLite 集合/文件类别和迁移逻辑，不要重新引入根目录 JSON、日志目录或静态 HTML 快照。
+
+### 4.6 贡献流程
+
+1. 从 `main` 创建功能分支。
+2. 只修改与目标相关的模块，并补充测试和文档。
+3. 本地运行测试、前端构建和 `git diff --check`。
+4. 提交信息使用清晰的动词短语，提交前检查 `git status`，确认没有敏感文件。
+5. Pull Request 中说明行为变化、迁移影响、验证命令和已知限制。
+
+## 5. 开源协议
+
+本项目采用 [MIT License](LICENSE)。除许可证正文要求外，使用者还需要自行遵守：
+
+- ChatGPT/OpenAI、邮箱、短信、浏览器云服务和代理服务的服务条款；
+- 账号注册、自动化访问、数据保存和跨境传输适用的法律法规；
+- 目标网络、代理和第三方 API 的授权范围。
+
+项目按“现状”提供，不对第三方服务可用性、账号状态、注册成功率或外部接口兼容性作保证。第三方服务的密钥、账号和网络资源由使用者自行负责。
+
+Copyright (c) 2026 Turb GPT Free Register contributors. 详见 [LICENSE](LICENSE)。
