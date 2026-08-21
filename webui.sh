@@ -20,9 +20,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 RUN_DIR="$ROOT_DIR/data/runtime"
-LOG_DIR="$ROOT_DIR/data/runtime"
 PID_FILE="$RUN_DIR/webui.pid"
-LOG_FILE="$LOG_DIR/webui.log"
+# Stable SQLite source key used by the WebUI logger; no log file is created.
+LOG_FILE="$ROOT_DIR/data/runtime/webui.log"
 LOG_CATEGORY="webui_process_logs"
 
 HOST="127.0.0.1"
@@ -32,7 +32,7 @@ VERBOSE="${VERBOSE:-0}"
 AUTH_CODE="${AUTH_CODE:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
-mkdir -p "$RUN_DIR" "$LOG_DIR"
+mkdir -p "$RUN_DIR"
 
 usage() {
   cat <<EOF
@@ -141,7 +141,7 @@ cmd_start() {
   fi
 
   echo "启动 WebUI：http://${HOST}:${PORT}"
-  echo "日志存储：SQLite（逻辑键：${LOG_FILE}）"
+  echo "日志存储：SQLite（逻辑键：data/runtime/webui.log）"
   nohup "$py" "${args[@]}" >/dev/null 2>&1 &
   pid=$!
   echo "$pid" > "$PID_FILE"

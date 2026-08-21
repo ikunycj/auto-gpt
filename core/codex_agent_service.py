@@ -17,7 +17,10 @@ from core import db
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_OUTPUT_DIR = _PROJECT_ROOT / "data" / "runtime" / "codex-agent"
+# Stable SQLite file-key prefix for generated Agent credentials. The path is
+# never materialized because the writer explicitly uses mirror=False.
+_AGENT_CREDENTIAL_KEY_ROOT = _PROJECT_ROOT / "data" / "runtime" / "codex-agent"
+_OUTPUT_DIR = _AGENT_CREDENTIAL_KEY_ROOT
 
 
 def _join_sub2_url(base: str, path: str) -> str:

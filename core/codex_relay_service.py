@@ -21,12 +21,24 @@ import pyotp
 from core import sms_provider, sqlite_store
 
 _ROOT = Path(__file__).resolve().parent.parent
-_ACCOUNTS_PATH = _ROOT / "codex_接码账号.json"
-_PHONES_PATH = _ROOT / "codex_接码手机.json"
-_JOBS_PATH = _ROOT / "codex_接码任务.json"
-_LOG_DIR = _ROOT / "codex_接码日志"
-_CREDENTIAL_DIR = _ROOT / "codex_accounts"
-_SUB2_SERVICES_PATH = _ROOT / "codex_sub2_services.json"
+# The following paths are stable SQLite source-key labels. They are retained
+# for migration and test injection; production writes use mirror=False for
+# repository paths, so no matching directories or JSON files are created.
+_RELAY_ACCOUNTS_KEY = _ROOT / "codex_接码账号.json"
+_RELAY_PHONES_KEY = _ROOT / "codex_接码手机.json"
+_RELAY_JOBS_KEY = _ROOT / "codex_接码任务.json"
+_RELAY_LOG_KEY_ROOT = _ROOT / "codex_接码日志"
+_CODEX_CREDENTIAL_KEY_ROOT = _ROOT / "codex_accounts"
+_RELAY_SUB2_SERVICES_KEY = _ROOT / "codex_sub2_services.json"
+
+# Private aliases are kept for existing callers/tests that isolate relay
+# storage by monkeypatching these names.
+_ACCOUNTS_PATH = _RELAY_ACCOUNTS_KEY
+_PHONES_PATH = _RELAY_PHONES_KEY
+_JOBS_PATH = _RELAY_JOBS_KEY
+_LOG_DIR = _RELAY_LOG_KEY_ROOT
+_CREDENTIAL_DIR = _CODEX_CREDENTIAL_KEY_ROOT
+_SUB2_SERVICES_PATH = _RELAY_SUB2_SERVICES_KEY
 _SUB2_SYNC_MARKER = "自动导入注册机"
 _SUB2_LEGACY_TRAILING_MARKERS = {"注册机自动转入"}
 _SUB2_PAGE_SIZE = 100
@@ -133,6 +145,8 @@ def _write(path: Path, rows: list[dict]) -> None:
         rows,
         collection=_collection_name(path),
         mode=0o600,
+        # Temporary paths used by isolated tests and explicit export tooling
+        # may still request a mirror; repository runtime paths remain SQLite-only.
         mirror=sqlite_store.legacy_mirror_allowed(path),
     )
 
@@ -149,7 +163,7 @@ def _collection_name(path: Path) -> str:
 
 
 def initialize_storage() -> dict:
-    """Import the relay JSON documents into the shared SQLite database."""
+    """Import relay compatibility documents into the shared SQLite database."""
     for path in (_ACCOUNTS_PATH, _PHONES_PATH, _JOBS_PATH, _SUB2_SERVICES_PATH):
         sqlite_store.migrate_json_file(path, default=[], collection=_collection_name(path))
     return sqlite_store.storage_info(sqlite_store.database_path(_ACCOUNTS_PATH))
@@ -2881,7 +2895,7 @@ def _safe_diagnostic_url(value: str) -> str:
 
 def _log_path(job_id: str) -> Path:
     # The path is a stable SQLite file key. Logging never materializes the
-    # historical ``codex_接码日志`` directory.
+    # historical relay-log directory.
     return _LOG_DIR / f"{job_id}.log"
 
 

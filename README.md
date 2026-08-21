@@ -430,7 +430,7 @@ CPA_MANAGEMENT_KEY = "你的CPA管理密钥"
 ./webui.sh logs       # 查看实时日志
 ```
 
-脚本固定启动 `http://127.0.0.1:5000`；WebUI 进程日志和 PID 集中在 `data/runtime/`。
+脚本固定启动 `http://127.0.0.1:5000`；PID 文件位于 `data/runtime/`，日志正文写入 SQLite。
 
 可通过环境变量调整授权码和是否自动打开浏览器；地址和端口不可修改：
 
@@ -577,11 +577,11 @@ WebUI 配置页保存后会调用热加载；Roxy、Codex、邮箱、代理、�
 | 路径 | 内容 |
 |---|---|
 | `data/turb_gpt.sqlite3` | 唯一运行时数据源：账号、邮箱池、任务、凭证、日志和批次归档 |
-| `data/runtime/` | WebUI 进程 PID；进程日志正文存于 SQLite，`webui.log` 仅作为逻辑键 |
+| `data/runtime/` | WebUI 进程 PID；进程日志正文存于 SQLite，日志文件名只作为逻辑键 |
 
 ### SQLite 存储
 
-运行时数据唯一存储在 `data/turb_gpt.sqlite3`。首次启动时，程序会把仍存在的旧 JSON/TXT/凭证/日志幂等导入 SQLite；之后生产代码只读写 SQLite，不再生成旧 JSON/TXT/HTML、`accounts/`、`codex_accounts/` 或 `注册日志/` 镜像。需要文件时通过 WebUI 下载接口或显式导出工具生成。
+运行时数据唯一存储在 `data/turb_gpt.sqlite3`。启动时只会对仍存在的历史 JSON/TXT/凭证/日志执行一次性幂等导入；之后生产代码只读写 SQLite，不创建旧目录或散落 JSON/TXT/HTML。需要文件时通过 WebUI 下载接口或显式导出工具生成，导出文件由调用方自行指定位置。
 
 可以用 `TURB_SQLITE_PATH` 指定数据库位置：
 
@@ -608,7 +608,7 @@ with connect() as conn:
     ).fetchall()
 ```
 
-`config/*.py`、`.env` 等配置文件仍由配置编辑器维护；命令行显式指定的 TXT/JSON 也只作为外部导入入口，不是运行时主数据源。
+`config/*.py`、`.env` 等配置文件仍由配置编辑器维护；根目录的 `.example` 文件只是模板。命令行显式指定的 TXT/JSON 只作为外部导入入口，不是运行时主数据源。
 
 批次归档通过 `storage_files.category = 'batch_archives'` 保存，文件名仅作为 SQLite 中的逻辑键。
 

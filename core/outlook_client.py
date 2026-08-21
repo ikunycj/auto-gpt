@@ -14,7 +14,7 @@ Outlook 邮箱客户端（mail.chatai.codes 双协议）
 工作流：
     1. pick_account()       从 SQLite 邮箱池中挑一个未用过的账号
     2. fetch_latest_otp()   双协议（Graph / IMAP）轮询取 OTP
-    3. 注册成功后会写入 `注册成功的邮箱.txt` 与 `注册成功的token.txt`
+    3. 注册成功后的账号与 token 写入 SQLite；文本仅作为显式导入输入
 
 只用 Outlook 提供的 refresh_token 调远端的 mail.chatai.codes 服务，
 不直连 Microsoft Graph，因为后者要 access_token + 复杂 OAuth 协议。
@@ -258,14 +258,14 @@ def pick_account() -> OutlookAccount:
 
     inserted, skipped = import_outlook_from_file()
     if inserted:
-        logger.info(f"[Outlook] 已自动从 {OUTLOOK_ACCOUNTS_FILE} 导入 {inserted} 个新账号（跳过 {skipped} 个）")
+        logger.info(f"[Outlook] 已从可选导入文件 {OUTLOOK_ACCOUNTS_FILE} 导入 {inserted} 个新账号（跳过 {skipped} 个）")
 
     row = claim_next_outlook()
     if row is None:
         summary = outlook_pool_summary()
         raise OutlookClientError(
             f"Outlook 账号池没有可用账号: {summary}. "
-            f"请把新邮箱写入 {OUTLOOK_ACCOUNTS_FILE}，程序会在下次注册前自动导入。"
+            f"请通过 WebUI 导入新邮箱；也可把它放入 {OUTLOOK_ACCOUNTS_FILE} 作为一次性导入输入。"
         )
 
     account = OutlookAccount(

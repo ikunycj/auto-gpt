@@ -10,7 +10,9 @@ from core import db, sqlite_store
 
 logger = logging.getLogger(__name__)
 
-_LOG_DIR = Path(__file__).resolve().parent.parent / "runtime" / "codex-retry-logs"
+_CODEX_RETRY_LOG_KEY_ROOT = Path(__file__).resolve().parent.parent / "data" / "runtime" / "codex-retry-logs"
+# This is a logical SQLite key prefix, not a directory created by production.
+_LOG_DIR = _CODEX_RETRY_LOG_KEY_ROOT
 _RETRYING: set[str] = set()
 _RETRYING_LOCK = threading.Lock()
 _STOP_REQUESTED: set[str] = set()

@@ -17,7 +17,7 @@ Codex OAuth 单独验证脚本（2026-06-15 重写：全新 session + 接码方�
 
 输出：
     - 全程 [Codex] / [SMS] 日志
-    - 成功则写入 SQLite `codex_credentials` 集合，并打印 PASS
+    - 成功则写入 SQLite `codex_credentials` 文件类别，并打印 PASS
     - 失败打印 FAIL + 完整堆栈，便于定位卡在哪一步
 """
 import argparse

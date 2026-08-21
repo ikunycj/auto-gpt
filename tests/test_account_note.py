@@ -16,8 +16,7 @@ class AccountNoteTests(unittest.TestCase):
             with patch.object(db, "_ACCOUNTS_JSON", accounts_path), \
                  patch.object(db, "_LEGACY_ACCOUNTS_JSON", root / "legacy_accounts.json"), \
                  patch.object(db, "_ACCOUNTS_TXT", root / "accounts.txt"), \
-                 patch.object(db, "_TOKENS_TXT", root / "tokens.txt"), \
-                 patch.object(db, "_VIEWER_HTML", root / "viewer.html"):
+                 patch.object(db, "_TOKENS_TXT", root / "tokens.txt"):
                 self.assertTrue(db.update_account_note(1, "备注A"))
                 self.assertFalse(db.update_account_note(99, "不存在"))
                 self.assertEqual(db.get_account(1)["note"], "备注A")

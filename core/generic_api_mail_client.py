@@ -485,7 +485,7 @@ def pick_account() -> GenericApiEmailAccount:
 
     inserted, skipped = import_from_file()
     if inserted:
-        logger.info(f"[GenericAPI] 已自动从 {_ACCOUNTS_FILE.name} 导入 {inserted} 个邮箱（跳过 {skipped} 个）")
+        logger.info(f"[GenericAPI] 已从可选导入文件 {_ACCOUNTS_FILE.name} 导入 {inserted} 个邮箱（跳过 {skipped} 个）")
 
     row = claim_next_generic_api_email()
     if row is None:

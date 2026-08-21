@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 """SQLite-backed persistence for the local registration console.
 
-The application historically stored several independent JSON documents.  This
-module keeps the dictionary/list API those callers use while making SQLite the
-authoritative store.  Legacy files are imported lazily on first access and are
-written back as compatibility exports so existing CLI tools and downloads do
-not break during the migration.
+SQLite is authoritative for all repository runtime data. Legacy files are read
+only as one-time migration inputs; compatibility mirrors are allowed only for
+external test/export paths or when a caller explicitly opts in.
 """
 from __future__ import annotations
 
@@ -65,8 +63,8 @@ def _source_key(source_path: str | Path) -> str:
 def legacy_mirror_allowed(path: str | Path) -> bool:
     """Return whether a caller may materialize a legacy file mirror.
 
-    Runtime paths inside this repository are SQLite-only. External paths are
-    still supported for isolated tests and explicit export tooling.
+    Runtime paths inside this repository are SQLite-only. External paths remain
+    supported for isolated tests and explicit user-requested exports.
     """
     target = Path(path).expanduser().resolve()
     try:

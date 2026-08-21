@@ -29,6 +29,10 @@ CODEX_REDIRECT_URI: str = "http://localhost:1455/auth/callback"
 CODEX_SCOPE: str = "openid email profile offline_access"
 
 # 输出目录名（仅名字，运行时拼到项目根；与 OUTLOOK_ACCOUNTS_FILE 同级风格）
+# SQLite file-key prefix for Codex credentials. The name is retained as a
+# compatibility setting for existing config/UI clients; production code stores
+# credential bytes in the SQLite ``codex_credentials`` category and does not
+# create this directory.
 CODEX_OUTPUT_DIRNAME: str = "codex_accounts"
 
 # 请求超时（秒）
@@ -92,7 +96,8 @@ CPA_REQUEST_TIMEOUT: int = 30
 CPA_CALLBACK_SUBMIT_RETRIES: int = 5
 CPA_CALLBACK_SUBMIT_RETRY_DELAY: int = 6
 
-# CPA 未返回完整 auth json 时，是否仍在本地 codex_accounts/ 记录一份回调提交凭据
+# CPA 未返回完整 auth json 时，是否在 SQLite ``codex_credentials`` 类别中
+# 保存一份回调提交凭据（文件名仍沿用 CPA 兼容格式）。
 CPA_SAVE_CALLBACK_RECEIPT: bool = True
 
 # ============================================================

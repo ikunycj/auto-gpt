@@ -2,10 +2,10 @@
 """
 Outlook 邮箱账号池配置。
 
-注册邮箱与 OTP 均只走 Outlook 账号池：
-    1. 把邮箱素材写入项目根目录 `用于注册的邮箱.txt`
-    2. 每行格式：email====password====clientId====refreshToken
-    3. 运行注册时会自动导入新增邮箱
+注册邮箱与 OTP 均只走 SQLite 邮箱池。历史文本文件仍可作为一次性导入输入：
+    1. 通过 WebUI 导入邮箱素材（推荐）
+    2. 或显式指定一个文本文件执行导入
+    3. 每行格式：email====password====clientId====refreshToken
 """
 from config.env_loader import env_str, apply_env_overrides
 
@@ -29,6 +29,8 @@ EMAIL_SOURCE = "outlook,generic_api,mailnest"
 # Outlook 模式（外购账号池 + 取信服务）
 # ============================================================
 
+# Historical import filename. It is an optional input label, not a runtime
+# database or output file; new data is stored in SQLite ``outlook_pool``.
 OUTLOOK_ACCOUNTS_FILE = "用于注册的邮箱.txt"
 
 # Outlook 取件模式：

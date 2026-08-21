@@ -3,7 +3,7 @@
 注册后处理模块：
     1. 拉取 /api/auth/session，从中抽取 accessToken / user 信息
     2. 设置 2FA（TOTP），返回 secret
-    3. 把账号信息（邮箱 + accessToken + TOTP secret）落盘成 JSON
+    3. 把账号信息（邮箱 + accessToken + TOTP secret）写入 SQLite 批次归档
 
 整体复用注册阶段的 BrowserSession（同一 cookie jar / 同一 IP / 同一 UA），
 避免再起新会话被风控关联或缺失登录态。
@@ -25,9 +25,11 @@ from core import sqlite_store
 
 logger = logging.getLogger(__name__)
 
-# Stable logical prefix for legacy batch archive keys; content lives in SQLite.
+# Stable logical prefix for batch archive keys; content lives in SQLite.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_ACCOUNTS_DIR = _PROJECT_ROOT / "accounts"
+_BATCH_ARCHIVE_KEY_ROOT = _PROJECT_ROOT / "accounts"
+# Compatibility alias retained for callers that pass/inspect the historical key.
+_ACCOUNTS_DIR = _BATCH_ARCHIVE_KEY_ROOT
 _BATCH_ARCHIVE_LOCK = threading.RLock()
 
 
@@ -47,8 +49,8 @@ def create_batch_archive_dir(count: int, workers: int = 1) -> Path:
     """Return a logical SQLite archive prefix for one registration batch."""
     day = datetime.now().strftime("%Y%m%d")
     base_name = f"{day}-{count}个" if workers <= 1 else f"{day}-{count}个-{workers}线程"
-    # Keep the historical ``accounts/`` prefix as a logical SQLite namespace;
-    # no compatibility directory is created during normal operation.
+    # Keep a stable source-key prefix for existing archive records; no
+    # compatibility directory is created during normal operation.
     folder = _ACCOUNTS_DIR / f"{base_name}-{uuid.uuid4().hex[:8]}"
     for filename, content in (
         ("注册成功的邮箱.txt", ""),

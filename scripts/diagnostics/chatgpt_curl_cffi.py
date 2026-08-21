@@ -11,8 +11,8 @@ ChatGPT backend-api 指纹环境请求测试脚本。
     # 方式1：直接参数传 token
     python3 scripts/diagnostics/chatgpt_curl_cffi.py --token '<JWT>' --verbose
 
-    # 方式2：从文件读取 token（默认取第一条非空行；允许有 Bearer 前缀）
-    python3 scripts/diagnostics/chatgpt_curl_cffi.py --token-file 注册成功的token.txt
+    # 方式2：从显式导出的 token 文件读取（默认取第一条非空行）
+    python3 scripts/diagnostics/chatgpt_curl_cffi.py --token-file /path/to/exported-tokens.txt
 
     # 方式3：测试 subscriptions，需要传 account_id
     python3 scripts/diagnostics/chatgpt_curl_cffi.py --token '<JWT>' --endpoint subscriptions --account-id '<account_id>'

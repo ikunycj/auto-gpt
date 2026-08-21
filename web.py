@@ -78,8 +78,8 @@ def _setup_logging(verbose: bool) -> None:
         datefmt="%H:%M:%S",
     )
 
-    # Process logs are authoritative in SQLite as well; the path is a logical
-    # key and ``mirror=False`` prevents a second physical log store.
+    # Process logs are authoritative in SQLite; the path is a logical key and
+    # ``mirror=False`` prevents a second physical log store.
     sqlite_handler = sqlite_store.SQLiteFileHandler(
         _WEBUI_LOG_PATH,
         category=_WEBUI_LOG_CATEGORY,

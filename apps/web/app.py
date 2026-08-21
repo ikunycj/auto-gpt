@@ -219,9 +219,9 @@ def create_app(auth_code: str | None = None) -> Flask:
         )
 
     init_auth(app, auth_code=auth_code)
-    # Import legacy JSON state before recovery workers inspect it.  SQLite is
-    # authoritative after this idempotent migration; JSON files remain only as
-    # compatibility exports for older CLI tools and credential downloads.
+    # Import any still-present legacy input before recovery workers inspect it.
+    # SQLite is authoritative after this idempotent migration; normal runtime
+    # writes never create JSON/TXT/HTML mirrors in the repository.
     try:
         storage_info = db.initialize_storage()
         relay_storage_info = codex_relay_service.initialize_storage()

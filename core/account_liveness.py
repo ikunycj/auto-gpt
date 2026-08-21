@@ -21,7 +21,9 @@ from core.email_provider import wait_for_otp
 from core import sqlite_store
 
 logger = logging.getLogger(__name__)
-_LOG_DIR = Path(__file__).resolve().parent.parent / "runtime" / "liveness-logs"
+_LIVENESS_LOG_KEY_ROOT = Path(__file__).resolve().parent.parent / "注册日志"
+# Historical private name retained for callers that customize isolated storage.
+_LOG_DIR = _LIVENESS_LOG_KEY_ROOT
 _RUNNING: set[str] = set()
 _RUNNING_LOCK = threading.Lock()
 
