@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
+import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from flask import Flask
 from apps.web.app import create_app
+from apps.web import auth
 
 
 class WebUiAuthTests(unittest.TestCase):
@@ -39,6 +43,29 @@ class WebUiAuthTests(unittest.TestCase):
         self.assertEqual(r.status_code, 302)
         r = self.client.get("/api/summary")
         self.assertEqual(r.status_code, 200)
+
+    def test_reload_auth_from_environment_applies_new_code(self):
+        old_code, old_generated = auth._AUTH_CODE, auth._GENERATED
+        old_secret = os.environ.get("WEBUI_SESSION_SECRET")
+        try:
+            auth._AUTH_CODE = "old-code"
+            auth._GENERATED = False
+            app = Flask(__name__)
+            with patch.object(auth, "_configured_auth_code", return_value="new-code"), patch.dict(
+                os.environ, {"WEBUI_SESSION_SECRET": "test-session-secret"}, clear=False
+            ):
+                result = auth.reload_auth_from_environment(app)
+            self.assertTrue(result["changed"])
+            self.assertFalse(result["generated"])
+            self.assertEqual(app.secret_key, "test-session-secret")
+            self.assertTrue(auth.code_is_valid("new-code"))
+            self.assertFalse(auth.code_is_valid("old-code"))
+        finally:
+            auth._AUTH_CODE, auth._GENERATED = old_code, old_generated
+            if old_secret is None:
+                os.environ.pop("WEBUI_SESSION_SECRET", None)
+            else:
+                os.environ["WEBUI_SESSION_SECRET"] = old_secret
 
     def test_root_serves_react_bundle(self):
         r = self.client.get("/", headers={"X-Auth-Code": "test-auth"})

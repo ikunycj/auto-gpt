@@ -31,7 +31,7 @@ ChatGPT / OpenAI 账号注册与 Codex OAuth 授权工具。项目提供本地 W
 
 ### 2.1 注册驱动
 
-注册驱动通过 `config/roxybrowser.py` 的 `REGISTRATION_DRIVER` 选择，当前支持五种实现：
+注册驱动可在 WebUI「运行配置 → 注册方式」中选择（底层配置键为 `REGISTRATION_DRIVER`），当前支持五种实现：
 
 | 驱动 | 说明 | 典型依赖 |
 |---|---|---|
@@ -45,7 +45,7 @@ ChatGPT / OpenAI 账号注册与 Codex OAuth 授权工具。项目提供本地 W
 
 ### 2.2 邮箱与验证码
 
-`config/email.py` 中的 `EMAIL_SOURCE` 支持多个来源组合：
+WebUI「运行配置 → 邮箱 / OTP」中的 `EMAIL_SOURCE` 支持多个来源组合：
 
 - **Outlook**：专用素材格式为 `email----password----clientId----refreshToken`。
 - **通用 API**：按内容提取邮箱和 `http://` / `https://` 接码地址。
@@ -59,7 +59,7 @@ ChatGPT / OpenAI 账号注册与 Codex OAuth 授权工具。项目提供本地 W
 
 ### 2.3 Codex OAuth 与接码
 
-- 注册完成后可选自动执行 Codex OAuth：`ENABLE_CODEX_AUTO = True`。
+- 注册完成后可选自动执行 Codex OAuth：在 WebUI 中开启 `ENABLE_CODEX_AUTO`。
 - 授权驱动支持 `protocol`、`roxy`、`cloak`、`browser_use`、`skyvern` 和 `same_as_registration`。
 - 支持 CPA 管理接口或本地 PKCE 授权地址。
 - 手机验证支持 GrizzlySMS、本地 L 服务和 H 服务，可执行取号、发送、收码、提交和失败重试。
@@ -94,28 +94,23 @@ React WebUI 由 Flask 在生产环境提供，主要页面包括：
 - 可用的网络出口和代理；使用云端浏览器时还需要对应服务的 API Key。
 - 使用 RoxyBrowser 时，本机 Roxy API 必须可访问。
 
-安装 Python 依赖并创建本地配置：
+安装 Python 依赖：
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate       # Windows PowerShell: .venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-cp .env.example .env
 ```
 
-不要把真实密钥写入 `config/*.py`、README、Issue 或提交记录。优先将密钥放入根目录 `.env`；WebUI 配置页保存密钥时也会写入 `.env`。
+日常启动不要求手工创建或编辑 `.env`。首次启动后，打开 WebUI 的“运行配置”页面即可填写邮箱、代理、浏览器、Codex、短信和第三方 API；保存时系统会自动把配置写入项目根目录 `.env` 并热加载。不要把真实密钥写入 `config/*.py`、README、Issue 或提交记录。
 
-常用 `.env` 字段包括：
+`.env.example` 仅作为自动化部署或高级用户的模板，不是日常配置入口。只有少数启动级选项需要在启动前通过环境变量设置，例如数据库路径：
 
 ```dotenv
-WEBUI_AUTH_CODE=设置一个本地授权码
-WEBUI_SESSION_SECRET=可选的固定 session 密钥
-BROWSER_USE_API_KEY=可选
-SKYVERN_API_KEY=可选
-ROXY_API_TOKEN=可选
-CPA_MANAGEMENT_KEY=可选
-SMS_API_KEY=可选
+TURB_SQLITE_PATH=/path/to/turb_gpt.sqlite3
 ```
+
+如果需要无人值守启动，也可以在命令行传入 `AUTH_CODE` 或预先准备 `.env`；交互式使用不需要这样做。
 
 ### 3.2 配置邮箱来源
 
@@ -145,88 +140,19 @@ Relay 账号也可以按内容乱序粘贴，密码和 2FA 为可选字段：
 
 Markdown 链接（`[说明](https://...)`）和聊天复制产生的反斜杠转义也会自动清理。接码 URL 查询参数或路径中如果包含 `----` 等分隔符，且没有其他可识别字段，解析器会将其视为 URL 内容保留。
 
-在 `config/email.py` 选择来源，例如：
-
-```python
-EMAIL_SOURCE = "outlook,generic_api,mailnest"
-```
-
-GPTMail、Cloudflare、Cloudflare 域名邮箱、MailNest 和 CloudMail 的密钥、地址、项目代码等字段可在 WebUI 配置页填写；字段说明也可直接查看 `config/email.py` 和 `.env.example`。
+在 WebUI「运行配置 → 邮箱 / OTP」中设置 `EMAIL_SOURCE`，可填一个来源或用英文逗号分隔多个来源作为兜底。GPTMail、Cloudflare、Cloudflare 域名邮箱、MailNest 和 CloudMail 的密钥、地址、项目代码等字段也都在该页面填写；保存后会写入 `.env` 并热加载。`config/email.py` 只用于查看默认值和开发维护，不需要手工编辑。
 
 ### 3.3 选择注册驱动
 
-最小配置示例：
+进入 WebUI「运行配置 → 注册方式」，选择 `protocol`、`roxy`、`cloak`、`browser_use` 或 `skyvern`。同一页面会按当前驱动展示对应的 API 地址、工作区、无头、代理、GeoIP、语言、时区和超时设置；云浏览器的 API Key 也直接在这里填写。Roxy 的团队/项目可以使用配置页中的“获取团队”工具读取并保存。
 
-```python
-# config/roxybrowser.py
-REGISTRATION_DRIVER = "protocol"
-```
-
-RoxyBrowser：
-
-```python
-REGISTRATION_DRIVER = "roxy"
-ROXY_API_BASE = "http://127.0.0.1:50100"
-ROXY_API_TOKEN = "你的 Roxy API Key"
-ROXY_WORKSPACE_ID = "你的 workspaceId"
-ROXY_PROJECT_ID = "你的 projectId"
-ROXY_ONE_PROFILE_PER_ACCOUNT = True
-ROXY_DELETE_PROFILE_AFTER_RUN = True
-ROXY_OPEN_HEADLESS = False
-```
-
-CloakBrowser：
-
-```python
-REGISTRATION_DRIVER = "cloak"
-```
-
-其无头、代理、GeoIP、语言、时区和 fingerprint seed 配置位于 `config/cloakbrowser.py`。使用 Browser Use Cloud 或 Skyvern 时，分别设置：
-
-```python
-REGISTRATION_DRIVER = "browser_use"  # 或 "skyvern"
-```
-
-并在 `.env` 设置对应 API Key。Browser Use 默认通过远端 CDP 连接；Skyvern 使用 Browser Sessions。详细字段以 `config/browser_use.py`、`config/skyvern.py` 为准。
+`config/*.py` 中仍保留安全默认值，供 CLI 和开发环境使用，但不建议为了日常运行直接编辑源码。修改配置页后，新的任务会读取热加载后的值；已经运行中的浏览器任务不会被强行改写。
 
 ### 3.4 配置代理和 Codex
 
-代理池在 `config/proxy.py`：
+在 WebUI「运行配置 → 代理池」中逐行填写代理 URL，并设置套餐查询的网络模式、超时和重试策略。代理包含用户名或密码时也建议只通过配置页保存，系统会将其写入 `.env`。
 
-```python
-PROXY_POOL = [
-    "http://user:password@host:port",
-]
-```
-
-不需要 Codex 时保持默认关闭：
-
-```python
-# config/codex.py
-ENABLE_CODEX_AUTO = False
-```
-
-需要自动授权时：
-
-```python
-ENABLE_CODEX_AUTO = True
-CODEX_OAUTH_DRIVER = "same_as_registration"
-SMS_PROVIDER = "l"       # grizzly / l / h
-SMS_SERVICE = "openai"
-SMS_COUNTRY = "国家代码"
-SMS_MAX_RETRIES = 10
-SMS_CODE_WAIT = 120
-```
-
-如果使用 CPA：
-
-```python
-CODEX_AUTH_URL_SOURCE = "cpa"
-CPA_MANAGEMENT_URL = "https://你的-cpa-地址"
-CPA_MANAGEMENT_KEY = "你的 CPA 管理密钥"
-```
-
-短信服务的地址和鉴权字段见 `config/codex.py` 与 [L_API.md](L_API.md)。
+在「运行配置 → Codex」和「接码平台」中开启 `ENABLE_CODEX_AUTO`（如需要），选择授权地址来源、OAuth 驱动、CPA/sub2API 接口和短信通道。GrizzlySMS、本地 L/H 服务、固定手机号 URL 以及 callback 重试、轮询间隔等字段均可在页面调整；不需要 Codex 时保持开关关闭即可。短信服务的接口语义仍可参考 [L_API.md](L_API.md)。
 
 ### 3.5 启动 WebUI
 
@@ -241,6 +167,16 @@ CPA_MANAGEMENT_KEY = "你的 CPA 管理密钥"
 ```
 
 服务固定监听：<http://127.0.0.1:5000>。同一工作区只允许一个 WebUI 进程，不能通过参数改成其他端口。
+
+首次使用的完整流程：
+
+1. 执行 `./webui.sh start`。
+2. 执行 `./webui.sh logs`，复制日志中自动生成的临时授权码（如果你没有预先配置授权码）。
+3. 打开 <http://127.0.0.1:5000> 登录。
+4. 进入“运行配置”，填写邮箱来源、代理、浏览器、API Key、Codex/短信和其他第三方服务参数。
+5. 点击“保存全部”。配置会写入本地 `.env` 并热加载，新启动的任务即可使用。
+
+因此，普通使用者不需要在启动前编辑 `.env` 或修改 `config/*.py`。数据库位置 `TURB_SQLITE_PATH` 和固定监听地址属于启动级设置，仍需在进程启动前准备。
 
 可选环境变量：
 
@@ -321,9 +257,9 @@ with connect() as conn:
 
 ### 3.8 常见问题
 
-**配置保存后没有生效？** 通过 WebUI 保存的常用字段会热加载；直接修改 `config/*.py` 后需要重启 CLI 或 WebUI。
+**配置保存后没有生效？** WebUI 保存的运行配置会写入 `.env` 并立即热加载；已经运行中的任务会继续使用启动时读取的值，新的任务才会使用新值。修改 `WEBUI_AUTH_CODE` 或 Session 密钥后，当前登录会话可能需要重新登录。直接修改 `config/*.py` 只影响默认值，通常需要重启 CLI 或 WebUI 才能重新读取。
 
-**没有接码平台能否注册？** 可以，将 `ENABLE_CODEX_AUTO` 设为 `False`。接码只用于 Codex 手机验证，不影响主注册流程。
+**没有接码平台能否注册？** 可以，在 WebUI「运行配置」中关闭 `ENABLE_CODEX_AUTO`。接码只用于 Codex 手机验证，不影响主注册流程。
 
 **Codex 失败但注册成功怎么办？** 账号会保留并标记 Codex 失败，可在 WebUI 账号页补跑，或执行上面的 Codex CLI 命令。
 

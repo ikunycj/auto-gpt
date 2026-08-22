@@ -300,4 +300,9 @@ def validate_browser_profile(profile: dict) -> list[str]:
     return issues
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'BROWSER_LOCALE_PROFILE': 'str', 'AUTO_BROWSER_LOCALE_FROM_IP': 'bool', 'IP_GEO_TIMEOUT': 'float', 'REJECT_CLOUD_PROXY': 'bool'})
+apply_env_overrides(globals(), {
+    'BROWSER_LOCALE_PROFILE': 'str',
+    'AUTO_BROWSER_LOCALE_FROM_IP': 'bool',
+    'IP_GEO_TIMEOUT': 'float',
+    'REJECT_CLOUD_PROXY': 'bool',
+})

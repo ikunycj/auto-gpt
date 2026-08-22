@@ -24,4 +24,10 @@ FLOW_TRIGGER_PAYLOAD: dict = {}
 FLOW_TRIGGER_TIMEOUT: int = 15
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'ENABLE_FLOW_TRIGGER': 'bool'})
+apply_env_overrides(globals(), {
+    'ENABLE_FLOW_TRIGGER': 'bool',
+    'FLOW_TRIGGER_URL': 'str',
+    'FLOW_TRIGGER_BEARER': 'str',
+    'FLOW_TRIGGER_COOKIE': 'str',
+    'FLOW_TRIGGER_TIMEOUT': 'int',
+})

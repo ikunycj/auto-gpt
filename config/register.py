@@ -18,4 +18,8 @@ REGISTER_PASSWORD = ""
 REGISTER_NAME = ""
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'REGISTER_EMAIL': 'str', 'REGISTER_NAME': 'str'})
+apply_env_overrides(globals(), {
+    'REGISTER_EMAIL': 'str',
+    'REGISTER_PASSWORD': 'str',
+    'REGISTER_NAME': 'str',
+})

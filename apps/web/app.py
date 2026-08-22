@@ -30,7 +30,7 @@ from core.import_parser import (
     parse_account_material_line,
     split_import_line,
 )
-from apps.web.auth import init_auth, register_auth_routes
+from apps.web.auth import init_auth, register_auth_routes, reload_auth_from_environment
 from registration.application import job_service as svc
 from apps.web import config_editor
 
@@ -2854,16 +2854,26 @@ def create_app(auth_code: str | None = None) -> Flask:
             reload_err = f"{type(exc).__name__}: {exc}"
             logger.exception("配置热加载失败")
 
+        auth_reload = None
+        if reload_ok and set(result.get("updated") or ()) & {"WEBUI_AUTH_CODE", "WEBUI_SESSION_SECRET"}:
+            try:
+                auth_reload = reload_auth_from_environment(app)
+            except Exception as exc:
+                reload_ok = False
+                reload_err = f"鉴权刷新失败：{type(exc).__name__}: {exc}"
+                logger.exception("WebUI 鉴权配置刷新失败")
+
         return jsonify({
             "ok": True,
             "updated": result["updated"],
             "ignored": result["ignored"],
             "reloaded": reload_ok,
+            "auth_reloaded": bool(auth_reload),
             "note": (
                 "✅ 已保存并热加载，新值立即生效"
                 if reload_ok
                 else f"⚠️ 已写入文件但热加载失败（{reload_err}），需重启 Web 服务才能生效"
-            ),
+            ) + ("；鉴权配置已刷新，必要时请重新登录" if auth_reload else ""),
         })
 
     return app

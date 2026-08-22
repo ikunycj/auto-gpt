@@ -3,8 +3,9 @@
 配置读写层（供 WebUI /api/config 使用）。
 
 设计原则：
-    1. 白名单：只暴露"运行时安全"的开关/数值/默认值，协议级常量
-       （client_id / scope / sentinel 版本等）一律不开放，避免一改就废号。
+    1. 白名单：暴露运行时开关/数值/默认值，以及为自部署兼容而需要调整的
+       外部接口路径/方法；client_id / scope / sentinel 版本等不可变协议常量
+       仍然不开放，避免一改就废号。
     2. 所有 WebUI 可编辑项统一写入项目根 `.env`，不再修改 `config/*.py`。
     3. `config/*.py` 只保留默认值；运行时通过 config.env_loader 用 `.env` 覆盖。
     4. 读取时优先 `.env`，缺失时回退解析 `config/*.py` 默认值。
@@ -32,12 +33,12 @@ EDITABLE_FIELDS = [
     # ---- WebUI 授权 ----
     {
         "key": "WEBUI_AUTH_CODE", "file": "codex.py", "type": "str", "group": "WebUI 授权",
-        "label": "WebUI 授权码", "help": "仅保存在 .env（WEBUI_AUTH_CODE），避免出现在进程命令行中；保存后重启 WebUI 生效",
+        "label": "WebUI 授权码", "help": "仅保存在 .env（WEBUI_AUTH_CODE），避免出现在进程命令行中；保存后立即刷新鉴权，已有会话可能需要重新登录",
         "storage": "env", "secret": True,
     },
     {
         "key": "WEBUI_SESSION_SECRET", "file": "codex.py", "type": "str", "group": "WebUI 授权",
-        "label": "Session 签名密钥", "help": "可选，保存在 .env（WEBUI_SESSION_SECRET）；不填则从固定授权码派生，修改授权码会使已有登录失效",
+        "label": "Session 签名密钥", "help": "可选，保存在 .env（WEBUI_SESSION_SECRET）；不填则从授权码派生，修改此密钥会使已有登录失效",
         "storage": "env", "secret": True,
     },
     # ---- 功能开关 ----
@@ -88,6 +89,10 @@ EDITABLE_FIELDS = [
         "label": "Cloak用户目录", "help": "留空使用临时上下文；填写路径则持久化 cookies/cache",
     },
     {
+        "key": "CLOAK_EXTRA_ARGS", "file": "cloakbrowser.py", "type": "list_str_multiline", "group": "CloakBrowser",
+        "label": "Cloak Chromium 参数", "help": "每行一个额外启动参数，例如 --disable-gpu；通常保持为空",
+    },
+    {
         "key": "CLOAK_SELENIUM_TIMEOUT", "file": "cloakbrowser.py", "type": "int", "group": "CloakBrowser",
         "label": "Cloak超时", "help": "页面和元素等待超时时间，秒",
     },
@@ -101,6 +106,14 @@ EDITABLE_FIELDS = [
         "key": "BROWSER_USE_API_KEY", "file": "browser_use.py", "type": "str", "group": "Browser Use",
         "label": "Browser Use API Key", "help": "保存在 .env（BROWSER_USE_API_KEY），不写回 config/*.py",
         "storage": "env", "secret": True,
+    },
+    {
+        "key": "BROWSER_USE_CONNECT_MODE", "file": "browser_use.py", "type": "str", "group": "Browser Use",
+        "label": "连接方式", "help": "cdp_url=直接连接官方 CDP；sdk=预留的 REST 会话模式",
+    },
+    {
+        "key": "BROWSER_USE_API_BASE", "file": "browser_use.py", "type": "str", "group": "Browser Use",
+        "label": "REST API 地址", "help": "Browser Use REST API 根地址；通常保持默认值",
     },
     {
         "key": "BROWSER_USE_PROXY_COUNTRY_CODE", "file": "browser_use.py", "type": "str", "group": "Browser Use",
@@ -121,6 +134,10 @@ EDITABLE_FIELDS = [
     {
         "key": "BROWSER_USE_TIMEOUT", "file": "browser_use.py", "type": "int", "group": "Browser Use",
         "label": "操作超时(秒)", "help": "Playwright 默认操作超时",
+    },
+    {
+        "key": "BROWSER_USE_NAVIGATION_TIMEOUT", "file": "browser_use.py", "type": "int", "group": "Browser Use",
+        "label": "页面导航超时(秒)", "help": "页面打开和跳转的最长等待时间",
     },
     {
         "key": "BROWSER_USE_SESSION_TIMEOUT", "file": "browser_use.py", "type": "int", "group": "Browser Use",
@@ -211,8 +228,16 @@ EDITABLE_FIELDS = [
         "label": "获取团队接口", "help": "默认 /browser/workspace；点击获取团队/项目时会先试此路径，再自动尝试常见兼容路径",
     },
     {
+        "key": "ROXY_WORKSPACE_LIST_METHOD", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "label": "获取团队请求方法", "help": "Roxy 工作区列表请求方法，通常为 GET；仅在自部署 API 要求其他方法时调整",
+    },
+    {
         "key": "ROXY_OPEN_PATH", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
         "label": "打开接口路径", "help": "默认 /browser/open；如 Roxy 版本不同可在此调整",
+    },
+    {
+        "key": "ROXY_OPEN_METHOD", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "label": "打开接口方法", "help": "打开环境请求方法，常见为 POST；按 Roxy 版本 API 要求填写",
     },
     {
         "key": "ROXY_OPEN_HEADLESS", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
@@ -221,6 +246,18 @@ EDITABLE_FIELDS = [
     {
         "key": "ROXY_CLOSE_PATH", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
         "label": "关闭接口路径", "help": "默认 /browser/close",
+    },
+    {
+        "key": "ROXY_CLOSE_METHOD", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "label": "关闭接口方法", "help": "关闭环境请求方法，常见为 POST",
+    },
+    {
+        "key": "ROXY_CREATE_PATH", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "label": "创建接口路径", "help": "默认 /browser/create；如 Roxy 版本不同可在此调整",
+    },
+    {
+        "key": "ROXY_CREATE_METHOD", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "label": "创建接口方法", "help": "创建环境请求方法，常见为 POST",
     },
     {
         "key": "ROXY_KEEP_BROWSER_OPEN", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
@@ -243,6 +280,14 @@ EDITABLE_FIELDS = [
         "label": "随机OS范围", "help": "逗号分隔，默认 Windows,macOS；Roxy 支持 Windows / macOS / Linux / IOS / Android",
     },
     {
+        "key": "ROXY_DEFAULT_OS", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "label": "默认OS", "help": "关闭随机OS时使用；可填 Windows、macOS、Linux、IOS 或 Android",
+    },
+    {
+        "key": "ROXY_DEFAULT_OS_VERSION", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "label": "默认OS版本", "help": "可选固定版本，例如 15.3.2；留空使用 Roxy 默认版本",
+    },
+    {
         "key": "ROXY_RANDOM_PROFILE_NAME_ON_CREATE", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
         "label": "创建环境随机名称", "help": "创建 Roxy 环境时自动生成不同名称，避免固定 gpt-free-register",
     },
@@ -263,8 +308,28 @@ EDITABLE_FIELDS = [
         "label": "删除接口路径", "help": "默认 /browser/delete；如 Roxy 版本不同可调整",
     },
     {
+        "key": "ROXY_DELETE_METHOD", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "label": "删除接口方法", "help": "删除环境请求方法，常见为 POST",
+    },
+    {
+        "key": "ROXY_SELENIUM_TIMEOUT", "file": "roxybrowser.py", "type": "int", "group": "RoxyBrowser",
+        "label": "Selenium 超时(秒)", "help": "Roxy 浏览器页面和元素操作的最长等待时间",
+    },
+    {
+        "key": "ROXY_API_RETRIES", "file": "roxybrowser.py", "type": "int", "group": "RoxyBrowser",
+        "label": "API 重试次数", "help": "Roxy 临时网络错误的重试次数；创建接口通常不重试",
+    },
+    {
+        "key": "ROXY_API_RETRY_DELAY", "file": "roxybrowser.py", "type": "int", "group": "RoxyBrowser",
+        "label": "API 重试间隔(秒)", "help": "Roxy API 重试之间的基础等待时间",
+    },
+    {
         "key": "CODEX_OAUTH_DRIVER", "file": "codex.py", "type": "str", "group": "Codex",
         "label": "Codex授权驱动", "help": "本地推荐 chrome_cdp；protocol=原协议授权；roxy=用 RoxyBrowser；cloak=用 CloakBrowser；chrome_cdp=正常启动系统 Chrome 后通过 CDP 接管；browser_use=用 Browser Use Cloud；skyvern=用 Skyvern；same_as_registration=跟随注册驱动",
+    },
+    {
+        "key": "CODEX_REQUEST_TIMEOUT", "file": "codex.py", "type": "int", "group": "Codex",
+        "label": "Codex 请求超时(秒)", "help": "Codex OAuth 网络请求的最长等待时间",
     },
     {
         "key": "CHROME_CDP_EXECUTABLE_PATH", "file": "codex.py", "type": "str", "group": "Codex",
@@ -295,6 +360,24 @@ EDITABLE_FIELDS = [
         "label": "启用 Flow 触发", "help": "注册成功后自动调用内部 Flow 接口（不影响注册结果）",
     },
     {
+        "key": "FLOW_TRIGGER_URL", "file": "flow_trigger.py", "type": "str", "group": "Flow Trigger",
+        "label": "Flow 接口地址", "help": "注册成功后调用的 Flow HTTP 地址；启用功能时必填",
+    },
+    {
+        "key": "FLOW_TRIGGER_BEARER", "file": "flow_trigger.py", "type": "str", "group": "Flow Trigger",
+        "label": "Flow Bearer Token", "help": "写入 Authorization: Bearer 头；保存到 .env，不会写入源码",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "FLOW_TRIGGER_COOKIE", "file": "flow_trigger.py", "type": "str", "group": "Flow Trigger",
+        "label": "Flow Cookie", "help": "可选 Cookie 请求头；保存到 .env，不会写入源码",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "FLOW_TRIGGER_TIMEOUT", "file": "flow_trigger.py", "type": "int", "group": "Flow Trigger",
+        "label": "Flow 请求超时(秒)", "help": "调用 Flow 接口的最长等待时间",
+    },
+    {
         "key": "ENABLE_HUMANIZE_DELAY", "file": "humanize.py", "type": "bool", "group": "人工节奏",
         "label": "启用随机停顿", "help": "在注册、OTP、授权等步骤之间加入随机等待，更接近人工操作节奏",
     },
@@ -316,6 +399,11 @@ EDITABLE_FIELDS = [
         "label": "手动注册邮箱", "help": "USE_EMAIL_SERVICE=False 时必填。例如你的 outlook.com 地址；OTP 去网页邮箱看，再回任务页提交",
     },
     {
+        "key": "REGISTER_PASSWORD", "file": "register.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "注册密码", "help": "部分浏览器驱动或兼容流程需要；OTP-only 主流程通常留空。保存到 .env",
+        "storage": "env", "secret": True,
+    },
+    {
         "key": "REGISTER_NAME", "file": "register.py", "type": "str", "group": "邮箱 / OTP",
         "label": "显示名称", "help": "留空则自动生成英文名",
     },
@@ -326,6 +414,10 @@ EDITABLE_FIELDS = [
     {
         "key": "OTP_POLL_INTERVAL", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
         "label": "OTP 轮询间隔(秒)", "help": "每隔多少秒查一次新邮件",
+    },
+    {
+        "key": "OTP_SETTLE_SECONDS", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "OTP 收件稳定等待(秒)", "help": "首次抓到验证码后继续等待更晚邮件的时间；Outlook 双协议取件使用",
     },
     {
         "key": "EMAIL_SOURCE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
@@ -392,12 +484,24 @@ EDITABLE_FIELDS = [
         "label": "Outlook取件模式", "help": "auto=远端优先，远端 402/DEPLOYMENT_DISABLED 自动切 Graph 直连；direct=只用 Microsoft Graph 直连；remote=只用远端服务",
     },
     {
+        "key": "OUTLOOK_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Outlook 取件 API", "help": "远端 Outlook 取件服务根地址；自部署兼容服务可在此替换",
+    },
+    {
         "key": "EMAIL_DOMAIN", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
         "label": "转发域名(cloudflare_domain)", "help": "仅 cloudflare_domain 使用：Email Routing 的域名，如 mydomain.com；与 EMAIL_SOURCE=cloudflare 无关",
     },
     {
         "key": "QQ_EMAIL", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
         "label": "QQ 邮箱地址", "help": "仅 cloudflare_domain：接收 Email Routing 转发的 QQ 邮箱，如 123456@qq.com",
+    },
+    {
+        "key": "QQ_IMAP_SERVER", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "QQ IMAP 服务器", "help": "cloudflare_domain 收信服务器，默认 imap.qq.com",
+    },
+    {
+        "key": "QQ_IMAP_PORT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "QQ IMAP 端口", "help": "SSL IMAP 端口，默认 993",
     },
     {
         "key": "QQ_IMAP_PASSWORD", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
@@ -461,6 +565,10 @@ EDITABLE_FIELDS = [
     {
         "key": "IP_GEO_TIMEOUT", "file": "browser.py", "type": "float", "group": "浏览器画像",
         "label": "IP定位超时(秒)", "help": "出口 IP 地理信息接口的单次请求超时；接口失败会自动回退，不影响注册",
+    },
+    {
+        "key": "REJECT_CLOUD_PROXY", "file": "browser.py", "type": "bool", "group": "浏览器画像",
+        "label": "拒绝云代理出口", "help": "检测到云厂商代理组织时拒绝该出口并重新选代理；关闭后允许继续使用",
     },
 
     # ---- 代理池 ----
@@ -527,6 +635,18 @@ EDITABLE_FIELDS = [
         "key": "EXTRACT_LINK_WORKERS", "file": "extract_link.py", "type": "int", "group": "提链",
         "label": "提链并发数", "help": "批量提链后台线程数，建议 1-4",
     },
+    {
+        "key": "EXTRACT_LINK_QUEUE_LIMIT", "file": "extract_link.py", "type": "int", "group": "提链",
+        "label": "提链队列上限", "help": "后台待处理任务的最大数量，防止批量提交无限堆积",
+    },
+    {
+        "key": "EXTRACT_LINK_REQUEST_TIMEOUT", "file": "extract_link.py", "type": "int", "group": "提链",
+        "label": "提链请求超时(秒)", "help": "创建提链任务 HTTP 请求的最长等待时间",
+    },
+    {
+        "key": "EXTRACT_LINK_EVENT_TIMEOUT", "file": "extract_link.py", "type": "int", "group": "提链",
+        "label": "提链事件超时(秒)", "help": "等待提链服务完成事件的最长时间",
+    },
     # ---- Codex 配置 ----
     {
         "key": "SUB2API_AUTO_EXPORT", "file": "sub2api.py", "type": "bool", "group": "Codex",
@@ -556,6 +676,52 @@ EDITABLE_FIELDS = [
         "key": "SUB2API_PROXY_KEY", "file": "sub2api.py", "type": "str", "group": "Codex",
         "label": "Agent sub2 代理键", "help": "可选；写入 account.proxy_key，并在 proxies 为空时初始化 proxies[0].proxy_key",
     },
+    {
+        "key": "SUB2API_API_URL", "file": "sub2api.py", "type": "str", "group": "Codex",
+        "label": "sub2 兼容完整接口", "help": "旧版上传接口完整 URL；填写后优先于 API 基址拼接",
+    },
+    {
+        "key": "SUB2API_API_TOKEN", "file": "sub2api.py", "type": "str", "group": "Codex",
+        "label": "sub2 兼容 Token", "help": "旧配置名，作为 SUB2API_API_KEY 的兼容回退；保存到 .env",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "SUB2API_API_AUTH_HEADER", "file": "sub2api.py", "type": "str", "group": "Codex",
+        "label": "sub2 鉴权请求头", "help": "默认 x-api-key；自部署 sub2 服务可改为 Authorization 等",
+    },
+    {
+        "key": "SUB2API_API_AUTH_PREFIX", "file": "sub2api.py", "type": "str", "group": "Codex",
+        "label": "sub2 鉴权前缀", "help": "例如 Bearer；x-api-key 通常留空",
+    },
+    {
+        "key": "SUB2_CODEX_API_BASE", "file": "sub2api.py", "type": "str", "group": "Codex",
+        "label": "sub2 Codex API 基址", "help": "Codex OAuth 对接专用地址；留空时复用 sub2 API 基址",
+    },
+    {
+        "key": "SUB2_CODEX_AUTH_URL_PATH", "file": "sub2api.py", "type": "str", "group": "Codex",
+        "label": "sub2 授权地址路径", "help": "生成 Codex 授权链接的接口路径；默认 /api/v1/admin/openai/generate-auth-url",
+    },
+    {
+        "key": "SUB2_CODEX_CALLBACK_PATH", "file": "sub2api.py", "type": "str", "group": "Codex",
+        "label": "sub2 回调路径", "help": "提交 OAuth callback 的接口路径；默认 /api/v1/admin/openai/create-from-oauth",
+    },
+    {
+        "key": "SUB2_CODEX_API_TOKEN", "file": "sub2api.py", "type": "str", "group": "Codex",
+        "label": "sub2 Codex Token", "help": "Codex 对接专用 Token；为空时复用 sub2 API Key，保存到 .env",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "SUB2_CODEX_AUTH_HEADER", "file": "sub2api.py", "type": "str", "group": "Codex",
+        "label": "sub2 Codex 鉴权头", "help": "留空时复用 sub2 API 鉴权头",
+    },
+    {
+        "key": "SUB2_CODEX_AUTH_PREFIX", "file": "sub2api.py", "type": "str", "group": "Codex",
+        "label": "sub2 Codex 鉴权前缀", "help": "留空时复用 sub2 API 鉴权前缀",
+    },
+    {
+        "key": "SUB2_CODEX_CALLBACK_PAYLOAD_MODE", "file": "sub2api.py", "type": "str", "group": "Codex",
+        "label": "sub2 回调载荷模式", "help": "create_from_oauth=创建账号；exchange_code=仅换 token",
+    },
     # ---- 接码平台 ----
     # ---- Codex：基础 / CPA / sub2api 配置 ----
     {
@@ -576,6 +742,14 @@ EDITABLE_FIELDS = [
         "label": "CPA 超时(秒)", "help": "请求 CPA 管理接口的超时时间",
     },
     {
+        "key": "CPA_CALLBACK_SUBMIT_RETRIES", "file": "codex.py", "type": "int", "group": "Codex",
+        "label": "CPA 回调重试次数", "help": "提交 OAuth callback 遇到超时、409 或 5xx 时的重试次数",
+    },
+    {
+        "key": "CPA_CALLBACK_SUBMIT_RETRY_DELAY", "file": "codex.py", "type": "int", "group": "Codex",
+        "label": "CPA 回调重试间隔(秒)", "help": "每次 CPA callback 重试前的基础等待时间",
+    },
+    {
         "key": "CPA_SAVE_CALLBACK_RECEIPT", "file": "codex.py", "type": "bool", "group": "Codex",
         "label": "保存CPA回执", "help": "CPA 未返回完整授权文件时，本地仍保存一份回调提交记录",
     },
@@ -583,6 +757,10 @@ EDITABLE_FIELDS = [
     {
         "key": "SMS_PROVIDER", "file": "codex.py", "type": "str", "group": "接码平台",
         "label": "接码通道", "help": "grizzly / l / h / fixed_url；fixed_url 使用固定手机号和取码 URL",
+    },
+    {
+        "key": "SMS_API_BASE", "file": "codex.py", "type": "str", "group": "接码平台",
+        "label": "Grizzly API 地址", "help": "GrizzlySMS handler API 地址；自部署或兼容服务可在此替换",
     },
     {
         "key": "SMS_COUNTRY", "file": "codex.py", "type": "str", "group": "接码平台",
@@ -593,12 +771,24 @@ EDITABLE_FIELDS = [
         "label": "服务/项目代码", "help": "GrizzlySMS/L 作为 service；H 通道作为 H_API.md 的 projectId",
     },
     {
+        "key": "SMS_MAX_PRICE", "file": "codex.py", "type": "str", "group": "接码平台",
+        "label": "短信最高价格", "help": "可选，透传给支持价格过滤的接码平台；留空表示不限",
+    },
+    {
         "key": "SMS_MAX_RETRIES", "file": "codex.py", "type": "int", "group": "接码平台",
         "label": "换号重试次数", "help": "一个号收不到短信/被OpenAI拒时换下一个号，最多重试几次",
     },
     {
         "key": "SMS_CODE_WAIT", "file": "codex.py", "type": "int", "group": "接码平台",
         "label": "单号等短信(秒)", "help": "单个号等待短信到达的最长秒数，超时则换号",
+    },
+    {
+        "key": "SMS_POLL_INTERVAL", "file": "codex.py", "type": "int", "group": "接码平台",
+        "label": "短信轮询间隔(秒)", "help": "调用接码平台查询验证码的间隔",
+    },
+    {
+        "key": "SMS_REQUEST_TIMEOUT", "file": "codex.py", "type": "int", "group": "接码平台",
+        "label": "短信请求超时(秒)", "help": "接码平台 HTTP 请求的最长等待时间",
     },
     {
         "key": "SMS_API_KEY", "file": "codex.py", "type": "str", "group": "接码平台",

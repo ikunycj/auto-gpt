@@ -110,4 +110,37 @@ ROXY_PROFILE_CREATE_PAYLOAD: dict = {
 ROXY_CODEX_CALLBACK_TIMEOUT: int = 180
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'REGISTRATION_DRIVER': 'str', 'ROXY_API_BASE': 'str', 'ROXY_API_TOKEN': 'str', 'ROXY_PROFILE_ID': 'str', 'ROXY_WORKSPACE_ID': 'str', 'ROXY_PROJECT_ID': 'str', 'ROXY_WORKSPACE_LIST_PATH': 'str', 'ROXY_OPEN_PATH': 'str', 'ROXY_OPEN_HEADLESS': 'bool', 'ROXY_CLOSE_PATH': 'str', 'ROXY_KEEP_BROWSER_OPEN': 'bool', 'ROXY_ONE_PROFILE_PER_ACCOUNT': 'bool', 'ROXY_DELETE_PROFILE_AFTER_RUN': 'bool', 'ROXY_RANDOM_OS_ON_CREATE': 'bool', 'ROXY_RANDOM_OS_CHOICES': 'str', 'ROXY_RANDOM_PROFILE_NAME_ON_CREATE': 'bool', 'ROXY_PROFILE_NAME_PREFIX': 'str', 'ROXY_CREATE_USE_PROXY_POOL': 'bool', 'ROXY_PROXY_CHECK_CHANNEL': 'str', 'ROXY_DELETE_PATH': 'str', 'ROXY_CODEX_CALLBACK_TIMEOUT': 'int'})
+apply_env_overrides(globals(), {
+    'REGISTRATION_DRIVER': 'str',
+    'ROXY_API_BASE': 'str',
+    'ROXY_API_TOKEN': 'str',
+    'ROXY_PROFILE_ID': 'str',
+    'ROXY_WORKSPACE_ID': 'str',
+    'ROXY_PROJECT_ID': 'str',
+    'ROXY_WORKSPACE_LIST_PATH': 'str',
+    'ROXY_WORKSPACE_LIST_METHOD': 'str',
+    'ROXY_OPEN_PATH': 'str',
+    'ROXY_OPEN_METHOD': 'str',
+    'ROXY_CLOSE_PATH': 'str',
+    'ROXY_CLOSE_METHOD': 'str',
+    'ROXY_CREATE_PATH': 'str',
+    'ROXY_CREATE_METHOD': 'str',
+    'ROXY_OPEN_HEADLESS': 'bool',
+    'ROXY_SELENIUM_TIMEOUT': 'int',
+    'ROXY_KEEP_BROWSER_OPEN': 'bool',
+    'ROXY_API_RETRIES': 'int',
+    'ROXY_API_RETRY_DELAY': 'int',
+    'ROXY_ONE_PROFILE_PER_ACCOUNT': 'bool',
+    'ROXY_DELETE_PROFILE_AFTER_RUN': 'bool',
+    'ROXY_DELETE_PATH': 'str',
+    'ROXY_DELETE_METHOD': 'str',
+    'ROXY_RANDOM_OS_ON_CREATE': 'bool',
+    'ROXY_RANDOM_OS_CHOICES': 'str',
+    'ROXY_DEFAULT_OS': 'str',
+    'ROXY_DEFAULT_OS_VERSION': 'str',
+    'ROXY_RANDOM_PROFILE_NAME_ON_CREATE': 'bool',
+    'ROXY_PROFILE_NAME_PREFIX': 'str',
+    'ROXY_CREATE_USE_PROXY_POOL': 'bool',
+    'ROXY_PROXY_CHECK_CHANNEL': 'str',
+    'ROXY_CODEX_CALLBACK_TIMEOUT': 'int',
+})

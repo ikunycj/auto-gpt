@@ -20,32 +20,26 @@ _SESSION_KEY = "webui_auth_ok"
 _AUTH_CODE: str | None = None
 _GENERATED = False
 
-def init_auth(app: Any, *, auth_code: str | None = None) -> str:
-    """初始化授权码和 Flask session。未显式配置时生成临时授权码。"""
-    global _AUTH_CODE, _GENERATED
 
-    code = (auth_code or "").strip()
-    if not code:
-        try:
-            from config.env_loader import load_env, env_str
-            load_env(override=False)
-            for key in AUTH_ENV_KEYS:
-                code = env_str(key, "")
-                if code:
-                    break
-        except Exception:
-            for key in AUTH_ENV_KEYS:
-                code = (os.getenv(key) or "").strip()
-                if code:
-                    break
+def _configured_auth_code(*, override_env: bool = False) -> str:
+    """Read the first configured WebUI auth code from .env/environment."""
+    try:
+        from config.env_loader import load_env, env_str
 
-    if not code:
-        code = secrets.token_urlsafe(18)
-        _GENERATED = True
-    else:
-        _GENERATED = False
+        load_env(override=override_env)
+        for key in AUTH_ENV_KEYS:
+            code = env_str(key, "")
+            if code:
+                return code
+    except Exception:
+        for key in AUTH_ENV_KEYS:
+            code = (os.getenv(key) or "").strip()
+            if code:
+                return code
+    return ""
 
-    _AUTH_CODE = code
+
+def _set_session_secret(app: Any, code: str) -> None:
     session_secret = os.getenv("WEBUI_SESSION_SECRET") or os.getenv("FLASK_SECRET_KEY")
     if not session_secret:
         # 授权码来自 .env 时，用带命名空间的摘要生成稳定签名密钥；修改授权码会自然注销旧会话。
@@ -56,7 +50,56 @@ def init_auth(app: Any, *, auth_code: str | None = None) -> str:
         SESSION_COOKIE_SAMESITE="Lax",
         PERMANENT_SESSION_LIFETIME=timedelta(days=30),
     )
+
+
+def init_auth(app: Any, *, auth_code: str | None = None) -> str:
+    """初始化授权码和 Flask session。未显式配置时生成临时授权码。"""
+    global _AUTH_CODE, _GENERATED
+
+    code = (auth_code or "").strip()
+    if not code:
+        code = _configured_auth_code(override_env=False)
+
+    if not code:
+        code = secrets.token_urlsafe(18)
+        _GENERATED = True
+    else:
+        _GENERATED = False
+
+    _AUTH_CODE = code
+    _set_session_secret(app, code)
     return code
+
+
+def reload_auth_from_environment(app: Any) -> dict[str, Any]:
+    """Refresh the auth code/session secret after WebUI settings are saved.
+
+    A generated temporary code is retained when no persistent code has been
+    configured, so saving an unrelated setting does not strand the operator.
+    Once a code is written to ``.env``, it becomes effective immediately.
+    """
+    global _AUTH_CODE, _GENERATED
+
+    previous = _AUTH_CODE or ""
+    configured = _configured_auth_code(override_env=True)
+    if configured:
+        code = configured
+        generated = False
+    elif _GENERATED and previous:
+        code = previous
+        generated = True
+    else:
+        code = secrets.token_urlsafe(18)
+        generated = True
+
+    _AUTH_CODE = code
+    _GENERATED = generated
+    _set_session_secret(app, code)
+    return {
+        "changed": code != previous,
+        "generated": generated,
+        "code": code,
+    }
 
 
 def is_generated_code() -> bool:

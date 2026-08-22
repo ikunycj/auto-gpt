@@ -63,4 +63,19 @@ BROWSER_USE_EXTRA_QUERY: dict = {}
 BROWSER_USE_START_URL: str = "https://chatgpt.com/auth/login"
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'BROWSER_USE_API_KEY': 'str', 'BROWSER_USE_PROXY_COUNTRY_CODE': 'str', 'BROWSER_USE_USE_PROXY': 'bool', 'BROWSER_USE_PROFILE_ID': 'str', 'BROWSER_USE_CDP_BASE': 'str', 'BROWSER_USE_TIMEOUT': 'int', 'BROWSER_USE_SESSION_TIMEOUT': 'int', 'BROWSER_USE_FAST_MODE': 'bool', 'BROWSER_USE_LOG_TIMING': 'bool', 'BROWSER_USE_KEEP_BROWSER_OPEN': 'bool', 'BROWSER_USE_START_URL': 'str'})
+apply_env_overrides(globals(), {
+    'BROWSER_USE_API_KEY': 'str',
+    'BROWSER_USE_CONNECT_MODE': 'str',
+    'BROWSER_USE_CDP_BASE': 'str',
+    'BROWSER_USE_API_BASE': 'str',
+    'BROWSER_USE_PROXY_COUNTRY_CODE': 'str',
+    'BROWSER_USE_USE_PROXY': 'bool',
+    'BROWSER_USE_PROFILE_ID': 'str',
+    'BROWSER_USE_TIMEOUT': 'int',
+    'BROWSER_USE_NAVIGATION_TIMEOUT': 'int',
+    'BROWSER_USE_SESSION_TIMEOUT': 'int',
+    'BROWSER_USE_FAST_MODE': 'bool',
+    'BROWSER_USE_LOG_TIMING': 'bool',
+    'BROWSER_USE_KEEP_BROWSER_OPEN': 'bool',
+    'BROWSER_USE_START_URL': 'str',
+})
