@@ -19,6 +19,13 @@ from urllib.parse import quote, urlparse
 import pyotp
 
 from core import sms_provider, sqlite_store
+from core.import_parser import (
+    clean_import_value,
+    is_http_url,
+    iter_import_splits,
+    parse_account_material_line,
+    split_import_line,
+)
 
 _ROOT = Path(__file__).resolve().parent.parent
 # The following paths are stable SQLite source-key labels. They are retained
@@ -170,11 +177,7 @@ def initialize_storage() -> dict:
 
 
 def _valid_url(value: str) -> bool:
-    try:
-        parsed = urlparse(value)
-        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
-    except Exception:
-        return False
+    return is_http_url(value)
 
 
 def _normalize_phone(value: str) -> str:
@@ -201,6 +204,73 @@ def _normalize_totp_secret(value: str) -> str:
     except Exception as exc:
         raise ValueError("2FA 密钥不是有效的 Base32 或 otpauth:// URI") from exc
     return value
+
+
+def _auto_import_parts(line: str) -> list[str]:
+    """Choose an automatic account split without damaging URL query strings."""
+    # Prefer the richer formats first.  URL/phone combinations are selected
+    # by validation; plain four-field Outlook material falls back to its first
+    # structural candidate, preserving tokens that contain separators.
+    for count in (6, 5, 4, 3):
+        candidates = list(iter_import_splits(line, count))
+        if not candidates:
+            continue
+        if count == 6:
+            match = next(
+                (
+                    candidate for candidate in candidates
+                    if _EMAIL_RE.match(candidate[0])
+                    and _valid_url(candidate[2])
+                    and _valid_url(candidate[5])
+                    and 7 <= len(_normalize_phone(candidate[4]).lstrip("+")) <= 15
+                ),
+                None,
+            )
+            if match:
+                return list(match)
+        elif count == 5:
+            match = next(
+                (
+                    candidate for candidate in candidates
+                    if _EMAIL_RE.match(candidate[0])
+                    and _valid_url(candidate[4])
+                    and 7 <= len(_normalize_phone(candidate[3]).lstrip("+")) <= 15
+                ),
+                None,
+            )
+            if match:
+                return list(match)
+        elif count == 4:
+            match = next(
+                (
+                    candidate for candidate in candidates
+                    if _EMAIL_RE.match(candidate[0])
+                    and _valid_url(candidate[1])
+                    and _valid_url(candidate[3])
+                    and 7 <= len(_normalize_phone(candidate[2]).lstrip("+")) <= 15
+                ),
+                None,
+            )
+            if match:
+                return list(match)
+            # Outlook is the other four-field auto format.  Its fields are
+            # opaque, so the earliest structural candidate is the safest one.
+            if _EMAIL_RE.match(candidates[0][0]):
+                return list(candidates[0])
+        elif count == 3:
+            match = next(
+                (
+                    candidate for candidate in candidates
+                    if _EMAIL_RE.match(candidate[0]) and _valid_url(candidate[2])
+                ),
+                None,
+            )
+            if match:
+                return list(match)
+            if _EMAIL_RE.match(candidates[0][0]):
+                return list(candidates[0])
+
+    return split_import_line(line, max_fields=2)
 
 
 def _parse_record(
@@ -235,9 +305,23 @@ def _parse_record(
             "sms_code_url": data.get("sms_code_url") or data.get("sms_url"),
         }
     else:
-        delimiter = "----" if "----" in line else "\t"
-        parts = [x.strip() for x in line.split(delimiter)]
-        if format_name == "generic_api":
+        semantic_record = parse_account_material_line(line) if format_name == "auto" else None
+        if semantic_record is not None:
+            record = semantic_record
+            parts = []
+        elif format_name == "generic_api":
+            parts = split_import_line(line, max_fields=2)
+        elif format_name == "chatgpt_email_url" or format_name == "chatgpt_totp":
+            parts = split_import_line(line, max_fields=3)
+        elif format_name == "outlook":
+            parts = split_import_line(line, max_fields=4)
+        elif format_name == "combined":
+            parts = split_import_line(line, max_fields=6)
+        else:
+            parts = _auto_import_parts(line)
+        if semantic_record is not None:
+            pass
+        elif format_name == "generic_api":
             if len(parts) != 2:
                 raise ValueError(f"第 {line_no} 行通用 API 格式应为：邮箱----邮箱取码URL")
             email, email_url = parts
@@ -304,7 +388,7 @@ def _parse_record(
         else:
             raise ValueError(f"第 {line_no} 行字段数应为 2、3、4、5 或 6")
 
-    record = {k: str(v or "").strip() for k, v in record.items()}
+    record = {k: clean_import_value(v) for k, v in record.items()}
     email = record.get("email", "").lower()
     if not _EMAIL_RE.match(email):
         raise ValueError(f"第 {line_no} 行邮箱格式错误")

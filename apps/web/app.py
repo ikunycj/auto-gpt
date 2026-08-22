@@ -21,6 +21,15 @@ from urllib.parse import urlparse
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 from core import codex_retry_service, codex_relay_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service, sqlite_store
+from core.import_parser import (
+    clean_import_value,
+    is_email,
+    is_http_url,
+    looks_like_access_token,
+    looks_like_totp,
+    parse_account_material_line,
+    split_import_line,
+)
 from apps.web.auth import init_auth, register_auth_routes
 from registration.application import job_service as svc
 from apps.web import config_editor
@@ -1334,8 +1343,8 @@ def create_app(auth_code: str | None = None) -> Flask:
         """
         粘贴文本导入邮箱素材。
         Outlook：email----password----clientId----refreshToken
-        通用 API：email----code_url
-        分隔符兼容 ---- 与 ====。
+        通用 API：按内容识别 email 与 code_url。
+        分隔符读取 EMAIL_IMPORT_SEPARATORS 配置。
         """
         data = request.get_json(silent=True) or {}
         source = (data.get("source") or data.get("type") or "").strip()
@@ -1348,31 +1357,56 @@ def create_app(auth_code: str | None = None) -> Flask:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            parts = line.split("----") if "----" in line else line.split("====")
-            parts = [p.strip() for p in parts]
             if source == "generic_api":
-                if len(parts) < 2:
+                legacy_parts = split_import_line(line, max_fields=4)
+                legacy_prefix = (
+                    3 <= len(legacy_parts) <= 4
+                    and is_email(legacy_parts[0])
+                    and is_http_url(legacy_parts[1])
+                )
+                legacy_shape = (
+                    legacy_prefix
+                    and looks_like_access_token(legacy_parts[2])
+                    and (len(legacy_parts) == 3 or looks_like_totp(legacy_parts[3]))
+                )
+                if legacy_shape:
+                    # Former fixed-position API: email, code_url,
+                    # access_token, optional totp_secret.
+                    record = {
+                        "email": clean_import_value(legacy_parts[0]).lower(),
+                        "code_url": clean_import_value(legacy_parts[1]),
+                        "access_token": clean_import_value(legacy_parts[2]),
+                    }
+                    if len(legacy_parts) == 4:
+                        record["totp_secret"] = clean_import_value(legacy_parts[3])
+                    records.append(record)
+                    continue
+
+                material = parse_account_material_line(line)
+                if not material or not material.get("email_code_url"):
+                    continue
+                if not is_email(material.get("email")):
                     continue
                 records.append({
-                    "email": parts[0],
-                    "code_url": parts[1],
-                    "access_token": parts[2] if len(parts) > 2 else "",
-                    "totp_secret": parts[3] if len(parts) > 3 else "",
+                    "email": material["email"],
+                    "code_url": material["email_code_url"],
+                    "totp_secret": material.get("totp_secret") or "",
                 })
                 continue
+            parts = split_import_line(line, max_fields=6)
             if len(parts) < 4:
                 continue
             records.append({
-                "email": parts[0],
-                "password": parts[1],
-                "client_id": parts[2],
-                "refresh_token": parts[3],
-                "access_token": parts[4] if len(parts) > 4 else "",
-                "totp_secret": parts[5] if len(parts) > 5 else "",
+                "email": clean_import_value(parts[0]),
+                "password": clean_import_value(parts[1]),
+                "client_id": clean_import_value(parts[2]),
+                "refresh_token": clean_import_value(parts[3]),
+                "access_token": clean_import_value(parts[4]) if len(parts) > 4 else "",
+                "totp_secret": clean_import_value(parts[5]) if len(parts) > 5 else "",
             })
         if not records:
             need = "2 段：邮箱----取码地址" if source == "generic_api" else "4 段：email----password----clientId----refreshToken"
-            return jsonify({"ok": False, "error": f"未解析到有效邮箱行（需 {need}，---- 或 ==== 分隔）"}), 400
+            return jsonify({"ok": False, "error": f"未解析到有效邮箱行（需 {need}，支持 ---、----、| 或 ==== 分隔）"}), 400
         if as_registered:
             inserted, skipped = db.import_registered_email_accounts(records, source=source)
         elif source == "generic_api":

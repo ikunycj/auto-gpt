@@ -47,14 +47,15 @@ ChatGPT / OpenAI 账号注册与 Codex OAuth 授权工具。项目提供本地 W
 
 `config/email.py` 中的 `EMAIL_SOURCE` 支持多个来源组合：
 
-- **Outlook**：素材格式为 `email----password----clientId----refreshToken`。
-- **通用 API**：素材格式为 `email----code_url`。
+- **Outlook**：专用素材格式为 `email----password----clientId----refreshToken`。
+- **通用 API**：按内容提取邮箱和 `http://` / `https://` 接码地址。
+- **Relay 账号**：导入器不要求固定顺序；邮箱、接码地址、Base32/TOTP 2FA（通常 16-64 个字符）按内容识别，剩余的单个字段作为密码。
 - **GPTMail**：运行时创建临时邮箱并通过 API 取码。
 - **Cloudflare Worker**：使用 Worker API 创建地址并轮询验证码，标识为 `cloudflare`。
 - **Cloudflare 域名邮箱**：本地生成地址，通过 QQ IMAP 收信，标识为 `cloudflare_domain`。
 - **MailNest / CloudMail**：按对应服务的 API 配置获取临时邮箱。
 
-邮箱素材可以从 WebUI 导入，也可以显式指定历史文本作为一次性导入入口。导入后，邮箱池正文存储在 SQLite，不依赖根目录文本文件持续运行。
+邮箱素材可以从 WebUI 导入，也可以显式指定历史文本作为一次性导入入口。导入器支持 `---`、`----`、`|`、`====`，并能保留接码 URL 内部出现的分隔符。分隔符可在 WebUI「配置 → 邮箱 / OTP → 导入分隔符」中设置，多个分隔符用英文逗号分隔，默认值为 `---,----,|,====`。导入后，邮箱池正文存储在 SQLite，不依赖根目录文本文件持续运行。
 
 ### 2.3 Codex OAuth 与接码
 
@@ -135,6 +136,14 @@ email@example.com----mail-password----client-id----refresh-token
 ```text
 email@example.com----https://mail.example.com/code?id=...
 ```
+
+Relay 账号也可以按内容乱序粘贴，密码和 2FA 为可选字段：
+
+```text
+密码|JBSWY3DPEHPK3PXP|email@example.com|https://mail.example.com/code?id=...
+```
+
+Markdown 链接（`[说明](https://...)`）和聊天复制产生的反斜杠转义也会自动清理。接码 URL 查询参数或路径中如果包含 `----` 等分隔符，且没有其他可识别字段，解析器会将其视为 URL 内容保留。
 
 在 `config/email.py` 选择来源，例如：
 

@@ -24,6 +24,10 @@ USE_EMAIL_SERVICE = False
 #   "cloudmail"         — CloudMail/Cloud Mail API（自动从平台获取域名并随机生成邮箱）
 EMAIL_SOURCE = "outlook,generic_api,mailnest"
 
+# 导入账号/邮箱素材时使用的分隔符。逗号分隔，可在 WebUI「配置 → 邮箱 / OTP」修改。
+# 默认兼容三短横线、四短横线、竖线和历史四等号格式。
+EMAIL_IMPORT_SEPARATORS = env_str("EMAIL_IMPORT_SEPARATORS", "---,----,|,====")
+
 
 # ============================================================
 # Outlook 模式（外购账号池 + 取信服务）

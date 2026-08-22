@@ -22,6 +22,7 @@ from urllib.parse import quote, unquote, urlparse, urlunparse
 import requests
 
 from config import email as _email_cfg
+from core.import_parser import clean_import_value, parse_email_code_url_line
 from core.otp_utils import extract_otp
 
 logger = logging.getLogger(__name__)
@@ -500,7 +501,7 @@ def pick_account() -> GenericApiEmailAccount:
 
 
 def import_from_file(path: str | Path | None = None) -> tuple[int, int]:
-    """从文本文件导入通用 API 邮箱，每行：email----code_url 或 email====code_url。"""
+    """从文本文件导入通用 API 邮箱，按内容识别邮箱和接码 URL。"""
     from core.db import import_generic_api_emails
     p = Path(path) if path else _ACCOUNTS_FILE
     if not p.is_absolute():
@@ -512,11 +513,11 @@ def import_from_file(path: str | Path | None = None) -> tuple[int, int]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split("----") if "----" in line else line.split("====")
-        parts = [x.strip() for x in parts]
-        if len(parts) < 2:
+        parsed = parse_email_code_url_line(line)
+        if not parsed:
             continue
-        records.append({"email": parts[0], "code_url": parts[1]})
+        email, code_url = parsed
+        records.append({"email": clean_import_value(email), "code_url": clean_import_value(code_url)})
     return import_generic_api_emails(records)
 
 

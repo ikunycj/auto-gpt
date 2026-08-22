@@ -332,6 +332,10 @@ EDITABLE_FIELDS = [
         "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail",
     },
     {
+        "key": "EMAIL_IMPORT_SEPARATORS", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "导入分隔符", "help": "账号/邮箱素材的分隔符，多个用逗号分隔；默认 --- , ---- , | , ====。保存后立即生效",
+    },
+    {
         "key": "GPTMAIL_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
         "label": "GPTMail API Key", "help": "选择 gptmail 邮箱来源时必填；保存在 .env，不会写入 config 源码",
         "storage": "env", "secret": True,
