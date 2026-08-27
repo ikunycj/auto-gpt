@@ -45,6 +45,10 @@ _ALIASES: dict[str, str] = {
     "browser-use": "browser_use",
     "bu": "browser_use",
     "sv": "skyvern",
+    "chrome-cdp": "chrome_cdp",
+    "chrome": "chrome_cdp",
+    "local_chrome": "chrome_cdp",
+    "system_chrome": "chrome_cdp",
 }
 
 _DRIVERS: dict[str, RegistrationDriver] = {
@@ -55,6 +59,9 @@ _DRIVERS: dict[str, RegistrationDriver] = {
         "browser_use", "registration.drivers.browser_use", "run"
     ),
     "skyvern": LazyFunctionDriver("skyvern", "registration.drivers.skyvern", "run"),
+    "chrome_cdp": LazyFunctionDriver(
+        "chrome_cdp", "registration.drivers.chrome_cdp", "run"
+    ),
 }
 
 

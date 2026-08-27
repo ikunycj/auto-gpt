@@ -126,7 +126,14 @@ def _validate_with_retry(session: BrowserSession, email: str, otp_after_ts: floa
     raise last_exc if last_exc else RuntimeError("OTP 验证失败")
 
 
-def authenticate_account_session(email: str, proxy: str | None = None, otp_provider=None):
+def authenticate_account_session(
+    email: str,
+    proxy: str | None = None,
+    otp_provider=None,
+    *,
+    login_password: str | None = None,
+    totp_provider=None,
+):
     """Authenticate an existing account and return its live BrowserSession.
 
     This is intentionally separate from the liveness result so maintenance actions
@@ -135,6 +142,26 @@ def authenticate_account_session(email: str, proxy: str | None = None, otp_provi
     email = str(email or "").strip()
     if not email:
         raise ValueError("email 不能为空")
+    if str(login_password or "").strip():
+        from core.chatgpt_browser_login import (
+            PasswordLoginUnavailable,
+            authenticate_chatgpt_with_password,
+        )
+
+        logger.info("[查活] 检测到已确认的 ChatGPT 密码，优先使用密码登录")
+        try:
+            session, session_info = authenticate_chatgpt_with_password(
+                email,
+                str(login_password),
+                proxy=proxy,
+                totp_provider=totp_provider,
+            )
+            setattr(session, "authentication_method", "password")
+            return session, session_info
+        except PasswordLoginUnavailable as exc:
+            logger.info("[查活] 当前页面不提供密码登录，回退邮箱 OTP：%s", str(exc)[:180])
+
+    logger.info("[查活] 使用邮箱 OTP 登录")
     session, authorize_url = _network_preflight_with_retry(email, proxy)
     try:
         otp_after_ts = time.time()
@@ -160,6 +187,7 @@ def authenticate_account_session(email: str, proxy: str | None = None, otp_provi
             raise RuntimeError("该邮箱登录后进入资料页，疑似不是完整已注册账号")
         follow_oauth_callback(session, str(continue_url), referer="https://auth.openai.com/email-verification")
         session_info = fetch_session(session)
+        setattr(session, "authentication_method", "email_otp")
         return session, session_info
     except Exception:
         try:
@@ -169,7 +197,15 @@ def authenticate_account_session(email: str, proxy: str | None = None, otp_provi
         raise
 
 
-def check_account_liveness(email: str, proxy: str | None = None, *, clear_log: bool = True, otp_provider=None) -> dict:
+def check_account_liveness(
+    email: str,
+    proxy: str | None = None,
+    *,
+    clear_log: bool = True,
+    otp_provider=None,
+    login_password: str | None = None,
+    totp_provider=None,
+) -> dict:
     """
     重新登录账号并刷新最新 accessToken。
 
@@ -210,34 +246,14 @@ def check_account_liveness(email: str, proxy: str | None = None, *, clear_log: b
 
         logger.info("[查活] 日志文件：%s", path)
         logger.info("[查活] 开始重新登录：%s", email)
-        logger.info("[查活] 流程：Providers → CSRF → Signin → Authorize → 邮箱 OTP → OAuth callback → Session/AT")
-        session, authorize_url = _network_preflight_with_retry(email, proxy)
-
-        otp_after_ts = time.time()
-        final_url = follow_authorize(session, authorize_url)
-        dead_code = detect_account_unusable_text(final_url)
-        if dead_code:
-            return {"ok": False, "status": "deactivated", "checked_at": checked_at, "error": dead_code}
-
-        validate_result = _validate_with_retry(session, email, otp_after_ts, otp_provider=otp_provider)
-        page = validate_result.get("page") if isinstance(validate_result, dict) else {}
-        page = page if isinstance(page, dict) else {}
-        page_type = str(page.get("type") or "")
-        continue_url = (
-            validate_result.get("continue_url")
-            or validate_result.get("external_url")
-            or validate_result.get("url")
-            or page.get("continue_url")
-            or page.get("external_url")
-            or page.get("url")
+        logger.info("[查活] 流程：有密码先走浏览器密码登录；无密码/页面仅 OTP 时走邮箱 OTP；最后校验 Session/AT")
+        session, session_info = authenticate_account_session(
+            email,
+            proxy=proxy,
+            otp_provider=otp_provider,
+            login_password=login_password,
+            totp_provider=totp_provider,
         )
-        if not continue_url:
-            raise RuntimeError(f"OTP 登录成功但没有 OAuth continue_url: {validate_result}")
-        if "about-you" in str(continue_url) or page_type in {"about_you", "about-you"}:
-            raise RuntimeError(f"该邮箱登录后进入资料页，疑似不是完整已注册账号: page_type={page_type}, continue_url={continue_url}")
-
-        follow_oauth_callback(session, str(continue_url), referer="https://auth.openai.com/email-verification")
-        session_info = fetch_session(session)
         access_token = str(session_info.get("accessToken") or "")
         if not access_token:
             raise RuntimeError("重新登录后未拿到 accessToken")
@@ -253,6 +269,7 @@ def check_account_liveness(email: str, proxy: str | None = None, *, clear_log: b
             "session": session_info,
             "device_id": session.device_id,
             "proxy_used": session.proxy or None,
+            "auth_method": getattr(session, "authentication_method", "email_otp"),
         }
     except AccountUnusableError as exc:
         code = getattr(exc, "error_code", "") or detect_account_unusable_text(str(exc)) or "account_deactivated"
@@ -267,6 +284,11 @@ def check_account_liveness(email: str, proxy: str | None = None, *, clear_log: b
         return {"ok": False, "status": "failed", "checked_at": checked_at, "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
     finally:
         try:
+            try:
+                if "session" in locals() and session is not None:
+                    session.session.close()
+            except Exception:
+                pass
             logger.info("[查活] 结束：%s", email)
             if fh is not None:
                 root_logger.removeHandler(fh)

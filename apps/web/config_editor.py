@@ -41,286 +41,281 @@ EDITABLE_FIELDS = [
         "label": "Session 签名密钥", "help": "可选，保存在 .env（WEBUI_SESSION_SECRET）；不填则从授权码派生，修改此密钥会使已有登录失效",
         "storage": "env", "secret": True,
     },
-    # ---- 功能开关 ----
     {
-        "key": "ENABLE_CODEX_AUTO", "file": "codex.py", "type": "bool", "group": "功能开关",
-        "label": "启用 Codex OAuth", "help": "注册成功后自动跑 Codex 授权（全新session+接码），落盘 codex-邮箱.json",
-    },
-    {
-        "key": "REGISTRATION_DRIVER", "file": "roxybrowser.py", "type": "str", "group": "注册方式",
-        "label": "注册驱动", "help": "默认推荐 roxy；protocol=纯协议，容易封号不建议；roxy=RoxyBrowser；cloak=CloakBrowser；browser_use=Browser Use Cloud+Playwright；skyvern=Skyvern Browser Sessions+Playwright",
+        "key": "REGISTRATION_DRIVER", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
+        "label": "注册驱动", "help": "本机推荐 chrome_cdp；浏览器驱动优先邮箱 OTP，仅在 OpenAI 没有 OTP 入口且强制创建密码时使用密码兜底；protocol 始终是纯邮箱 OTP 流程",
     },
 
     # ---- CloakBrowser ----
     {
-        "key": "CLOAK_HEADLESS", "file": "cloakbrowser.py", "type": "bool", "group": "CloakBrowser",
+        "key": "CLOAK_HEADLESS", "file": "cloakbrowser.py", "type": "bool", "group": "代理浏览器",
         "label": "Cloak无头", "help": "True=无头运行；False=显示浏览器窗口",
     },
     {
-        "key": "CLOAK_HUMANIZE", "file": "cloakbrowser.py", "type": "bool", "group": "CloakBrowser",
+        "key": "CLOAK_HUMANIZE", "file": "cloakbrowser.py", "type": "bool", "group": "代理浏览器",
         "label": "Cloak人工行为", "help": "启用 CloakBrowser humanize 鼠标/键盘/滚动行为",
     },
     {
-        "key": "CLOAK_GEOIP", "file": "cloakbrowser.py", "type": "bool", "group": "CloakBrowser",
+        "key": "CLOAK_GEOIP", "file": "cloakbrowser.py", "type": "bool", "group": "代理浏览器",
         "label": "Cloak按出口定位", "help": "按当前出口 IP 自动匹配时区/语言/WebRTC IP；支持显式代理、系统代理/VPN",
     },
     {
-        "key": "CLOAK_LOCALE", "file": "cloakbrowser.py", "type": "str", "group": "CloakBrowser",
+        "key": "CLOAK_LOCALE", "file": "cloakbrowser.py", "type": "str", "group": "代理浏览器",
         "label": "Cloak语言", "help": "留空自动；日本可填 ja-JP，美国 en-US",
     },
     {
-        "key": "CLOAK_TIMEZONE", "file": "cloakbrowser.py", "type": "str", "group": "CloakBrowser",
+        "key": "CLOAK_TIMEZONE", "file": "cloakbrowser.py", "type": "str", "group": "代理浏览器",
         "label": "Cloak时区", "help": "留空自动；日本可填 Asia/Tokyo，美国 America/Los_Angeles",
     },
     {
-        "key": "CLOAK_USE_PROXY", "file": "cloakbrowser.py", "type": "bool", "group": "CloakBrowser",
+        "key": "CLOAK_USE_PROXY", "file": "cloakbrowser.py", "type": "bool", "group": "代理浏览器",
         "label": "Cloak使用代理", "help": "把本项目传入或代理池抽取的代理传给 CloakBrowser",
     },
     {
-        "key": "CLOAK_LICENSE_KEY", "file": "cloakbrowser.py", "type": "str", "group": "CloakBrowser",
+        "key": "CLOAK_LICENSE_KEY", "file": "cloakbrowser.py", "type": "str", "group": "代理浏览器",
         "label": "Cloak License", "help": "Pro license；留空使用免费 binary",
     },
     {
-        "key": "CLOAK_FINGERPRINT_SEED", "file": "cloakbrowser.py", "type": "str", "group": "CloakBrowser",
+        "key": "CLOAK_FINGERPRINT_SEED", "file": "cloakbrowser.py", "type": "str", "group": "代理浏览器",
         "label": "Cloak指纹Seed", "help": "留空每次随机；固定值可保持同一指纹",
     },
     {
-        "key": "CLOAK_USER_DATA_DIR", "file": "cloakbrowser.py", "type": "str", "group": "CloakBrowser",
+        "key": "CLOAK_USER_DATA_DIR", "file": "cloakbrowser.py", "type": "str", "group": "代理浏览器",
         "label": "Cloak用户目录", "help": "留空使用临时上下文；填写路径则持久化 cookies/cache",
     },
     {
-        "key": "CLOAK_EXTRA_ARGS", "file": "cloakbrowser.py", "type": "list_str_multiline", "group": "CloakBrowser",
+        "key": "CLOAK_EXTRA_ARGS", "file": "cloakbrowser.py", "type": "list_str_multiline", "group": "代理浏览器",
         "label": "Cloak Chromium 参数", "help": "每行一个额外启动参数，例如 --disable-gpu；通常保持为空",
     },
     {
-        "key": "CLOAK_SELENIUM_TIMEOUT", "file": "cloakbrowser.py", "type": "int", "group": "CloakBrowser",
+        "key": "CLOAK_SELENIUM_TIMEOUT", "file": "cloakbrowser.py", "type": "int", "group": "代理浏览器",
         "label": "Cloak超时", "help": "页面和元素等待超时时间，秒",
     },
     {
-        "key": "CLOAK_KEEP_BROWSER_OPEN", "file": "cloakbrowser.py", "type": "bool", "group": "CloakBrowser",
+        "key": "CLOAK_KEEP_BROWSER_OPEN", "file": "cloakbrowser.py", "type": "bool", "group": "代理浏览器",
         "label": "保留Cloak浏览器", "help": "调试时开启，任务结束后不自动关闭",
     },
 
     # ---- Browser Use Cloud ----
     {
-        "key": "BROWSER_USE_API_KEY", "file": "browser_use.py", "type": "str", "group": "Browser Use",
+        "key": "BROWSER_USE_API_KEY", "file": "browser_use.py", "type": "str", "group": "代理浏览器",
         "label": "Browser Use API Key", "help": "保存在 .env（BROWSER_USE_API_KEY），不写回 config/*.py",
         "storage": "env", "secret": True,
     },
     {
-        "key": "BROWSER_USE_CONNECT_MODE", "file": "browser_use.py", "type": "str", "group": "Browser Use",
+        "key": "BROWSER_USE_CONNECT_MODE", "file": "browser_use.py", "type": "str", "group": "代理浏览器",
         "label": "连接方式", "help": "cdp_url=直接连接官方 CDP；sdk=预留的 REST 会话模式",
     },
     {
-        "key": "BROWSER_USE_API_BASE", "file": "browser_use.py", "type": "str", "group": "Browser Use",
+        "key": "BROWSER_USE_API_BASE", "file": "browser_use.py", "type": "str", "group": "代理浏览器",
         "label": "REST API 地址", "help": "Browser Use REST API 根地址；通常保持默认值",
     },
     {
-        "key": "BROWSER_USE_PROXY_COUNTRY_CODE", "file": "browser_use.py", "type": "str", "group": "Browser Use",
+        "key": "BROWSER_USE_PROXY_COUNTRY_CODE", "file": "browser_use.py", "type": "str", "group": "代理浏览器",
         "label": "代理国家代码", "help": "两位国家码，如 jp/us/sg；配合 Browser Use 内置 residential proxy",
     },
     {
-        "key": "BROWSER_USE_USE_PROXY", "file": "browser_use.py", "type": "bool", "group": "Browser Use",
+        "key": "BROWSER_USE_USE_PROXY", "file": "browser_use.py", "type": "bool", "group": "代理浏览器",
         "label": "使用内置代理", "help": "True=连接参数带 proxyCountryCode；False=不强制传国家代理参数",
     },
     {
-        "key": "BROWSER_USE_PROFILE_ID", "file": "browser_use.py", "type": "str", "group": "Browser Use",
+        "key": "BROWSER_USE_PROFILE_ID", "file": "browser_use.py", "type": "str", "group": "代理浏览器",
         "label": "Profile ID", "help": "可选。填写则复用 Browser Use profile 的 cookies/localStorage；批量建议留空",
     },
     {
-        "key": "BROWSER_USE_CDP_BASE", "file": "browser_use.py", "type": "str", "group": "Browser Use",
+        "key": "BROWSER_USE_CDP_BASE", "file": "browser_use.py", "type": "str", "group": "代理浏览器",
         "label": "CDP 地址", "help": "默认 wss://connect.browser-use.com",
     },
     {
-        "key": "BROWSER_USE_TIMEOUT", "file": "browser_use.py", "type": "int", "group": "Browser Use",
+        "key": "BROWSER_USE_TIMEOUT", "file": "browser_use.py", "type": "int", "group": "代理浏览器",
         "label": "操作超时(秒)", "help": "Playwright 默认操作超时",
     },
     {
-        "key": "BROWSER_USE_NAVIGATION_TIMEOUT", "file": "browser_use.py", "type": "int", "group": "Browser Use",
+        "key": "BROWSER_USE_NAVIGATION_TIMEOUT", "file": "browser_use.py", "type": "int", "group": "代理浏览器",
         "label": "页面导航超时(秒)", "help": "页面打开和跳转的最长等待时间",
     },
     {
-        "key": "BROWSER_USE_SESSION_TIMEOUT", "file": "browser_use.py", "type": "int", "group": "Browser Use",
+        "key": "BROWSER_USE_SESSION_TIMEOUT", "file": "browser_use.py", "type": "int", "group": "代理浏览器",
         "label": "云端keepAlive(分钟)", "help": "传给 Browser Use connect URL 的 timeout/keepAlive；程序会自动限制到 1-240，建议 240",
     },
     {
-        "key": "BROWSER_USE_FAST_MODE", "file": "browser_use.py", "type": "bool", "group": "Browser Use",
+        "key": "BROWSER_USE_FAST_MODE", "file": "browser_use.py", "type": "bool", "group": "代理浏览器",
         "label": "快速模式", "help": "减少 Browser Use 额外等待和 humanize 延迟；建议开启，异常排查时可关闭",
     },
     {
-        "key": "BROWSER_USE_LOG_TIMING", "file": "browser_use.py", "type": "bool", "group": "Browser Use",
+        "key": "BROWSER_USE_LOG_TIMING", "file": "browser_use.py", "type": "bool", "group": "代理浏览器",
         "label": "耗时日志", "help": "打印 Browser Use 各阶段耗时：连接、打开页面、邮箱、OTP、手机、callback",
     },
     {
-        "key": "BROWSER_USE_KEEP_BROWSER_OPEN", "file": "browser_use.py", "type": "bool", "group": "Browser Use",
+        "key": "BROWSER_USE_KEEP_BROWSER_OPEN", "file": "browser_use.py", "type": "bool", "group": "代理浏览器",
         "label": "保留远端会话", "help": "调试时可不主动 browser.close()；默认 False",
     },
     {
-        "key": "BROWSER_USE_START_URL", "file": "browser_use.py", "type": "str", "group": "Browser Use",
+        "key": "BROWSER_USE_START_URL", "file": "browser_use.py", "type": "str", "group": "代理浏览器",
         "label": "起始 URL", "help": "默认 https://chatgpt.com/auth/login",
     },
 
     # ---- Skyvern Cloud Browser ----
     {
-        "key": "SKYVERN_API_KEY", "file": "skyvern.py", "type": "str", "group": "Skyvern",
+        "key": "SKYVERN_API_KEY", "file": "skyvern.py", "type": "str", "group": "代理浏览器",
         "label": "Skyvern API Key", "help": "保存在 .env（SKYVERN_API_KEY），用于创建 Skyvern Browser Session",
         "storage": "env", "secret": True,
     },
     {
-        "key": "SKYVERN_API_BASE", "file": "skyvern.py", "type": "str", "group": "Skyvern",
+        "key": "SKYVERN_API_BASE", "file": "skyvern.py", "type": "str", "group": "代理浏览器",
         "label": "API 地址", "help": "默认 https://api.skyvern.com",
     },
     {
-        "key": "SKYVERN_BROWSER_SESSION_TIMEOUT", "file": "skyvern.py", "type": "int", "group": "Skyvern",
+        "key": "SKYVERN_BROWSER_SESSION_TIMEOUT", "file": "skyvern.py", "type": "int", "group": "代理浏览器",
         "label": "Session 超时(分钟)", "help": "创建 Skyvern Browser Session 时传入的 timeout",
     },
     {
-        "key": "SKYVERN_BROWSER_PROFILE_ID", "file": "skyvern.py", "type": "str", "group": "Skyvern",
+        "key": "SKYVERN_BROWSER_PROFILE_ID", "file": "skyvern.py", "type": "str", "group": "代理浏览器",
         "label": "Browser Profile ID", "help": "可选，复用 Skyvern browser profile",
     },
     {
-        "key": "SKYVERN_PROXY_LOCATION", "file": "skyvern.py", "type": "str", "group": "Skyvern",
+        "key": "SKYVERN_PROXY_LOCATION", "file": "skyvern.py", "type": "str", "group": "代理浏览器",
         "label": "代理地区", "help": "可填 jp/us/gb 等简写；会自动转为 Skyvern 枚举，如 jp→RESIDENTIAL_JP；留空不传",
     },
     {
-        "key": "SKYVERN_BROWSER_TYPE", "file": "skyvern.py", "type": "str", "group": "Skyvern",
+        "key": "SKYVERN_BROWSER_TYPE", "file": "skyvern.py", "type": "str", "group": "代理浏览器",
         "label": "浏览器类型", "help": "Skyvern 支持 msedge / chrome / stealth-chromium；旧值 chromium-headful 会自动转为 stealth-chromium",
     },
     {
-        "key": "SKYVERN_AD_BLOCKER", "file": "skyvern.py", "type": "bool", "group": "Skyvern",
+        "key": "SKYVERN_AD_BLOCKER", "file": "skyvern.py", "type": "bool", "group": "代理浏览器",
         "label": "广告拦截", "help": "创建 Skyvern Browser Session 时启用 ad_blocker",
     },
     {
-        "key": "SKYVERN_GENERATE_BROWSER_PROFILE", "file": "skyvern.py", "type": "bool", "group": "Skyvern",
+        "key": "SKYVERN_GENERATE_BROWSER_PROFILE", "file": "skyvern.py", "type": "bool", "group": "代理浏览器",
         "label": "保存浏览器Profile", "help": "Session 结束时是否让 Skyvern 生成/保存 browser profile",
     },
     {
-        "key": "SKYVERN_KEEP_BROWSER_OPEN", "file": "skyvern.py", "type": "bool", "group": "Skyvern",
+        "key": "SKYVERN_KEEP_BROWSER_OPEN", "file": "skyvern.py", "type": "bool", "group": "代理浏览器",
         "label": "保留浏览器", "help": "调试时可开启，任务结束后不主动关闭 Skyvern Browser Session",
     },
     {
-        "key": "SKYVERN_START_URL", "file": "skyvern.py", "type": "str", "group": "Skyvern",
+        "key": "SKYVERN_START_URL", "file": "skyvern.py", "type": "str", "group": "代理浏览器",
         "label": "起始 URL", "help": "默认 https://chatgpt.com/auth/login",
     },
     {
-        "key": "ROXY_API_BASE", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_API_BASE", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "Roxy API 地址", "help": "默认 http://127.0.0.1:50000；需在 Roxy 应用 API 配置中开启",
     },
     {
-        "key": "ROXY_API_TOKEN", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_API_TOKEN", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "Roxy API Key", "help": "保存在 .env（ROXY_API_TOKEN），不写回 config/*.py",
         "storage": "env", "secret": True,
     },
     {
-        "key": "ROXY_PROFILE_ID", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_PROFILE_ID", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "Roxy 环境ID", "help": "指定要打开的 Roxy 浏览器环境/Profile ID；留空则尝试创建临时环境",
     },
     {
-        "key": "ROXY_WORKSPACE_ID", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_WORKSPACE_ID", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "Roxy 工作区ID", "help": "创建一号一环境时必填，会作为 workspaceId 提交给 Roxy 创建 Profile 接口",
     },
     {
-        "key": "ROXY_PROJECT_ID", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_PROJECT_ID", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "Roxy 项目ID", "help": "从 /browser/workspace 的 project_details.projectId 获取；创建 Profile 时会作为 projectId 提交",
     },
     {
-        "key": "ROXY_WORKSPACE_LIST_PATH", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_WORKSPACE_LIST_PATH", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "获取团队接口", "help": "默认 /browser/workspace；点击获取团队/项目时会先试此路径，再自动尝试常见兼容路径",
     },
     {
-        "key": "ROXY_WORKSPACE_LIST_METHOD", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_WORKSPACE_LIST_METHOD", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "获取团队请求方法", "help": "Roxy 工作区列表请求方法，通常为 GET；仅在自部署 API 要求其他方法时调整",
     },
     {
-        "key": "ROXY_OPEN_PATH", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_OPEN_PATH", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "打开接口路径", "help": "默认 /browser/open；如 Roxy 版本不同可在此调整",
     },
     {
-        "key": "ROXY_OPEN_METHOD", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_OPEN_METHOD", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "打开接口方法", "help": "打开环境请求方法，常见为 POST；按 Roxy 版本 API 要求填写",
     },
     {
-        "key": "ROXY_OPEN_HEADLESS", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
+        "key": "ROXY_OPEN_HEADLESS", "file": "roxybrowser.py", "type": "bool", "group": "代理浏览器",
         "label": "无头启动窗口", "help": "打开 Roxy 环境时向 /browser/open 传 headless；False=显示窗口，True=无头启动",
     },
     {
-        "key": "ROXY_CLOSE_PATH", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_CLOSE_PATH", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "关闭接口路径", "help": "默认 /browser/close",
     },
     {
-        "key": "ROXY_CLOSE_METHOD", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_CLOSE_METHOD", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "关闭接口方法", "help": "关闭环境请求方法，常见为 POST",
     },
     {
-        "key": "ROXY_CREATE_PATH", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_CREATE_PATH", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "创建接口路径", "help": "默认 /browser/create；如 Roxy 版本不同可在此调整",
     },
     {
-        "key": "ROXY_CREATE_METHOD", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_CREATE_METHOD", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "创建接口方法", "help": "创建环境请求方法，常见为 POST",
     },
     {
-        "key": "ROXY_KEEP_BROWSER_OPEN", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
+        "key": "ROXY_KEEP_BROWSER_OPEN", "file": "roxybrowser.py", "type": "bool", "group": "代理浏览器",
         "label": "保留浏览器", "help": "调试时可开启，任务结束后不自动关闭 Roxy 环境",
     },
     {
-        "key": "ROXY_ONE_PROFILE_PER_ACCOUNT", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
+        "key": "ROXY_ONE_PROFILE_PER_ACCOUNT", "file": "roxybrowser.py", "type": "bool", "group": "代理浏览器",
         "label": "一号一环境", "help": "每个账号强制创建新 Roxy Profile，用完关闭并删除，禁止复用固定环境",
     },
     {
-        "key": "ROXY_DELETE_PROFILE_AFTER_RUN", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
+        "key": "ROXY_DELETE_PROFILE_AFTER_RUN", "file": "roxybrowser.py", "type": "bool", "group": "代理浏览器",
         "label": "结束后删除环境", "help": "一号一环境模式下，任务结束后删除本轮创建的 Roxy Profile",
     },
     {
-        "key": "ROXY_RANDOM_OS_ON_CREATE", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
+        "key": "ROXY_RANDOM_OS_ON_CREATE", "file": "roxybrowser.py", "type": "bool", "group": "代理浏览器",
         "label": "创建环境随机OS", "help": "创建 Roxy 环境时每次在 Windows / macOS 中随机，不固定 macOS",
     },
     {
-        "key": "ROXY_RANDOM_OS_CHOICES", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_RANDOM_OS_CHOICES", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "随机OS范围", "help": "逗号分隔，默认 Windows,macOS；Roxy 支持 Windows / macOS / Linux / IOS / Android",
     },
     {
-        "key": "ROXY_DEFAULT_OS", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_DEFAULT_OS", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "默认OS", "help": "关闭随机OS时使用；可填 Windows、macOS、Linux、IOS 或 Android",
     },
     {
-        "key": "ROXY_DEFAULT_OS_VERSION", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_DEFAULT_OS_VERSION", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "默认OS版本", "help": "可选固定版本，例如 15.3.2；留空使用 Roxy 默认版本",
     },
     {
-        "key": "ROXY_RANDOM_PROFILE_NAME_ON_CREATE", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
+        "key": "ROXY_RANDOM_PROFILE_NAME_ON_CREATE", "file": "roxybrowser.py", "type": "bool", "group": "代理浏览器",
         "label": "创建环境随机名称", "help": "创建 Roxy 环境时自动生成不同名称，避免固定 gpt-free-register",
     },
     {
-        "key": "ROXY_PROFILE_NAME_PREFIX", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_PROFILE_NAME_PREFIX", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "随机名称前缀", "help": "默认 rb；实际名称格式类似 rb-时间戳-随机码",
     },
     {
-        "key": "ROXY_CREATE_USE_PROXY_POOL", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
+        "key": "ROXY_CREATE_USE_PROXY_POOL", "file": "roxybrowser.py", "type": "bool", "group": "代理浏览器",
         "label": "创建环境使用代理池", "help": "创建 Roxy 环境时从配置页「代理池」随机取一个代理，写入 Roxy proxyInfo",
     },
     {
-        "key": "ROXY_PROXY_CHECK_CHANNEL", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_PROXY_CHECK_CHANNEL", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "代理检测通道", "help": "写入 Roxy proxyInfo.checkChannel；留空则不传，默认 IPRust.io",
     },
     {
-        "key": "ROXY_DELETE_PATH", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_DELETE_PATH", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "删除接口路径", "help": "默认 /browser/delete；如 Roxy 版本不同可调整",
     },
     {
-        "key": "ROXY_DELETE_METHOD", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "key": "ROXY_DELETE_METHOD", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "删除接口方法", "help": "删除环境请求方法，常见为 POST",
     },
     {
-        "key": "ROXY_SELENIUM_TIMEOUT", "file": "roxybrowser.py", "type": "int", "group": "RoxyBrowser",
+        "key": "ROXY_SELENIUM_TIMEOUT", "file": "roxybrowser.py", "type": "int", "group": "代理浏览器",
         "label": "Selenium 超时(秒)", "help": "Roxy 浏览器页面和元素操作的最长等待时间",
     },
     {
-        "key": "ROXY_API_RETRIES", "file": "roxybrowser.py", "type": "int", "group": "RoxyBrowser",
+        "key": "ROXY_API_RETRIES", "file": "roxybrowser.py", "type": "int", "group": "代理浏览器",
         "label": "API 重试次数", "help": "Roxy 临时网络错误的重试次数；创建接口通常不重试",
     },
     {
-        "key": "ROXY_API_RETRY_DELAY", "file": "roxybrowser.py", "type": "int", "group": "RoxyBrowser",
+        "key": "ROXY_API_RETRY_DELAY", "file": "roxybrowser.py", "type": "int", "group": "代理浏览器",
         "label": "API 重试间隔(秒)", "help": "Roxy API 重试之间的基础等待时间",
     },
     {
@@ -332,23 +327,23 @@ EDITABLE_FIELDS = [
         "label": "Codex 请求超时(秒)", "help": "Codex OAuth 网络请求的最长等待时间",
     },
     {
-        "key": "CHROME_CDP_EXECUTABLE_PATH", "file": "codex.py", "type": "str", "group": "Codex",
+        "key": "CHROME_CDP_EXECUTABLE_PATH", "file": "codex.py", "type": "str", "group": "代理浏览器",
         "label": "系统 Chrome 路径", "help": "留空自动查找 Google Chrome；找不到时填写完整可执行文件路径",
     },
     {
-        "key": "CHROME_CDP_START_TIMEOUT", "file": "codex.py", "type": "int", "group": "Codex",
+        "key": "CHROME_CDP_START_TIMEOUT", "file": "codex.py", "type": "int", "group": "代理浏览器",
         "label": "Chrome CDP 启动超时", "help": "等待系统 Chrome 开放本地 CDP 的最长秒数",
     },
     {
-        "key": "CHROME_CDP_PAGE_TIMEOUT", "file": "codex.py", "type": "int", "group": "Codex",
+        "key": "CHROME_CDP_PAGE_TIMEOUT", "file": "codex.py", "type": "int", "group": "代理浏览器",
         "label": "Chrome 页面超时", "help": "系统 Chrome 页面导航和元素操作的最长秒数",
     },
     {
-        "key": "CHROME_CDP_KEEP_BROWSER_OPEN", "file": "codex.py", "type": "bool", "group": "Codex",
+        "key": "CHROME_CDP_KEEP_BROWSER_OPEN", "file": "codex.py", "type": "bool", "group": "代理浏览器",
         "label": "保留 Chrome", "help": "仅调试时开启；任务结束后不关闭本次系统 Chrome，也不删除临时 Profile",
     },
     {
-        "key": "ROXY_CODEX_CALLBACK_TIMEOUT", "file": "roxybrowser.py", "type": "int", "group": "RoxyBrowser",
+        "key": "ROXY_CODEX_CALLBACK_TIMEOUT", "file": "roxybrowser.py", "type": "int", "group": "代理浏览器",
         "label": "Codex回调超时", "help": "Roxy Codex OAuth 等待 localhost:1455 callback 的最长秒数",
     },
     {
@@ -392,15 +387,15 @@ EDITABLE_FIELDS = [
     # ---- 邮箱 / OTP ----
     {
         "key": "USE_EMAIL_SERVICE", "file": "email.py", "type": "bool", "group": "邮箱 / OTP",
-        "label": "自动取邮箱+收码", "help": "True=从邮箱池自动领邮箱并自动收 OTP；False=手动模式：用 REGISTER_EMAIL，OTP 在任务页手填",
+        "label": "使用自动邮箱渠道", "help": "开启后从你勾选的渠道获取邮箱并自动收取验证码；关闭后使用下方的手动邮箱",
     },
     {
         "key": "REGISTER_EMAIL", "file": "register.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "手动注册邮箱", "help": "USE_EMAIL_SERVICE=False 时必填。例如你的 outlook.com 地址；OTP 去网页邮箱看，再回任务页提交",
+        "label": "手动注册邮箱", "help": "关闭自动邮箱渠道时使用。填写你能正常收信的邮箱，收到验证码后回到 GPT账号页面提交",
     },
     {
         "key": "REGISTER_PASSWORD", "file": "register.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "注册密码", "help": "部分浏览器驱动或兼容流程需要；OTP-only 主流程通常留空。保存到 .env",
+        "label": "注册密码", "help": "建议留空：注册优先使用邮箱 OTP；仅在 OpenAI 没有 OTP 入口且强制创建密码时使用，留空则为当前账号生成独立随机密码。纯协议注册始终使用邮箱 OTP",
         "storage": "env", "secret": True,
     },
     {
@@ -409,37 +404,37 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "OTP_MAX_WAIT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
-        "label": "OTP 最长等待(秒)", "help": "等待验证码邮件的最长秒数，超时判失败",
+        "label": "验证码最长等待时间（秒）", "help": "超过这个时间仍未收到验证码，本次注册会标记为失败",
     },
     {
         "key": "OTP_POLL_INTERVAL", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
-        "label": "OTP 轮询间隔(秒)", "help": "每隔多少秒查一次新邮件",
+        "label": "检查新邮件间隔（秒）", "help": "系统每隔多少秒检查一次新验证码邮件",
     },
     {
         "key": "OTP_SETTLE_SECONDS", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
-        "label": "OTP 收件稳定等待(秒)", "help": "首次抓到验证码后继续等待更晚邮件的时间；Outlook 双协议取件使用",
+        "label": "重复邮件等待时间（秒）", "help": "收到第一封邮件后短暂等待，避免误用较早的验证码；一般保持默认",
     },
     {
         "key": "EMAIL_SOURCE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail",
+        "label": "默认邮箱渠道", "help": "勾选要默认使用的渠道，并在页面上调整优先顺序",
     },
     {
         "key": "EMAIL_IMPORT_SEPARATORS", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "导入分隔符", "help": "账号/邮箱素材的分隔符，多个用逗号分隔；默认 --- , ---- , | , ====。保存后立即生效",
+        "label": "导入分隔符", "help": "导入账号或邮箱时用于分开各项内容。多个分隔符用逗号隔开，默认支持 ---、----、| 和 ====",
     },
     {
         "key": "GPTMAIL_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "GPTMail API Key", "help": "选择 gptmail 邮箱来源时必填；保存在 .env，不会写入 config 源码",
+        "label": "GPTMail API Key", "help": "从 GPTMail 服务网站取得并粘贴到这里",
         "storage": "env", "secret": True,
     },
     {
         "key": "CLOUDFLARE_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "Cloudflare API 地址", "help": "Worker 临时邮箱 API 根地址，如 https://mail.example.com；选择 cloudflare 时必填",
+        "label": "Worker 服务地址", "help": "填写服务管理员提供的完整访问地址，例如 https://mail.example.com",
         "storage": "env",
     },
     {
         "key": "CLOUDFLARE_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "Cloudflare API Key", "help": "匿名可空；admin 模式填 ADMIN_PASSWORD；保存在 .env",
+        "label": "Worker 访问密钥", "help": "服务允许匿名访问时留空；需要鉴权时填写管理员提供的密钥",
         "storage": "env", "secret": True,
     },
     {
@@ -481,54 +476,54 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "OUTLOOK_FETCH_MODE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "Outlook取件模式", "help": "auto=远端优先，远端 402/DEPLOYMENT_DISABLED 自动切 Graph 直连；direct=只用 Microsoft Graph 直连；remote=只用远端服务",
+        "label": "Outlook 收信方式", "help": "不确定时填写 auto；只有服务管理员明确要求时才改为 direct 或 remote",
     },
     {
         "key": "OUTLOOK_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "Outlook 取件 API", "help": "远端 Outlook 取件服务根地址；自部署兼容服务可在此替换",
+        "label": "Outlook 收信服务地址", "help": "通常保持默认；只有你使用自己的收信服务时才修改",
     },
     {
         "key": "EMAIL_DOMAIN", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "转发域名(cloudflare_domain)", "help": "仅 cloudflare_domain 使用：Email Routing 的域名，如 mydomain.com；与 EMAIL_SOURCE=cloudflare 无关",
+        "label": "邮件转发域名", "help": "填写已在 Cloudflare 开启邮件转发的域名，例如 mydomain.com",
     },
     {
         "key": "QQ_EMAIL", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "QQ 邮箱地址", "help": "仅 cloudflare_domain：接收 Email Routing 转发的 QQ 邮箱，如 123456@qq.com",
+        "label": "接收邮件的 QQ 邮箱", "help": "填写 Cloudflare 邮件最终转发到的 QQ 邮箱，例如 123456@qq.com",
     },
     {
         "key": "QQ_IMAP_SERVER", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "QQ IMAP 服务器", "help": "cloudflare_domain 收信服务器，默认 imap.qq.com",
+        "label": "QQ 邮箱收信服务器", "help": "通常保持默认的 imap.qq.com",
     },
     {
         "key": "QQ_IMAP_PORT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
-        "label": "QQ IMAP 端口", "help": "SSL IMAP 端口，默认 993",
+        "label": "QQ 邮箱收信端口", "help": "通常保持默认的 993",
     },
     {
         "key": "QQ_IMAP_PASSWORD", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "QQ 邮箱 IMAP 授权码", "help": "仅 cloudflare_domain：QQ IMAP 授权码，保存在 .env，不写回 config/*.py",
+        "label": "QQ 邮箱授权码", "help": "在 QQ 邮箱设置中开启 IMAP 后生成；这里不是 QQ 登录密码",
         "storage": "env", "secret": True,
     },
     {
         "key": "MAIL_NEST_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "MailNest API Key", "help": "选择 mailnest 邮箱来源时必填；保存在 .env，不会写入 config 源码",
+        "label": "MailNest API Key", "help": "登录 MailNest 后从账户中复制；请同时确认账户余额充足",
         "storage": "env", "secret": True,
     },
     {
         "key": "MAIL_NEST_PROJECT_CODE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "MailNest 项目代码", "help": "项目代码 默认 chatgpt001 获取页面 mailnest.top/buy-email",
+        "label": "MailNest 项目代码", "help": "在 MailNest 购买邮箱页面查看；OpenAI 邮箱通常为 chatgpt001",
     },
     {
         "key": "CLOUDMAIL_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "CloudMail API 地址", "help": "Cloud Mail Worker/API 地址，例如 https://mail.example.com",
+        "label": "CloudMail 服务地址", "help": "填写服务管理员提供的完整访问地址，例如 https://mail.example.com",
     },
     {
         "key": "CLOUDMAIL_ADMIN_EMAIL", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "CloudMail管理员邮箱", "help": "用于生成 Token；域名被平台隐藏时也会用它登录读取域名",
+        "label": "CloudMail 管理员邮箱", "help": "没有 Token 时填写，用于生成 Token 并读取可用域名",
         "storage": "env",
     },
     {
         "key": "CLOUDMAIL_PASSWORD", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "CloudMail 密码", "help": "用于自动获取 Token；保存在 .env",
+        "label": "CloudMail 管理员密码", "help": "没有 Token 时填写，随后点击上方的“生成 Token”",
         "storage": "env", "secret": True,
     },
     {
@@ -537,12 +532,12 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "CLOUDMAIL_AUTH_TOKEN", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "CloudMail Token", "help": "CloudMail/Cloud Mail API Authorization Token；保存在 .env",
+        "label": "CloudMail Token", "help": "由服务管理员提供，或使用上方的管理员邮箱和密码生成",
         "storage": "env", "secret": True,
     },
     {
         "key": "CLOUDMAIL_DOMAINS", "file": "email.py", "type": "list_str_multiline", "group": "邮箱 / OTP",
-        "label": "CloudMail 域名列表", "help": "可留空；运行时会自动从平台获取。也可点“获取 CloudMail 域名”缓存到这里",
+        "label": "CloudMail 可用域名", "help": "通常点击上方“获取域名”自动填写；也可以每行手动填写一个域名",
     },
     {
         "key": "CLOUDMAIL_AUTO_ADD_USER", "file": "email.py", "type": "bool", "group": "邮箱 / OTP",
@@ -554,20 +549,20 @@ EDITABLE_FIELDS = [
     },
     # ---- 浏览器地区画像 ----
     {
-        "key": "BROWSER_LOCALE_PROFILE", "file": "browser.py", "type": "str", "group": "浏览器画像",
+        "key": "BROWSER_LOCALE_PROFILE", "file": "browser.py", "type": "str", "group": "代理浏览器",
         "label": "地区画像", "help": "应与代理出口地区一致；可选 jp/cn/us/sg。当前本地代理实测为日本东京，推荐 jp",
     },
 
     {
-        "key": "AUTO_BROWSER_LOCALE_FROM_IP", "file": "browser.py", "type": "bool", "group": "浏览器画像",
+        "key": "AUTO_BROWSER_LOCALE_FROM_IP", "file": "browser.py", "type": "bool", "group": "代理浏览器",
         "label": "按出口IP自动画像", "help": "开启后每个 BrowserSession 会用当前代理出口 IP 自动选择语言/时区；失败时回退到地区画像",
     },
     {
-        "key": "IP_GEO_TIMEOUT", "file": "browser.py", "type": "float", "group": "浏览器画像",
+        "key": "IP_GEO_TIMEOUT", "file": "browser.py", "type": "float", "group": "代理浏览器",
         "label": "IP定位超时(秒)", "help": "出口 IP 地理信息接口的单次请求超时；接口失败会自动回退，不影响注册",
     },
     {
-        "key": "REJECT_CLOUD_PROXY", "file": "browser.py", "type": "bool", "group": "浏览器画像",
+        "key": "REJECT_CLOUD_PROXY", "file": "browser.py", "type": "bool", "group": "代理浏览器",
         "label": "拒绝云代理出口", "help": "检测到云厂商代理组织时拒绝该出口并重新选代理；关闭后允许继续使用",
     },
 
@@ -756,7 +751,11 @@ EDITABLE_FIELDS = [
 
     {
         "key": "SMS_PROVIDER", "file": "codex.py", "type": "str", "group": "接码平台",
-        "label": "接码通道", "help": "grizzly / l / h / fixed_url；fixed_url 使用固定手机号和取码 URL",
+        "label": "当前接码平台", "help": "选择手机号池动态来源：grizzly=GrizzlySMS，l=L 服务，h=H 服务。一次只启用一个平台",
+    },
+    {
+        "key": "SMS_POOL_PLATFORM_ENABLED", "file": "codex.py", "type": "bool", "group": "接码平台",
+        "label": "加入手机号池", "help": "开启后，该平台会显示在手机号池顶部，作为“平台自动取号”特殊来源；关闭后只使用手工导入号码",
     },
     {
         "key": "SMS_API_BASE", "file": "codex.py", "type": "str", "group": "接码平台",
@@ -796,16 +795,6 @@ EDITABLE_FIELDS = [
         "storage": "env", "secret": True,
     },
     {
-        "key": "FIXED_SMS_PHONE", "file": "codex.py", "type": "str", "group": "接码平台",
-        "label": "固定短信手机号", "help": "SMS_PROVIDER=fixed_url 时使用；填写含国家码的数字",
-        "storage": "env", "secret": True,
-    },
-    {
-        "key": "FIXED_SMS_CODE_URL", "file": "codex.py", "type": "str", "group": "接码平台",
-        "label": "固定短信取码 URL", "help": "SMS_PROVIDER=fixed_url 时轮询此 URL；URL 中的 token 视为密钥",
-        "storage": "env", "secret": True,
-    },
-    {
         "key": "H_API_BASE", "file": "codex.py", "type": "str", "group": "接码平台",
         "label": "H API 地址", "help": "H 取号服务基础地址，例如 http://localhost:8788",
     },
@@ -838,6 +827,118 @@ EDITABLE_FIELDS = [
 ]
 
 _FIELD_BY_KEY = {f["key"]: f for f in EDITABLE_FIELDS}
+
+
+# 邮箱配置在运行时仍共用历史 ``group=邮箱 / OTP``，但 WebUI 需要更细的
+# 层级才能把不同供应商的凭证、路径和收件参数隔离展示。这里仅给 API
+# 返回值补充元数据，不改变旧配置字段和写入协议。
+_EMAIL_FIELD_CHANNEL = {
+    # 共同的注册/验证码行为
+    "USE_EMAIL_SERVICE": "general",
+    "REGISTER_EMAIL": "general",
+    "REGISTER_PASSWORD": "general",
+    "REGISTER_NAME": "general",
+    "OTP_MAX_WAIT": "general",
+    "OTP_POLL_INTERVAL": "general",
+    "OTP_SETTLE_SECONDS": "general",
+    "EMAIL_SOURCE": "general",
+    "EMAIL_IMPORT_SEPARATORS": "general",
+    # 持久化邮箱池与运行时供应商
+    "OUTLOOK_FETCH_MODE": "outlook",
+    "OUTLOOK_API_BASE": "outlook",
+    "EMAIL_DOMAIN": "cloudflare_domain",
+    "QQ_EMAIL": "cloudflare_domain",
+    "QQ_IMAP_SERVER": "cloudflare_domain",
+    "QQ_IMAP_PORT": "cloudflare_domain",
+    "QQ_IMAP_PASSWORD": "cloudflare_domain",
+    "GPTMAIL_API_KEY": "gptmail",
+    "MAIL_NEST_API_KEY": "mailnest",
+    "MAIL_NEST_PROJECT_CODE": "mailnest",
+    "CLOUDMAIL_API_BASE": "cloudmail",
+    "CLOUDMAIL_ADMIN_EMAIL": "cloudmail",
+    "CLOUDMAIL_PASSWORD": "cloudmail",
+    "CLOUDMAIL_TOKEN_PATH": "cloudmail",
+    "CLOUDMAIL_AUTH_TOKEN": "cloudmail",
+    "CLOUDMAIL_DOMAINS": "cloudmail",
+    "CLOUDMAIL_AUTO_ADD_USER": "cloudmail",
+    "CLOUDMAIL_RANDOM_LOCAL_LENGTH": "cloudmail",
+    # Cloudflare Worker 临时邮箱
+    "CLOUDFLARE_API_BASE": "cloudflare",
+    "CLOUDFLARE_API_KEY": "cloudflare",
+    "CLOUDFLARE_AUTH_MODE": "cloudflare",
+    "CLOUDFLARE_CUSTOM_AUTH": "cloudflare",
+    "CLOUDFLARE_PATH_ACCOUNTS": "cloudflare",
+    "CLOUDFLARE_PATH_MESSAGES": "cloudflare",
+    "CLOUDFLARE_PATH_DOMAINS": "cloudflare",
+    "CLOUDFLARE_PATH_TOKEN": "cloudflare",
+    "CLOUDFLARE_DEFAULT_DOMAINS": "cloudflare",
+    "CLOUDFLARE_REQUEST_TIMEOUT": "cloudflare",
+    "CLOUDFLARE_NAME_LENGTH": "cloudflare",
+}
+
+# 接码配置沿用历史 ``group=接码平台``，但前端按供应商模块隔离展示。
+# 国家、项目代码和重试参数是所有供应商共用的运行策略，放在总览页；
+# 各供应商的地址、密钥和号码参数只出现在对应模块。
+_SMS_FIELD_CHANNEL = {
+    "SMS_PROVIDER": "general",
+    "SMS_POOL_PLATFORM_ENABLED": "general",
+    "SMS_COUNTRY": "general",
+    "SMS_SERVICE": "general",
+    "SMS_MAX_PRICE": "general",
+    "SMS_MAX_RETRIES": "general",
+    "SMS_CODE_WAIT": "general",
+    "SMS_POLL_INTERVAL": "general",
+    "SMS_REQUEST_TIMEOUT": "general",
+    "SMS_API_BASE": "grizzly",
+    "SMS_API_KEY": "grizzly",
+    "H_API_BASE": "h",
+    "H_ADMIN_AUTH_CODE": "h",
+    "H_PHONE_PREFIX": "h",
+    "H_PHONE_ACQUIRE_MODE": "h",
+    "L_API_BASE": "l",
+    "L_ADMIN_AUTH_CODE": "l",
+    "L_PHONE_PREFIX": "l",
+}
+
+
+# 浏览器设置沿用历史 ``group=代理浏览器``，但不同驱动的凭证、会话和
+# 指纹参数必须在 WebUI 中隔离展示。模块只影响元数据和页面分组，不改变
+# .env 键名、默认值或保存协议。
+_BROWSER_FIELD_MODULE = {
+    "REGISTRATION_DRIVER": "general",
+    **{
+        field["key"]: "roxy"
+        for field in EDITABLE_FIELDS
+        if field["group"] == "代理浏览器" and field["key"].startswith("ROXY_")
+    },
+    **{
+        field["key"]: "cloak"
+        for field in EDITABLE_FIELDS
+        if field["group"] == "代理浏览器" and field["key"].startswith("CLOAK_")
+    },
+    **{
+        field["key"]: "browser_use"
+        for field in EDITABLE_FIELDS
+        if field["group"] == "代理浏览器" and field["key"].startswith("BROWSER_USE_")
+    },
+    **{
+        field["key"]: "skyvern"
+        for field in EDITABLE_FIELDS
+        if field["group"] == "代理浏览器" and field["key"].startswith("SKYVERN_")
+    },
+    **{
+        field["key"]: "system_chrome"
+        for field in EDITABLE_FIELDS
+        if field["group"] == "代理浏览器" and field["key"].startswith("CHROME_CDP_")
+    },
+    **{
+        field["key"]: "locale"
+        for field in EDITABLE_FIELDS
+        if field["group"] == "代理浏览器"
+        and field["key"]
+        in {"BROWSER_LOCALE_PROFILE", "AUTO_BROWSER_LOCALE_FROM_IP", "IP_GEO_TIMEOUT", "REJECT_CLOUD_PROXY"}
+    },
+}
 
 
 # ============================================================
@@ -1008,6 +1109,18 @@ def get_config() -> list[dict]:
         item = dict(field)
         item["storage"] = "env"
         item["value"] = value
+        email_channel = _EMAIL_FIELD_CHANNEL.get(key)
+        if email_channel:
+            item["email_section"] = "email"
+            item["email_channel"] = email_channel
+        browser_module = _BROWSER_FIELD_MODULE.get(key)
+        if browser_module:
+            item["browser_section"] = "browser"
+            item["browser_module"] = browser_module
+        sms_channel = _SMS_FIELD_CHANNEL.get(key)
+        if sms_channel:
+            item["sms_section"] = "sms"
+            item["sms_channel"] = sms_channel
         out.append(item)
     return out
 

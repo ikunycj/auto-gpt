@@ -398,11 +398,94 @@ def test_import_supports_outlook_four_part_material(relay_storage):
     assert stored["mailbox_password"] == "mailbox-password"
     assert stored["outlook_client_id"] == "client-id"
     assert stored["outlook_refresh_token"] == "refresh-token"
+
+
+def test_ensure_account_material_is_idempotent_and_preserves_relay_state(relay_storage):
+    first = relay.ensure_account_material({
+        "email": "Existing@Example.com",
+        "chatgpt_password": "chatgpt-password",
+        "email_code_url": "https://mail.example/code?token=a----b",
+        "totp_secret": "JBSWY3DPEHPK3PXP",
+    })
+    assert first["created"] is True
+    account_id = first["id"]
+
+    relay._update_account(account_id, codex_status="authorized", note="keep this note")
+    second = relay.ensure_account_material({
+        "email": "existing@example.com",
+        "chatgpt_password": "replacement-should-not-win",
+        "email_code_url": "https://mail.example/other",
+        "totp_secret": "JBSWY3DPEHPK3PXP",
+    })
+
+    assert second["id"] == account_id
+    assert second["created"] is False
+    stored = relay._read(relay._ACCOUNTS_PATH)[0]
+    assert stored["chatgpt_password"] == "chatgpt-password"
+    assert stored["email_code_url"] == "https://mail.example/code?token=a----b"
+    assert stored["codex_status"] == "authorized"
+    assert stored["note"] == "keep this note"
+
+
+def test_ensure_account_material_supports_outlook_credentials(relay_storage):
+    result = relay.ensure_account_material({
+        "email": "outlook-existing@example.com",
+        "mailbox_password": "mailbox-password",
+        "outlook_client_id": "client-id",
+        "outlook_refresh_token": "refresh-token",
+    })
+    assert result["email_provider"] == "outlook"
+    stored = relay._read(relay._ACCOUNTS_PATH)[0]
+    assert stored["mailbox_password"] == "mailbox-password"
+    assert stored["outlook_client_id"] == "client-id"
+    assert stored["outlook_refresh_token"] == "refresh-token"
     public = relay.list_accounts()[0]
     assert public["email_provider_label"] == "微软邮箱"
     serialized = json.dumps(public)
     assert "mailbox-password" in serialized
     assert "refresh-token" in serialized
+
+
+def test_ensure_account_material_supports_mailnest_without_password_or_url(relay_storage):
+    result = relay.ensure_account_material({
+        "email": "mailnest@example.com",
+        "email_provider": "mailnest",
+        "email_provider_context": {"project_code": "chatgpt001"},
+        "login_method": "email_otp",
+        "totp_secret": "JBSWY3DPEHPK3PXP",
+    })
+
+    assert result["created"] is True
+    assert result["email_provider"] == "mailnest"
+    assert result["email_provider_label"] == "MailNest"
+    stored = relay._read(relay._ACCOUNTS_PATH)[0]
+    assert stored["email_provider_context"] == {"project_code": "chatgpt001"}
+    assert "project_code" not in result
+
+
+def test_relay_mailnest_provider_uses_channel_adapter(monkeypatch):
+    from core import email_provider
+
+    calls = []
+    monkeypatch.setattr(relay, "_check_stopped", lambda _job_id: None)
+    monkeypatch.setattr(relay, "_update_job", lambda *args, **kwargs: calls.append((args, kwargs)))
+    monkeypatch.setattr(relay, "_append_log", lambda *_args, **_kwargs: None)
+
+    def wait(email, **kwargs):
+        calls.append((email, kwargs))
+        return "123456"
+
+    monkeypatch.setattr(email_provider, "wait_for_otp", wait)
+    provider = relay._email_provider("job-1", {
+        "email_provider": "mailnest",
+        "email_provider_context": {"project_code": "chatgpt001"},
+    })
+
+    assert provider("mailnest@example.com", after_ts=123.0) == "123456"
+    email, kwargs = calls[-1]
+    assert email == "mailnest@example.com"
+    assert kwargs["source"] == "mailnest"
+    assert kwargs["context"] == {"project_code": "chatgpt001"}
 
 
 def test_update_account_records_note_and_password_timestamp(relay_storage):
@@ -467,6 +550,9 @@ def test_phone_import_default_and_explicit_available_uses(relay_storage):
     assert phones["+14155550123"]["available_uses"] == 1
     assert phones["+14155550124"]["available_uses"] == 0
     assert phones["+14155550125"]["available_uses"] == 3
+    assert phones["+14155550123"]["status"] == "available"
+    assert phones["+14155550124"]["status"] == "used"
+    assert [row["phone"] for row in relay.list_phones(status="used")] == ["+14155550124"]
     assert "max_uses" not in phones["+14155550123"]
     assert "use_count" not in phones["+14155550123"]
     assert "remaining_uses" not in phones["+14155550123"]
@@ -533,7 +619,7 @@ def test_phones_imported_first_stay_candidates_when_accounts_arrive(relay_storag
 
 def test_phone_candidates_are_sorted_by_import_order_and_reusable(relay_storage, monkeypatch):
     relay.import_accounts("first@example.com----https://mail.example/first\nsecond@example.com----https://mail.example/second")
-    relay.import_phones("+14155550222----https://sms.example/new\n+14155550111----https://sms.example/old")
+    relay.import_phones("+14155550222----https://sms.example/new----2\n+14155550111----https://sms.example/old")
     phones = relay.list_phones(status="available")
     assert [row["phone"] for row in phones] == ["+14155550222", "+14155550111"]
     assert all(row["candidate"] for row in phones)
@@ -586,7 +672,7 @@ def test_default_authorization_reserves_distinct_candidates_by_import_order(rela
     assert all(not row.get("assigned_account_id") for row in phones)
 
 
-def test_phone_reservation_is_deferred_until_phone_page_and_capacity_is_user_controlled(relay_storage):
+def test_phone_reservation_tracks_capacity_without_consuming_use_count(relay_storage):
     relay.import_accounts("one@example.com----https://mail.example/one\ntwo@example.com----https://mail.example/two")
     relay.import_phones("+14155550123----https://sms.example/code----2")
     accounts = {row["email"]: row for row in relay._read(relay._ACCOUNTS_PATH)}
@@ -604,17 +690,31 @@ def test_phone_reservation_is_deferred_until_phone_page_and_capacity_is_user_con
     assert relay.list_phones(status="available") == []
 
 
-def test_authorization_can_start_without_phone_material(relay_storage, monkeypatch):
+def test_authorization_refuses_to_start_when_phone_pool_is_empty(relay_storage, monkeypatch):
     relay.import_accounts("user@example.com----https://mail.example/code")
     account = relay._read(relay._ACCOUNTS_PATH)[0]
     monkeypatch.setattr(relay, "_run_job", lambda *args: None)
+    monkeypatch.setattr(relay.sms_provider._cfg, "SMS_PROVIDER", "fixed_url")
+    monkeypatch.setattr(relay.sms_provider._cfg, "FIXED_SMS_PHONE", "+8613464925132", raising=False)
+    monkeypatch.setattr(relay.sms_provider._cfg, "FIXED_SMS_CODE_URL", "https://sms.example/legacy", raising=False)
 
-    result = relay.start_jobs([account["id"]], workers=1)
+    with pytest.raises(ValueError, match=r"手机号池可用资源不足.*当前可预留 0 次"):
+        relay.start_jobs([account["id"]], workers=1)
 
-    assert result["submitted"] == 1
-    job = relay._read(relay._JOBS_PATH)[0]
-    assert job["phone_override"]["phone"] == ""
-    assert job["phone_override"]["phone_ids"] == []
+    assert relay._read(relay._JOBS_PATH) == []
+
+
+def test_authorization_refuses_batch_when_phone_pool_capacity_is_insufficient(relay_storage, monkeypatch):
+    relay.import_accounts("one@example.com----https://mail.example/one\ntwo@example.com----https://mail.example/two")
+    relay.import_phones("+14155550123----https://sms.example/code----1")
+    accounts = [row["id"] for row in relay._read(relay._ACCOUNTS_PATH)]
+    monkeypatch.setattr(relay, "_run_job", lambda *args: None)
+
+    with pytest.raises(ValueError, match=r"本批授权需要 2 次，当前可预留 1 次"):
+        relay.start_jobs(accounts, workers=2)
+
+    assert relay._read(relay._JOBS_PATH) == []
+    assert relay._read(relay._PHONES_PATH)[0].get("reserved_job_ids") == []
 
 
 def test_failed_phone_material_is_marked_invalid_and_not_reused(relay_storage):
@@ -928,3 +1028,92 @@ def test_browser_assist_wait_defaults_to_five_minutes(monkeypatch):
     assert relay._browser_assist_grace_seconds() == 300.0
     monkeypatch.setenv("CODEX_RELAY_BROWSER_ASSIST_GRACE_SECONDS", "999")
     assert relay._browser_assist_grace_seconds() == 300.0
+
+
+def _configure_dynamic_sms_platform(monkeypatch, *, provider="l", ready=True):
+    """Configure the synthetic phone-pool source without contacting a provider."""
+    monkeypatch.setattr(relay._codex_config, "SMS_PROVIDER", provider)
+    monkeypatch.setattr(relay._codex_config, "SMS_POOL_PLATFORM_ENABLED", True)
+    if provider == "grizzly":
+        monkeypatch.setattr(relay._codex_config, "SMS_API_BASE", "https://sms.example/api" if ready else "")
+        monkeypatch.setattr(relay._codex_config, "SMS_API_KEY", "test-key" if ready else "")
+    elif provider == "h":
+        monkeypatch.setattr(relay._codex_config, "H_API_BASE", "http://h.example" if ready else "")
+        monkeypatch.setattr(relay._codex_config, "H_ADMIN_AUTH_CODE", "test-auth" if ready else "")
+    else:
+        monkeypatch.setattr(relay._codex_config, "L_API_BASE", "http://l.example" if ready else "")
+        monkeypatch.setattr(relay._codex_config, "L_ADMIN_AUTH_CODE", "test-auth" if ready else "")
+
+
+def test_list_phones_places_ready_sms_platform_special_row_first(relay_storage, monkeypatch):
+    _configure_dynamic_sms_platform(monkeypatch, provider="l", ready=True)
+    relay.import_phones("+14155550123----https://sms.example/one")
+
+    rows = relay.list_phones()
+
+    assert len(rows) == 2
+    special = rows[0]
+    assert special["special"] is True
+    assert special["id"] == "sms-provider:l"
+    assert special["provider"] == "l"
+    assert special["status"] == "platform"
+    assert special["ready"] is True
+    assert special["candidate"] is True
+    assert special["phone"] == ""
+    assert rows[1]["phone"] == "+14155550123"
+    assert relay.list_phones(status="platform")[0]["id"] == "sms-provider:l"
+
+
+def test_list_phones_marks_enabled_but_unconfigured_sms_platform_unavailable(relay_storage, monkeypatch):
+    _configure_dynamic_sms_platform(monkeypatch, provider="l", ready=False)
+
+    rows = relay.list_phones()
+
+    assert len(rows) == 1
+    special = rows[0]
+    assert special["special"] is True
+    assert special["id"] == "sms-provider:l"
+    assert special["status"] == "unavailable"
+    assert special["ready"] is False
+    assert special["candidate"] is False
+    assert "未就绪" in special["message"]
+    assert relay.list_phones(status="available") == []
+
+
+def test_sms_platform_special_row_cannot_be_deleted_or_adjusted(relay_storage, monkeypatch):
+    _configure_dynamic_sms_platform(monkeypatch, provider="h", ready=True)
+    special_id = relay.list_phones()[0]["id"]
+
+    with pytest.raises(ValueError, match="特殊来源不能删除"):
+        relay.delete_phones([special_id])
+    with pytest.raises(ValueError, match="特殊来源没有固定次数"):
+        relay.adjust_phone_available_uses([special_id], 1)
+
+
+def test_start_jobs_uses_enabled_sms_platform_as_phone_override(relay_storage, monkeypatch):
+    _configure_dynamic_sms_platform(monkeypatch, provider="grizzly", ready=True)
+    relay.import_accounts("platform@example.com----https://mail.example/code")
+    account_id = relay._read(relay._ACCOUNTS_PATH)[0]["id"]
+    monkeypatch.setattr(relay, "_run_job", lambda *args: None)
+
+    result = relay.start_jobs([account_id], workers=1)
+
+    assert result["submitted"] == 1
+    jobs = relay._read(relay._JOBS_PATH)
+    assert len(jobs) == 1
+    override = jobs[0]["phone_override"]
+    assert override["source_type"] == "platform"
+    assert override["platform_provider"] == "grizzly"
+    assert override["phone_hint_id"] == "sms-provider:grizzly"
+    assert override["phone_id"] == "sms-provider:grizzly"
+    assert override["phone"] == ""
+    assert override["sms_code_url"] == ""
+
+
+def test_start_jobs_rejects_direct_selection_of_synthetic_platform_row(relay_storage, monkeypatch):
+    _configure_dynamic_sms_platform(monkeypatch, provider="l", ready=True)
+    relay.import_accounts("platform-direct@example.com----https://mail.example/code")
+    account_id = relay._read(relay._ACCOUNTS_PATH)[0]["id"]
+
+    with pytest.raises(ValueError, match="特殊来源不能手动选择"):
+        relay.start_jobs([account_id], phone_ids=["sms-provider:l"])

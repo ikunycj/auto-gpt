@@ -19,6 +19,7 @@ from urllib.parse import quote, urlparse
 import pyotp
 
 from core import sms_provider, sqlite_store
+from config import codex as _codex_config
 from core.import_parser import (
     clean_import_value,
     is_http_url,
@@ -67,6 +68,25 @@ _IMPORT_FORMATS = {
     "outlook",
     "combined",
 }
+_EMAIL_PROVIDER_LABELS = {
+    "outlook": "微软邮箱",
+    "generic_api": "通用 API",
+    "cloudflare_domain": "Cloudflare 域名邮箱",
+    "cloudflare": "Cloudflare Worker",
+    "gptmail": "GPTMail",
+    "mailnest": "MailNest",
+    "cloudmail": "CloudMail",
+}
+_DYNAMIC_EMAIL_PROVIDERS = {
+    "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail",
+}
+
+_SMS_PROVIDER_LABELS = {
+    "grizzly": "GrizzlySMS",
+    "l": "L 接码服务",
+    "h": "H 接码服务",
+}
+_SMS_PLATFORM_ROW_PREFIX = "sms-provider:"
 
 _stop_events: dict[str, threading.Event] = {}
 _verification_events: dict[tuple[str, str], threading.Event] = {}
@@ -465,9 +485,7 @@ def _id_list(value) -> list[str]:
 
 
 def _active_reservation_ids(row: dict) -> list[str]:
-    reserved = _id_list(row.get("reserved_job_ids"))
-    deferred = set(_id_list(row.get("deferred_job_ids")))
-    return [job_id for job_id in reserved if job_id not in deferred]
+    return _id_list(row.get("reserved_job_ids"))
 
 
 def _upsert_phone_locked(phones: list[dict], phone_value: str, sms_url: str, *, now: str | None = None) -> dict:
@@ -611,7 +629,7 @@ def _validate_unique_account_phones(accounts: list[dict]) -> None:
     return None
 
 
-def import_accounts(text: str, format_name: str = "auto") -> dict:
+def import_accounts(text: str, format_name: str = "auto", *, include_emails: bool = False) -> dict:
     records: list[dict] = []
     errors: list[str] = []
     for line_no, raw in enumerate(str(text or "").splitlines(), 1):
@@ -657,11 +675,145 @@ def import_accounts(text: str, format_name: str = "auto") -> dict:
         assigned, _changed = _ensure_assignments_locked(rows, phones)
         _write(_ACCOUNTS_PATH, rows)
         _write(_PHONES_PATH, phones)
-    return {
+    result = {
         "ok": True, "inserted": inserted, "updated": updated, "total": len(records),
         "assigned": assigned,
         "unassigned_accounts": sum(1 for row in rows if not row.get("phone") or not row.get("sms_code_url")),
     }
+    # The WebUI uses this transient list to clear matching soft-delete
+    # markers. Keep it opt-in so the lower-level import API remains backward
+    # compatible and does not expose account identifiers unnecessarily.
+    if include_emails:
+        result["emails"] = [record["email"] for record in records]
+    return result
+
+
+def _normalize_account_material(material: dict) -> tuple[str, dict]:
+    """Validate and normalize structured material before touching storage."""
+    if not isinstance(material, dict):
+        raise ValueError("账号材料必须是对象")
+    email = str(material.get("email") or "").strip().lower()
+    if not _EMAIL_RE.match(email):
+        raise ValueError("邮箱格式错误")
+    fields = (
+        "chatgpt_password", "mailbox_password", "outlook_client_id",
+        "outlook_refresh_token", "email_code_url", "totp_secret",
+        "phone", "sms_code_url", "note", "login_method",
+    )
+    incoming = {key: str(material.get(key) or "").strip() for key in fields}
+    provider = str(material.get("email_provider") or "").strip().lower()
+    if provider and provider not in _EMAIL_PROVIDER_LABELS:
+        raise ValueError(f"不支持的邮箱取码渠道：{provider}")
+    provider_context = material.get("email_provider_context")
+    if not isinstance(provider_context, dict):
+        provider_context = {}
+    incoming["email_provider"] = provider
+    incoming["email_provider_context"] = dict(provider_context)
+    if incoming["email_code_url"] and not _valid_url(incoming["email_code_url"]):
+        raise ValueError("邮箱取码 URL 必须是 http(s) 地址")
+    if incoming["sms_code_url"] and not _valid_url(incoming["sms_code_url"]):
+        raise ValueError("短信取码 URL 必须是 http(s) 地址")
+    if bool(incoming["outlook_client_id"]) != bool(incoming["outlook_refresh_token"]):
+        raise ValueError("微软邮箱必须同时填写 Client_ID 和 Refresh_Token")
+    if incoming["totp_secret"]:
+        incoming["totp_secret"] = _normalize_totp_secret(incoming["totp_secret"])
+    if incoming["phone"]:
+        incoming["phone"] = _normalize_phone(incoming["phone"])
+        if not 7 <= len(incoming["phone"].lstrip("+")) <= 15:
+            raise ValueError("手机号长度错误")
+    if bool(incoming["phone"]) != bool(incoming["sms_code_url"]):
+        raise ValueError("手机号与短信取码 URL 必须同时填写或同时留空")
+    if not any((
+        incoming["chatgpt_password"], incoming["email_code_url"],
+        incoming["outlook_client_id"] and incoming["outlook_refresh_token"],
+        provider in _DYNAMIC_EMAIL_PROVIDERS,
+    )):
+        raise ValueError("账号缺少 ChatGPT 密码或可用的邮箱取码渠道")
+    return email, incoming
+
+
+def validate_account_material(material: dict) -> dict:
+    """Validate bridge material without creating a Relay account."""
+    email, incoming = _normalize_account_material(material)
+    result = {"email": email, **incoming}
+    if isinstance(material, dict) and material.get("codex_status"):
+        result["codex_status"] = material.get("codex_status")
+    return result
+
+
+def ensure_account_material(material: dict) -> dict:
+    """Create or complete one Relay account from an existing GPT account.
+
+    Registration accounts and Relay accounts intentionally live in separate
+    collections for backwards compatibility.  This helper is the small,
+    idempotent bridge used by the unified GPT account workspace.  It accepts a
+    structured dict instead of rebuilding an import line, so URLs containing
+    configured separators are preserved byte-for-byte.
+
+    Existing Relay state (authorization status, result files, notes, and
+    timestamps) is never reset.  Only missing credential/material fields are
+    filled from ``material``.
+    """
+    email, incoming = _normalize_account_material(material)
+
+    with _LOCK:
+        rows = _read(_ACCOUNTS_PATH)
+        phones = _read(_PHONES_PATH)
+        existing = next((row for row in rows if _email_key(row.get("email")) == email), None)
+        now = _now()
+        created = False
+        changed = False
+        if existing is None:
+            next_seq = max((int(row.get("seq") or 0) for row in rows), default=0) + 1
+            raw_codex_status = str(material.get("codex_status") or "").strip().lower()
+            initial_codex_status = {
+                "success": "authorized",
+                "authorized": "authorized",
+                "failed": "failed",
+                "deactivated": "deactivated",
+                "deleted": "deactivated",
+            }.get(raw_codex_status, "not_authorized")
+            existing = {
+                "id": uuid.uuid4().hex,
+                "seq": next_seq,
+                "email": email,
+                "created_at": now,
+                "updated_at": now,
+                "last_status": "not_started",
+                "codex_status": initial_codex_status,
+            }
+            rows.append(existing)
+            created = True
+            changed = True
+
+        # Never overwrite an explicitly maintained Relay value with an empty
+        # value (or a stale value from the registration projection).
+        for key, value in incoming.items():
+            if not value or existing.get(key):
+                continue
+            existing[key] = value
+            changed = True
+        if not existing.get("email_provider"):
+            if existing.get("outlook_client_id") and existing.get("outlook_refresh_token"):
+                existing["email_provider"] = "outlook"
+                changed = True
+            elif existing.get("email_code_url"):
+                existing["email_provider"] = "generic_api"
+                changed = True
+        if changed and not created:
+            existing["updated_at"] = now
+        _validate_unique_account_phones(rows)
+        _ensure_assignments_locked(rows, phones)
+        _write(_ACCOUNTS_PATH, rows)
+        _write(_PHONES_PATH, phones)
+        public = _public_account(existing)
+        public["created"] = created
+        return public
+
+
+def _email_key(value: object) -> str:
+    """Normalize an email for internal Relay joins without exposing it."""
+    return str(value or "").strip().lower()
 
 
 def import_phones(text: str) -> dict:
@@ -748,7 +900,8 @@ def _public_account(row: dict) -> dict:
         "outlook_client_id": row.get("outlook_client_id") or "",
         "outlook_refresh_token": row.get("outlook_refresh_token") or "",
         "email_provider": email_provider,
-        "email_provider_label": "微软邮箱" if email_provider == "outlook" else "通用 API" if email_provider == "generic_api" else "未配置",
+        "email_provider_label": _EMAIL_PROVIDER_LABELS.get(email_provider, "未配置"),
+        "login_method": row.get("login_method") or ("password" if chatgpt_password else "email_otp"),
         "has_phone": bool(row.get("phone")),
         "has_sms_code_url": bool(row.get("sms_code_url")),
         "phone": row.get("phone") or "",
@@ -756,6 +909,7 @@ def _public_account(row: dict) -> dict:
         "sms_code_url": row.get("sms_code_url") or "",
         "phone_verified_at": row.get("phone_verified_at") or "",
         "last_sms_phone": row.get("last_sms_phone") or "",
+        "last_sms_provider": row.get("last_sms_provider") or "",
         "last_sms_code_url": row.get("last_sms_code_url") or "",
         "codex_status": codex_status,
         "codex_authorized_at": row.get("codex_authorized_at") or "",
@@ -820,6 +974,7 @@ def _public_account(row: dict) -> dict:
         "note": row.get("note") or "",
         "last_status": row.get("last_status") or "not_started",
         "last_job_id": row.get("last_job_id"),
+        "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }
 
@@ -900,6 +1055,88 @@ def _mask_phone(value: str) -> str:
     return prefix + ("*" * max(0, len(digits) - 4)) + digits[-4:]
 
 
+def _phone_public_status(*, invalid: bool, reserved: bool, assigned: bool, available_uses: int) -> str:
+    """Return the single status used by the phone-pool UI and API filters.
+
+    A bound number remains visibly bound even after its reusable balance is
+    exhausted.  This preserves the relationship users need to inspect, while
+    unbound numbers with no remaining balance are reported as ``used``.
+    """
+    if invalid:
+        return "invalid"
+    if reserved:
+        return "reserved"
+    if assigned:
+        return "bound"
+    if available_uses <= 0:
+        return "used"
+    return "available"
+
+
+def _sms_platform_state() -> dict:
+    """Return the configured dynamic SMS source without touching storage."""
+    provider = str(getattr(_codex_config, "SMS_PROVIDER", "") or "").strip().lower()
+    enabled = bool(getattr(_codex_config, "SMS_POOL_PLATFORM_ENABLED", False))
+    label = _SMS_PROVIDER_LABELS.get(provider, provider or "未选择平台")
+    missing: list[str] = []
+    if provider not in _SMS_PROVIDER_LABELS:
+        missing.append("当前接码平台")
+    if provider == "grizzly":
+        if not str(getattr(_codex_config, "SMS_API_BASE", "") or "").strip():
+            missing.append("Grizzly API 地址")
+        if not str(getattr(_codex_config, "SMS_API_KEY", "") or "").strip():
+            missing.append("Grizzly API Key")
+    elif provider == "l":
+        if not str(getattr(_codex_config, "L_API_BASE", "") or "").strip():
+            missing.append("L API 地址")
+        if not str(getattr(_codex_config, "L_ADMIN_AUTH_CODE", "") or "").strip():
+            missing.append("L 授权码")
+    elif provider == "h":
+        if not str(getattr(_codex_config, "H_API_BASE", "") or "").strip():
+            missing.append("H API 地址")
+        if not str(getattr(_codex_config, "H_ADMIN_AUTH_CODE", "") or "").strip():
+            missing.append("H 授权码")
+    return {
+        "provider": provider,
+        "label": label,
+        "enabled": enabled,
+        "ready": enabled and not missing,
+        "missing": missing,
+        "id": f"{_SMS_PLATFORM_ROW_PREFIX}{provider or 'unknown'}",
+    }
+
+
+def _sms_platform_row() -> dict | None:
+    state = _sms_platform_state()
+    if not state["enabled"]:
+        return None
+    return {
+        "id": state["id"],
+        "phone": "",
+        "sms_code_url": "",
+        "sms_provider": state["label"],
+        "provider": state["provider"],
+        "provider_label": state["label"],
+        "label": f"{state['label']} 自动取号",
+        "special": True,
+        "ready": state["ready"],
+        "enabled": True,
+        "message": "可用，授权时动态取号" if state["ready"] else "未就绪：" + "、".join(state["missing"]),
+        "status": "platform" if state["ready"] else "unavailable",
+        "candidate": state["ready"],
+        "available_uses": None,
+        "reserved_count": 0,
+        "assigned": False,
+        "assigned_count": 0,
+        "assigned_account_email": "",
+        "assigned_account_emails": [],
+        "reserved": False,
+        "invalid": False,
+        "import_seq": -1,
+        "updated_at": "",
+    }
+
+
 def list_phones(q: str = "", status: str = "") -> list[dict]:
     q = str(q or "").strip().lower()
     status = str(status or "").strip().lower()
@@ -922,6 +1159,12 @@ def list_phones(q: str = "", status: str = "") -> list[dict]:
                 available_uses = _PHONE_AVAILABLE_DEFAULT
             available_uses = max(0, min(_PHONE_AVAILABLE_MAX, available_uses))
             invalid = bool(row.get("invalid"))
+            public_status = _phone_public_status(
+                invalid=invalid,
+                reserved=bool(reserved_ids),
+                assigned=bool(assigned_ids),
+                available_uses=available_uses,
+            )
             rows.append({
                 "id": row.get("id"),
                 "phone": row.get("phone") or "",
@@ -938,13 +1181,17 @@ def list_phones(q: str = "", status: str = "") -> list[dict]:
                 "invalid": invalid,
                 "invalid_reason": row.get("invalid_reason") or "",
                 "candidate": not invalid and len(reserved_ids) < available_uses,
+                "status": public_status,
                 "import_seq": int(row.get("seq") or 0),
                 "updated_at": row.get("updated_at"),
             })
+    special_row = _sms_platform_row()
     if q:
         rows = [
             row for row in rows
             if q in (row.get("phone") or "").lower()
+            or q in (row.get("label") or "").lower()
+            or q in (row.get("provider_label") or "").lower()
             or any(q in email.lower() for email in row.get("assigned_account_emails") or [])
         ]
     if status == "bound":
@@ -955,12 +1202,21 @@ def list_phones(q: str = "", status: str = "") -> list[dict]:
         rows = [row for row in rows if row.get("invalid")]
     elif status == "reserved":
         rows = [row for row in rows if row.get("reserved")]
+    elif status == "used":
+        rows = [row for row in rows if row.get("status") == "used"]
+    elif status == "platform":
+        rows = []
+    if special_row and (not status or status == "platform" or (status in ("available", "unbound") and special_row.get("ready"))):
+        if not q or q in special_row["label"].lower() or q in special_row["provider_label"].lower():
+            rows.insert(0, special_row)
     # Candidate priority is stable import order, oldest first.
-    return sorted(rows, key=lambda row: (int(row.get("import_seq") or 0), str(row.get("updated_at") or "")))
+    return sorted(rows, key=lambda row: (0 if row.get("special") else 1, int(row.get("import_seq") or 0), str(row.get("updated_at") or "")))
 
 
 def delete_phones(phone_ids: list[str]) -> int:
     ids = {str(value) for value in phone_ids if value}
+    if any(value.startswith(_SMS_PLATFORM_ROW_PREFIX) for value in ids):
+        raise ValueError("接码平台特殊来源不能删除；请到设置中关闭")
     with _LOCK:
         accounts = _read(_ACCOUNTS_PATH)
         phones = _read(_PHONES_PATH)
@@ -979,6 +1235,8 @@ def adjust_phone_available_uses(phone_ids: list[str], delta: int) -> dict:
     ids = list(dict.fromkeys(str(value) for value in phone_ids if value))
     if not ids:
         raise ValueError("请先选择手机号")
+    if any(value.startswith(_SMS_PLATFORM_ROW_PREFIX) for value in ids):
+        raise ValueError("接码平台特殊来源没有固定次数，请到设置中管理")
     try:
         delta = int(delta)
     except (TypeError, ValueError) as exc:
@@ -1172,7 +1430,7 @@ def _acquire_phone_for_job(
     preferred_phone_ids: list[str] | None = None,
     prefer_bound: bool = True,
 ) -> dict:
-    """Reserve a phone only when OpenAI has actually shown the phone page."""
+    """Return the slot reserved for this job, or reserve one for legacy callers."""
     preferred = {str(item) for item in (preferred_phone_ids or []) if item}
     account_id = str(account.get("id") or "")
     with _LOCK:
@@ -1187,21 +1445,20 @@ def _acquire_phone_for_job(
             if not key or not row.get("sms_code_url") or row.get("invalid"):
                 continue
             reserved, available = _phone_capacity(row)
+            reservations = _id_list(row.get("reserved_job_ids"))
+            owns_reservation = job_id in reservations
             owns_account = bool(bound_key and key == bound_key)
-            if reserved < available:
-                candidates.append((row, owns_account))
+            if owns_reservation or reserved < available:
+                candidates.append((row, owns_reservation, owns_account))
         candidates.sort(key=lambda item: (
-            0 if (prefer_bound and item[1]) else 1,
+            0 if item[1] else 1,
+            0 if (prefer_bound and item[2]) else 1,
             0 if item[0].get("id") in preferred else 1,
             int(item[0].get("seq") or 0),
         ))
         chosen = candidates[0][0] if candidates else None
         if chosen is None:
             raise sms_provider.SmsProviderError("检测到手机验证页，但没有可用手机号；请导入手机号或增加可用次数")
-        deferred = _id_list(chosen.get("deferred_job_ids"))
-        if job_id in deferred:
-            deferred = [item for item in deferred if item != job_id]
-            chosen["deferred_job_ids"] = deferred
         reservations = _id_list(chosen.get("reserved_job_ids"))
         if job_id not in reservations:
             reservations.append(job_id)
@@ -3197,6 +3454,31 @@ def _wait_browser_assist(
 def _email_provider(job_id: str, account: dict):
     def provider(email: str, after_ts: float | None = None) -> str:
         _check_stopped(job_id)
+        configured_provider = str(account.get("email_provider") or "").strip().lower()
+        if configured_provider in _DYNAMIC_EMAIL_PROVIDERS:
+            try:
+                from core.email_provider import wait_for_otp
+
+                _update_job(
+                    job_id,
+                    status="running",
+                    stage="email",
+                    message=f"正在从{_EMAIL_PROVIDER_LABELS[configured_provider]}获取验证码",
+                )
+                return wait_for_otp(
+                    email,
+                    after_ts=after_ts,
+                    max_wait=35,
+                    poll_interval=3,
+                    settle_seconds=0,
+                    source=configured_provider,
+                    context=account.get("email_provider_context") or {},
+                )
+            except Exception as exc:
+                _append_log(
+                    job_id,
+                    f"{_EMAIL_PROVIDER_LABELS[configured_provider]}自动取码未成功：{type(exc).__name__}",
+                )
         outlook_client_id = account.get("outlook_client_id") or ""
         outlook_refresh_token = account.get("outlook_refresh_token") or ""
         if outlook_client_id and outlook_refresh_token:
@@ -3235,7 +3517,7 @@ def _email_provider(job_id: str, account: dict):
                 )
             except Exception as exc:
                 _append_log(job_id, f"邮箱自动取码未成功：{type(exc).__name__}")
-        if not outlook_client_id and not outlook_refresh_token and not code_url:
+        if not outlook_client_id and not outlook_refresh_token and not code_url and configured_provider not in _DYNAMIC_EMAIL_PROVIDERS:
             return _wait_manual_code(job_id, "email", "账号未配置邮箱取码来源；当前流程要求邮箱验证码，请手动填写")
         return _wait_manual_code(job_id, "email", "邮箱自动取码未成功，请手动填写邮箱验证码")
 
@@ -3298,6 +3580,17 @@ def _check_email_source(account: dict) -> dict:
     validates the source credentials or URL, so it can be used as a safe mailbox
     liveness check before starting an OAuth task.
     """
+    configured_provider = str(account.get("email_provider") or "").strip().lower()
+    if configured_provider in _DYNAMIC_EMAIL_PROVIDERS:
+        from core.email_provider import email_source_statuses
+
+        status = email_source_statuses([configured_provider])[0]
+        return {
+            "ok": bool(status.get("ready")),
+            "provider": configured_provider,
+            "message": str(status.get("message") or "邮箱渠道配置检查完成"),
+        }
+
     outlook_client_id = str(account.get("outlook_client_id") or "").strip()
     outlook_refresh_token = str(account.get("outlook_refresh_token") or "").strip()
     if outlook_client_id and outlook_refresh_token:
@@ -3400,6 +3693,15 @@ def _run_job(
         totp_provider = _totp_provider(job_id, account)
         sms_state = {"code_received": False}
         def acquire_phone_material():
+            if str(override.get("source_type") or "") == "platform":
+                platform_provider = str(override.get("platform_provider") or "").strip().lower()
+                if not platform_provider:
+                    raise sms_provider.SmsProviderError("手机号池动态接码平台未选择")
+                _update_job(job_id, stage="sms", message=f"检测到手机验证，正在从{_SMS_PROVIDER_LABELS.get(platform_provider, platform_provider)}取号")
+                with sms_provider.direct_provider_context(platform_provider):
+                    activation_id, phone = sms_provider.acquire_number()
+                phone_state.update(activation_id=activation_id, phone=phone)
+                return {"activation_id": activation_id, "phone_id": "", "phone": phone, "code_url": "", "source_type": "platform", "provider": platform_provider}
             material = _acquire_phone_for_job(job_id, account, preferred_phone_ids, prefer_bound=not bool(selected_phone_ids))
             phone_state.update(
                 phone_id=str(material.get("phone_id") or ""),
@@ -3411,6 +3713,11 @@ def _run_job(
             return material
 
         def sms_code_provider():
+            if str(override.get("source_type") or "") == "platform":
+                with sms_provider.direct_provider_context(str(override.get("platform_provider") or "")):
+                    sms_code = sms_provider.wait_for_sms_code(phone_state.get("activation_id") or "")
+                sms_state["code_received"] = True
+                return sms_code
             return _sms_provider(
                 job_id,
                 account,
@@ -3432,11 +3739,13 @@ def _run_job(
                 )
                 phone_state["consumed"] = True
 
+        platform_job = str(override.get("source_type") or "") == "platform"
         sms_context = sms_provider.fixed_sms_context(
-            code_provider=sms_code_provider,
+            provider=str(override.get("platform_provider") or "") if platform_job else "",
+            code_provider=None if platform_job else sms_code_provider,
             acquire_provider=acquire_phone_material,
-            failure_provider=sms_failure_provider,
-            success_provider=sms_success_provider,
+            failure_provider=None if platform_job else sms_failure_provider,
+            success_provider=None if platform_job else sms_success_provider,
         )
         with sms_context:
             from core.codex_oauth import run_codex_oauth
@@ -3482,7 +3791,17 @@ def _run_job(
             codex_authorized_at=_now(),
             result_file=result.get("file_path") or "",
         )
-        if phone_verified:
+        if phone_verified and str(override.get("source_type") or "") == "platform":
+            # Dynamic provider numbers are external resources; do not create
+            # a fake SQLite phone row. Keep the actual number in the account
+            # audit fields while the provider owns release/usage accounting.
+            _update_account(
+                account_id,
+                last_sms_phone=phone_state.get("phone") or "",
+                last_sms_provider=_SMS_PROVIDER_LABELS.get(str(override.get("platform_provider") or ""), str(override.get("platform_provider") or "")),
+                phone_verified_at=_now(),
+            )
+        elif phone_verified:
             _bind_verified_phone(
                 account_id,
                 phone_state.get("phone_id") or "",
@@ -3726,8 +4045,18 @@ def _run_maintenance_job(job_id: str, account_id: str, action: str) -> None:
             from core.account_export import setup_2fa
 
             email_provider = _email_provider(job_id, account)
-            browser_session, _session_info = authenticate_account_session(account["email"], otp_provider=email_provider)
-            secret = setup_2fa(browser_session, account["email"], otp_provider=email_provider)
+            browser_session, _session_info = authenticate_account_session(
+                account["email"],
+                otp_provider=email_provider,
+                login_password=account.get("chatgpt_password") or None,
+            )
+            try:
+                secret = setup_2fa(browser_session, account["email"], otp_provider=email_provider)
+            finally:
+                try:
+                    browser_session.session.close()
+                except Exception:
+                    pass
             _update_account(account_id, totp_secret=secret, twofa_enabled_at=_now(), maintenance_status="success", maintenance_action=action)
             _update_job(job_id, status="success", stage="done", message="2FA 已开启并记录", completed_at=_now(), waiting_since="")
         elif action == "check_liveness":
@@ -3735,7 +4064,12 @@ def _run_maintenance_job(job_id: str, account_id: str, action: str) -> None:
             from core.account_liveness import check_account_liveness
 
             email_provider = _email_provider(job_id, account)
-            result = check_account_liveness(account["email"], otp_provider=email_provider)
+            result = check_account_liveness(
+                account["email"],
+                otp_provider=email_provider,
+                login_password=account.get("chatgpt_password") or None,
+                totp_provider=_totp_provider(job_id, account),
+            )
             liveness = "alive" if result.get("ok") else "dead" if result.get("status") == "deactivated" else "error"
             _update_account(account_id, liveness_status=liveness, liveness_checked_at=result.get("checked_at") or _now(), maintenance_status="success" if result.get("ok") else "failed", maintenance_action=action)
             if not result.get("ok"):
@@ -3854,6 +4188,12 @@ def start_jobs(account_ids: list[str], workers: int = 1, phone_ids: list[str] | 
         if busy:
             raise ValueError("以下账号已有任务运行中：" + ", ".join(busy[:3]))
         selected_phone_ids = list(dict.fromkeys(str(x) for x in (phone_ids or []) if x))
+        platform_selected = [
+            phone_id for phone_id in selected_phone_ids
+            if phone_id.startswith(_SMS_PLATFORM_ROW_PREFIX)
+        ]
+        if platform_selected:
+            raise ValueError("接码平台特殊来源不能手动选择；请在设置中启用后由系统自动分配")
         phones_by_id = {str(x.get("id") or ""): x for x in phones}
         selected_phones = [phones_by_id[x] for x in selected_phone_ids if x in phones_by_id]
         if selected_phone_ids and len(selected_phones) != len(selected_phone_ids):
@@ -3863,13 +4203,54 @@ def start_jobs(account_ids: list[str], workers: int = 1, phone_ids: list[str] | 
             raise ValueError("选中的手机号缺少短信取码 URL")
         if selected_phone_ids and any(row.get("invalid") for row in selected_phones):
             raise ValueError("选中的手机号或短信 URL 已被标记为失效，请更换素材")
-        candidate_hints = [
+        candidate_phones = [
             row for row in sorted(phones, key=lambda item: int(item.get("seq") or 0))
             if row.get("phone") and row.get("sms_code_url") and not row.get("invalid")
         ]
+        if selected_phone_ids:
+            candidate_phones = selected_phones
+
+        # A configured SMS platform is a dynamic source rather than a
+        # persisted phone row. It has no static ``available_uses`` value, so
+        # jobs are admitted here and the real provider reports NO_BALANCE or
+        # NO_NUMBERS when the worker actually requests a number.
+        platform_state = _sms_platform_state()
+        platform_candidate = None
+        if not selected_phone_ids and platform_state["enabled"] and platform_state["ready"]:
+            platform_candidate = {
+                "id": platform_state["id"],
+                "special": True,
+                "provider": platform_state["provider"],
+                "provider_label": platform_state["label"],
+                "seq": -1,
+                "phone": "",
+                "sms_code_url": "",
+                "reserved_job_ids": [],
+            }
+            candidate_phones = [platform_candidate, *candidate_phones]
+        if platform_state["enabled"] and not platform_state["ready"] and not candidate_phones:
+            raise ValueError("已开启接码平台，但配置未完成：" + "、".join(platform_state["missing"]))
+
+        free_slots: dict[str, int] = {}
+        for phone in candidate_phones:
+            if phone.get("special"):
+                continue
+            reserved, available = _phone_capacity(phone)
+            free_slots[str(phone.get("id") or "")] = max(0, available - reserved)
+        available_capacity = sum(free_slots.values())
+        if platform_candidate is not None:
+            # Dynamic platform capacity is intentionally not guessed from a
+            # balance API that these providers do not expose.
+            free_slots[str(platform_candidate["id"])] = len(ids)
+            available_capacity += len(ids)
+        if available_capacity < len(ids):
+            raise ValueError(
+                f"手机号池可用资源不足：本批授权需要 {len(ids)} 次，当前可预留 {available_capacity} 次；"
+                "请先在手机号池导入号码或增加可用次数"
+            )
 
         rows = _read(_JOBS_PATH)
-        for index, account_id in enumerate(ids):
+        for account_id in ids:
             known[account_id]["codex_status"] = "reauthorize" if known[account_id].get("codex_status") == "authorized" else known[account_id].get("codex_status") or "not_authorized"
             known[account_id]["updated_at"] = _now()
             job = {
@@ -3881,28 +4262,37 @@ def start_jobs(account_ids: list[str], workers: int = 1, phone_ids: list[str] | 
                 "message": "等待执行",
                 "created_at": _now(),
             }
-            # 手机号只在 OAuth 页面实际要求短信时才分配，避免无手机验证的账号
-            # 提前占用号码，也避免号码池数量被任务数错误卡死。
-            hint = selected_phones[index % len(selected_phones)] if selected_phones else (
-                candidate_hints[index % len(candidate_hints)] if candidate_hints else None
-            )
+            bound_key = _phone_key(known[account_id].get("phone")) if known[account_id].get("phone_verified_at") else ""
+            eligible = [
+                phone for phone in candidate_phones
+                if free_slots.get(str(phone.get("id") or ""), 0) > 0
+            ]
+            eligible.sort(key=lambda phone: (
+                0 if bound_key and _phone_key(phone.get("phone")) == bound_key else 1,
+                int(phone.get("seq") or 0),
+            ))
+            hint = eligible[0]
+            hint_id = str(hint.get("id") or "")
+            free_slots[hint_id] -= 1
             job["phone_override"] = {
                 "phone_ids": selected_phone_ids,
-                "phone_hint_id": hint.get("id") if hint and not selected_phone_ids else "",
-                "phone_id": hint.get("id") if hint else "",
-                "phone": hint.get("phone") if hint else "",
-                "sms_code_url": hint.get("sms_code_url") if hint else "",
+                "phone_hint_id": hint_id,
+                "phone_id": hint_id,
+                "phone": hint.get("phone") or "",
+                "sms_code_url": hint.get("sms_code_url") or "",
+                "source_type": "platform" if hint.get("special") else "phone_pool",
+                "platform_provider": hint.get("provider") or "",
             }
-            if hint:
+            if not hint.get("special"):
                 reservations = _id_list(hint.get("reserved_job_ids"))
-                if job["id"] not in reservations:
-                    reservations.append(job["id"])
+                reservations.append(job["id"])
                 hint["reserved_job_ids"] = reservations
-                deferred = _id_list(hint.get("deferred_job_ids"))
-                if job["id"] not in deferred:
-                    deferred.append(job["id"])
-                hint["deferred_job_ids"] = deferred
+                hint.pop("deferred_job_ids", None)
                 hint["updated_at"] = _now()
+            elif hint.get("special"):
+                # Keep dynamic reservations in the job payload only. The
+                # synthetic row is intentionally not persisted in relay_phones.
+                pass
             rows.append(job)
             jobs.append(job)
             _active_accounts.add(account_id)
@@ -4047,8 +4437,9 @@ def recover_interrupted_jobs() -> int:
         phones = _read(_PHONES_PATH)
         phone_changed = False
         for phone in phones:
-            if _id_list(phone.get("reserved_job_ids")):
+            if _id_list(phone.get("reserved_job_ids")) or _id_list(phone.get("deferred_job_ids")):
                 phone["reserved_job_ids"] = []
+                phone.pop("deferred_job_ids", None)
                 phone["updated_at"] = _now()
                 phone_changed = True
         if phone_changed:

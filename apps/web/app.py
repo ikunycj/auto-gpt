@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 
-from core import codex_retry_service, codex_relay_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service, sqlite_store
+from core import codex_retry_service, codex_relay_service, gpt_account_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service, sqlite_store
 from core.import_parser import (
     clean_import_value,
     is_email,
@@ -280,9 +280,10 @@ def create_app(auth_code: str | None = None) -> Flask:
     @app.get("/api/summary")
     def api_summary():
         from config import email as _email_cfg
-        from core.email_provider import parse_email_sources
+        from core.email_provider import parse_email_sources, registration_email_status
+        email_sources = parse_email_sources(_email_cfg.EMAIL_SOURCE)
         pool = {"total": 0, "available": 0, "used": 0, "failed": 0}
-        for src in parse_email_sources(_email_cfg.EMAIL_SOURCE):
+        for src in email_sources:
             # GPTMail/MailNest/CloudMail 地址按需生成，不属于本地邮箱池。
             if src in ("gptmail", "mailnest", "cloudmail", "cloudflare"):
                 continue
@@ -294,8 +295,15 @@ def create_app(auth_code: str | None = None) -> Flask:
             for k in pool:
                 pool[k] += int(one.get(k, 0) or 0)
         domain_pool = db.domain_email_pool_summary()
+        gpt_accounts = gpt_account_service.list_accounts()
+        email_runtime = registration_email_status()
+        # Kept for older WebUI bundles during a rolling local restart.
+        email_runtime["mailnest_configured"] = any(
+            item["id"] == "mailnest" and item["configured"]
+            for item in email_runtime["channels"]
+        )
         return jsonify({
-            "accounts": db.count_accounts(),
+            "accounts": len(gpt_accounts),
             "outlook_total": pool.get("total", 0),
             "outlook_available": pool.get("available", 0),
             "outlook_used": pool.get("used", 0),
@@ -304,6 +312,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             "domain_available": domain_pool.get("available", 0),
             "domain_used": domain_pool.get("used", 0),
             "domain_failed": domain_pool.get("failed", 0),
+            "registration_email": email_runtime,
         })
 
     # ----------------------------------------------------------
@@ -1831,18 +1840,6 @@ def create_app(auth_code: str | None = None) -> Flask:
                 skipped.append({"filename": fname, "reason": f"{type(exc).__name__}: {exc}"})
         return jsonify({"ok": True, "deleted": deleted, "deleted_count": len(deleted), "skipped": skipped})
 
-    def _reserve_codex_retry(email: str) -> bool:
-        """进程内防重复占位；成功返回 True。"""
-        return codex_retry_service.reserve(email)
-
-    def _release_codex_retry(email: str) -> None:
-        codex_retry_service.release(email)
-
-    def _run_codex_retry_worker(email: str, *, batch_label: str | None = None, clear_log: bool = True) -> None:
-        """执行一个账号的 Codex 补跑。调用前必须已经 reserve。"""
-        codex_retry_service.run_worker(email, batch_label=batch_label, clear_log=clear_log)
-
-
     @app.post("/api/codex/stop")
     def api_codex_stop():
         """停止单个 Codex 补跑。Body {email}。"""
@@ -1925,7 +1922,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         if not ok:
             return jsonify({"ok": False, "error": f"账号不存在: {email}"}), 404
 
-        _release_codex_retry(email)
+        codex_retry_service.release(email)
 
         try:
             log_path = codex_retry_service.log_path(email)
@@ -1944,115 +1941,19 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.post("/api/codex/retry")
     def api_codex_retry():
-        """手动补跑某账号的 Codex 授权。Body {email}。"""
-        data = request.get_json(silent=True) or {}
-        email = (data.get("email") or "").strip()
-        if not email:
-            return jsonify({"ok": False, "error": "email 为空"}), 400
-        acc = db.get_account_by_email(email)
-        if acc is None:
-            return jsonify({"ok": False, "error": f"账号不存在: {email}"}), 404
-        if (acc.get("codex_status") or "") == "deactivated":
-            return jsonify({"ok": False, "error": "账号已废号，不能补跑 Codex"}), 409
-        if not _reserve_codex_retry(email):
-            return jsonify({"ok": False, "error": "该账号正在补跑中，请稍候"}), 409
-
-        db.update_account_codex_status(email, "retrying", None)
-        threading.Thread(
-            target=_run_codex_retry_worker,
-            kwargs={"email": email, "clear_log": True},
-            name=f"codex-retry-{email}",
-            daemon=True,
-        ).start()
-        return jsonify({"ok": True, "message": "已在后台开始补跑，~1-2 分钟后刷新查看"})
+        """Reject the retired endpoint that bypassed the phone pool."""
+        return jsonify({
+            "ok": False,
+            "error": "旧 Codex 补跑入口已停用；请在 GPT账号 页面发起授权，授权将使用手机号池",
+        }), 410
 
     @app.post("/api/codex/retry-bulk")
     def api_codex_retry_bulk():
-        """批量补跑 Codex。Body {account_ids:[...], workers: 1-16}。"""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from datetime import datetime as _dt
-
-        data = request.get_json(silent=True) or {}
-        ids = data.get("account_ids") or data.get("ids") or []
-        workers = data.get("workers", 1)
-        if not isinstance(ids, list) or not ids:
-            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
-        try:
-            workers = max(1, min(16, int(workers)))
-        except (TypeError, ValueError):
-            return jsonify({"ok": False, "error": "workers 必须是数字"}), 400
-        if len(ids) > 500:
-            return jsonify({"ok": False, "error": "单次最多选择 500 个账号"}), 400
-
-        selected = []
-        skipped = []
-        seen_ids = set()
-        for raw in ids:
-            try:
-                acc_id = int(raw)
-            except (TypeError, ValueError):
-                skipped.append({"id": raw, "reason": "ID 非法"})
-                continue
-            if acc_id in seen_ids:
-                continue
-            seen_ids.add(acc_id)
-            acc = db.get_account(acc_id)
-            if not acc:
-                skipped.append({"id": acc_id, "reason": "账号不存在"})
-                continue
-            email = (acc.get("email") or "").strip()
-            if not email:
-                skipped.append({"id": acc_id, "reason": "邮箱为空"})
-                continue
-            if (acc.get("codex_status") or "") == "deactivated":
-                skipped.append({"id": acc_id, "email": email, "reason": "账号已废号"})
-                continue
-            if not _reserve_codex_retry(email):
-                skipped.append({"id": acc_id, "email": email, "reason": "正在补跑中"})
-                continue
-            selected.append({"id": acc_id, "email": email})
-
-        if not selected:
-            return jsonify({"ok": False, "error": "没有可补跑的账号", "skipped": skipped}), 409
-
-        batch_id = _dt.now().strftime("%Y%m%d-%H%M%S")
-        for item in selected:
-            email = item["email"]
-            db.update_account_codex_status(email, "retrying", None)
-            log_path = codex_retry_service.log_path(email)
-            sqlite_store.write_file(
-                log_path,
-                f"{_dt.now().strftime('%H:%M:%S')} [INFO] [Codex 批量补跑] 已加入批量任务 batch={batch_id} workers={workers}，等待线程执行\n",
-                category="codex_retry_logs",
-                mode=0o600,
-                mirror=False,
-            )
-
-        def _bulk_runner(items: list[dict], max_workers: int, batch: str):
-            logger.info(f"[Codex 批量补跑] 启动 batch={batch} count={len(items)} workers={max_workers}")
-            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"codex-bulk-{batch}") as ex:
-                futures = [ex.submit(_run_codex_retry_worker, it["email"], batch_label=f"{batch} #{idx}/{len(items)}", clear_log=False) for idx, it in enumerate(items, 1)]
-                for fut in as_completed(futures):
-                    try:
-                        fut.result()
-                    except Exception:
-                        logger.exception(f"[Codex 批量补跑] 子任务异常 batch={batch}")
-            logger.info(f"[Codex 批量补跑] 完成 batch={batch}")
-
-        threading.Thread(
-            target=_bulk_runner,
-            args=(selected, workers, batch_id),
-            name=f"codex-bulk-dispatch-{batch_id}",
-            daemon=True,
-        ).start()
+        """Reject the retired batch endpoint that bypassed the phone pool."""
         return jsonify({
-            "ok": True,
-            "message": f"已开始批量补跑 {len(selected)} 个账号，并发 {workers}",
-            "started": selected,
-            "started_count": len(selected),
-            "skipped": skipped,
-            "batch_id": batch_id,
-        })
+            "ok": False,
+            "error": "旧 Codex 批量补跑入口已停用；请在 GPT账号 页面选择账号后授权",
+        }), 410
 
     @app.get("/api/codex/retry-log")
     def api_codex_retry_log():
@@ -2099,11 +2000,9 @@ def create_app(auth_code: str | None = None) -> Flask:
         page_arg = request.args.get("page", default=None, type=int)
         page_size_arg = request.args.get("page_size", default=None, type=int)
         fetch_limit = 1_000_000 if (paged or page_arg is not None or page_size_arg is not None) else limit
-        from config import email as _email_cfg
-        manual_otp_required = not bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True))
         rows = db.list_jobs(limit=fetch_limit)
         for row in rows:
-            row["manual_otp_required"] = manual_otp_required
+            row["manual_otp_required"] = not bool(str(row.get("email_source") or "").strip())
             row.update(svc.get_retry_info(row))
         if paged or page_arg is not None or page_size_arg is not None:
             page = max(1, int(page_arg or 1))
@@ -2117,7 +2016,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.post("/api/jobs")
     def api_jobs_create():
-        """启动批量注册：body {count, workers}。"""
+        """启动批量注册：body {count, workers, email_sources?}。"""
         data = request.get_json(silent=True) or {}
         try:
             count = int(data.get("count", 1))
@@ -2135,8 +2034,20 @@ def create_app(auth_code: str | None = None) -> Flask:
         # 提交前先确认池里有足够可用邮箱，给前端一个温和提示（不阻断）
         from config import email as _email_cfg
         from config import register as _register_cfg
-        from core.email_provider import parse_email_sources
-        if not bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True)):
+        from core.email_provider import (
+            email_source_statuses,
+            registration_email_status,
+            validate_email_sources,
+        )
+        explicit_sources = data.get("email_sources")
+        requested_sources = None
+        if explicit_sources is not None:
+            try:
+                requested_sources = validate_email_sources(explicit_sources)
+            except ValueError as exc:
+                return jsonify({"ok": False, "error": str(exc)}), 400
+
+        if not bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True)) and requested_sources is None:
             reg_email = str(getattr(_register_cfg, "REGISTER_EMAIL", "") or "").strip()
             if not reg_email:
                 return jsonify({
@@ -2156,97 +2067,289 @@ def create_app(auth_code: str | None = None) -> Flask:
                 "warning": f"手动 OTP 模式：将使用 {reg_email}；验证码请在任务页提交",
                 "workers": workers,
             })
-        sources = parse_email_sources(_email_cfg.EMAIL_SOURCE)
-        if "gptmail" in sources:
-            api_key = str(getattr(_email_cfg, "GPTMAIL_API_KEY", "") or "").strip()
-            if not api_key:
-                return jsonify({
-                    "ok": False,
-                    "error": "已选择 gptmail 邮箱来源，请填写 GPTMail API Key（配置 → 邮箱 / OTP）。",
-                }), 400
-        if "cloudflare" in sources:
-            api_base = str(getattr(_email_cfg, "CLOUDFLARE_API_BASE", "") or "").strip()
-            if not api_base:
-                return jsonify({
-                    "ok": False,
-                    "error": "已选择 cloudflare 邮箱来源，请填写 Cloudflare API 地址（配置 → 邮箱 / OTP）。",
-                }), 400
-            auth_mode = str(getattr(_email_cfg, "CLOUDFLARE_AUTH_MODE", "none") or "none").strip().lower()
-            accounts_path = str(getattr(_email_cfg, "CLOUDFLARE_PATH_ACCOUNTS", "/api/new_address") or "").strip().lower()
-            api_key = str(getattr(_email_cfg, "CLOUDFLARE_API_KEY", "") or "").strip()
-            needs_key = auth_mode in ("x-admin-auth", "bearer", "x-api-key", "query-key") or accounts_path.rstrip("/").endswith("/admin/new_address")
-            if needs_key and not api_key:
-                return jsonify({
-                    "ok": False,
-                    "error": "Cloudflare admin/鉴权模式需要填写 Cloudflare API Key（配置 → 邮箱 / OTP）。",
-                }), 400
-        if "mailnest" in sources:
-            api_key = str(getattr(_email_cfg, "MAIL_NEST_API_KEY", "") or "").strip()
-            project_code = str(getattr(_email_cfg, "MAIL_NEST_PROJECT_CODE", "") or "").strip()
-            if not api_key:
-                return jsonify({
-                    "ok": False,
-                    "error": "已选择 mailnest 邮箱来源，请填写 MailNest API Key（配置 → 邮箱 / OTP）。",
-                }), 400
-            if not project_code:
-                return jsonify({
-                    "ok": False,
-                    "error": "已选择 mailnest 邮箱来源，请填写 MailNest 项目代码（配置 → 邮箱 / OTP）。",
-                }), 400
-        if "cloudmail" in sources:
-            api_base = str(getattr(_email_cfg, "CLOUDMAIL_API_BASE", "") or "").strip()
-            token = str(getattr(_email_cfg, "CLOUDMAIL_AUTH_TOKEN", "") or "").strip()
-            if not api_base:
-                return jsonify({
-                    "ok": False,
-                    "error": "已选择 cloudmail 邮箱来源，请填写 CloudMail API 地址（配置 → 邮箱 / OTP）。",
-                }), 400
-            if not token:
-                return jsonify({
-                    "ok": False,
-                    "error": "已选择 cloudmail 邮箱来源，请填写 CloudMail Token（配置 → 邮箱 / OTP）。",
-                }), 400
-        if "gptmail" in sources or "mailnest" in sources or "cloudmail" in sources or "cloudflare" in sources:
-            # 临时邮箱在任务开始时动态生成，不需要本地邮箱池容量提示。
-            warning = ""
-        elif "cloudflare_domain" in sources:
-            pool = db.domain_email_pool_summary()
-            warning = ""
-            if sources == ["cloudflare_domain"] and pool.get("available", 0) < count:
-                warning = f"域名邮箱池仅 {pool.get('available', 0)} 个可用，少于任务数 {count}，不足的会自动生成"
-        elif sources == ["generic_api"]:
-            pool = db.generic_api_email_pool_summary()
-            warning = ""
-            if pool.get("available", 0) < count:
-                warning = f"通用 API 邮箱池仅 {pool.get('available', 0)} 个可用，少于任务数 {count}，不足的会失败"
-        elif len(sources) > 1:
-            available = 0
-            if "outlook" in sources:
-                available += db.outlook_pool_summary().get("available", 0)
-            if "generic_api" in sources:
-                available += db.generic_api_email_pool_summary().get("available", 0)
-            warning = ""
-            if available < count:
-                warning = f"多个邮箱池合计仅 {available} 个可用，少于任务数 {count}，不足的会失败"
+        if requested_sources:
+            channels = email_source_statuses(requested_sources)
+            runtime = {
+                "automatic": True,
+                "sources": requested_sources,
+                "channels": channels,
+                "all_channels": channels,
+                "usable_sources": [item["id"] for item in channels if item["ready"]],
+                "ready_sources": [item["id"] for item in channels if item["ready"]],
+                "ready": any(item["ready"] for item in channels),
+            }
         else:
-            pool = db.outlook_pool_summary()
-            warning = ""
-            if pool.get("available", 0) < count:
-                warning = f"可用邮箱仅 {pool.get('available', 0)} 个，少于任务数 {count}，不足的会失败"
-        jobs = svc.submit_registration(count=count, workers=workers)
-        return jsonify({"ok": True, "submitted": len(jobs), "jobs": jobs, "warning": warning, "workers": workers})
+            runtime = registration_email_status(include_all=False)
+            channels = runtime["channels"]
+        if requested_sources:
+            unavailable_channels = [item for item in channels if not item["ready"]]
+            if unavailable_channels:
+                details = "；".join(f"{item['label']}：{item['message']}" for item in unavailable_channels)
+                return jsonify({
+                    "ok": False,
+                    "error": f"本次选择中有不可用的邮箱渠道。{details}",
+                    "registration_email": runtime,
+                }), 400
+        ready_channels = [item for item in channels if item["ready"]]
+        if not ready_channels:
+            details = "；".join(f"{item['label']}：{item['message']}" for item in channels)
+            return jsonify({
+                "ok": False,
+                "error": f"当前没有可用的邮箱渠道。{details}。请到「设置 → 邮箱与 OTP」完成配置。",
+                "registration_email": runtime,
+            }), 400
+
+        warning_parts = []
+        skipped_channels = [] if requested_sources else [item for item in channels if not item["ready"]]
+        if skipped_channels:
+            skipped = "；".join(f"{item['label']}（{item['message']}）" for item in skipped_channels)
+            warning_parts.append(f"已跳过未就绪渠道：{skipped}")
+
+        if not any(item["kind"] == "generated" for item in ready_channels):
+            available = sum(int(item["available"] or 0) for item in ready_channels)
+            if available < count:
+                warning_parts.append(f"可用邮箱合计 {available} 个，少于任务数 {count}，超出部分可能失败")
+
+        warning = "；".join(warning_parts)
+        usable_sources = [item["id"] for item in ready_channels]
+        if requested_sources:
+            jobs = svc.submit_registration(
+                count=count,
+                workers=workers,
+                email_source=",".join(usable_sources),
+            )
+        elif usable_sources == runtime["sources"]:
+            jobs = svc.submit_registration(count=count, workers=workers)
+        else:
+            jobs = svc.submit_registration(
+                count=count,
+                workers=workers,
+                email_source=",".join(usable_sources),
+            )
+        return jsonify({
+            "ok": True,
+            "submitted": len(jobs),
+            "jobs": jobs,
+            "warning": warning,
+            "workers": workers,
+            "usable_sources": usable_sources,
+        })
 
     # ----------------------------------------------------------
     # 已有 GPT 账号 -> Codex OAuth 接码工作台
     # ----------------------------------------------------------
+    @app.get("/api/gpt-accounts")
+    def api_gpt_accounts():
+        """统一 GPT 账号读模型（注册、Codex 与手机状态在服务端聚合）。"""
+        rows = gpt_account_service.list_accounts(
+            q=request.args.get("q") or "",
+            registration_status=request.args.get("registration_status") or "",
+            codex_status=request.args.get("codex_status") or "",
+            phone_status=request.args.get("phone_status") or "",
+            gpt_status=request.args.get("gpt_status") or "",
+            provider=request.args.get("provider") or "",
+        )
+        paged = str(request.args.get("paged", default="") or "").lower() in {"1", "true", "yes"}
+        page_arg = request.args.get("page", default=None, type=int)
+        page_size_arg = request.args.get("page_size", default=None, type=int)
+        if paged or page_arg is not None or page_size_arg is not None:
+            result = _paginate_items(rows, page=max(1, int(page_arg or 1)), page_size=page_size_arg or 20)
+        else:
+            result = {"ok": True, "items": rows, "total": len(rows)}
+        result["status_counts"] = {
+            "registration": {key: sum(1 for row in rows if row.get("registration_status") == key) for key in ("registered", "unregistered", "registering", "failed")},
+            "codex": {key: sum(1 for row in rows if row.get("codex_status") == key) for key in ("authorized", "unauthorized", "authorizing", "failed")},
+            "phone": {key: sum(1 for row in rows if row.get("phone_status") == key) for key in ("verified", "unverified", "verifying", "failed")},
+        }
+        return jsonify(result)
+
+    @app.get("/api/gpt-accounts/<account_id>/log")
+    def api_gpt_account_log(account_id: str):
+        """Read the newest registration/authorization log attached to an account row."""
+        row = gpt_account_service.get_account(account_id)
+        if not row:
+            return jsonify({"ok": False, "error": "GPT账号不存在"}), 404
+        ref = row.get("latest_log") or {}
+        if not ref:
+            return jsonify({"ok": True, "account_id": account_id, "kind": "", "job_id": None, "log": ""})
+        try:
+            if ref.get("kind") in {"registration", "codex_retry"}:
+                log = svc.read_job_log(int(ref.get("id")))
+            else:
+                log = codex_relay_service.read_log(str(ref.get("id") or ""))
+        except (TypeError, ValueError):
+            log = ""
+        return jsonify({"ok": True, "account_id": account_id, "kind": ref.get("kind"), "job_id": ref.get("id"), "log": log, "job": ref})
+
+    @app.delete("/api/gpt-accounts")
+    def api_gpt_accounts_soft_delete():
+        """Soft-delete unified rows without removing source accounts or logs."""
+        data = request.get_json(silent=True) or {}
+        account_ids = data.get("account_ids") or []
+        if not isinstance(account_ids, list) or not account_ids:
+            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
+        if len(account_ids) > 5000:
+            return jsonify({"ok": False, "error": "单次最多删除 5000 个 GPT 账号"}), 400
+        try:
+            return jsonify(gpt_account_service.soft_delete_accounts(account_ids))
+        except gpt_account_service.AccountBusyError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 409
+        except LookupError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.post("/api/gpt-accounts/register")
+    def api_gpt_accounts_register():
+        """Queue registration work from the unified workspace.
+
+        Without account_ids this is the normal configured email-pool batch
+        entry.  With account_ids, the selected rows' email API/Outlook
+        material is prepared and the worker receives those exact addresses;
+        retry/stop semantics remain owned by the existing registration service.
+        """
+        data = request.get_json(silent=True) or {}
+        requested_ids = [str(value) for value in (data.get("account_ids") or []) if value]
+        if requested_ids:
+            rows = gpt_account_service.list_accounts()
+            selected = [row for row in rows if str(row.get("id") or "") in requested_ids and row.get("registration_status") not in {"registered", "registering"}]
+            if any(str(row.get("id") or "") in requested_ids and row.get("registration_status") == "registering" for row in rows):
+                return jsonify({"ok": False, "error": "所选账号已有注册任务运行中，请等待当前任务结束"}), 409
+            count = len(selected)
+            if not count:
+                return jsonify({"ok": False, "error": "所选账号均已注册或没有可注册账号"}), 400
+            target_emails = []
+            generic_material = []
+            outlook_material = []
+            for row in selected:
+                email = str(row.get("email") or "").strip().lower()
+                if not email:
+                    continue
+                target_emails.append(email)
+                if row.get("email_code_url"):
+                    generic_material.append({"email": email, "code_url": row.get("email_code_url")})
+                elif row.get("mailbox_password") and row.get("outlook_client_id") and row.get("outlook_refresh_token"):
+                    outlook_material.append({
+                        "email": email,
+                        "password": row.get("mailbox_password"),
+                        "client_id": row.get("outlook_client_id"),
+                        "refresh_token": row.get("outlook_refresh_token"),
+                    })
+                else:
+                    return jsonify({"ok": False, "error": f"账号 {email} 缺少邮箱接码 API 或 Outlook 邮箱凭证，无法定向注册"}), 400
+            if generic_material:
+                db.import_generic_api_emails(generic_material)
+            if outlook_material:
+                db.import_outlook_accounts(outlook_material)
+        else:
+            target_emails = None
+            try:
+                count = max(1, min(200, int(data.get("count", 1))))
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "count 非法"}), 400
+        try:
+            workers = max(1, min(16, int(data.get("workers", 1))))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "workers 非法"}), 400
+        jobs = svc.submit_registration(count=count, workers=workers, emails=target_emails)
+        return jsonify({"ok": True, "submitted": len(jobs), "jobs": jobs, "workers": workers})
+
+    @app.post("/api/gpt-accounts/authorize")
+    def api_gpt_accounts_authorize():
+        """Ensure selected unified rows have Relay records, then start OAuth.
+
+        A registered account can predate the Codex Relay collection.  The
+        bridge is intentionally lazy: it copies only the login/mailbox
+        material needed by the Relay worker and is idempotent by normalized
+        email.  This keeps the two SQLite collections compatible while making
+        the GPT账号 page the single user-facing workflow.
+        """
+        data = request.get_json(silent=True) or {}
+        requested_ids = [str(value).strip() for value in (data.get("account_ids") or []) if str(value).strip()]
+        if not requested_ids:
+            return jsonify({"ok": False, "error": "请先选择 GPT 账号"}), 400
+        try:
+            workers = max(1, min(8, int(data.get("workers", 1))))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "workers 非法"}), 400
+        rows = gpt_account_service.list_accounts()
+        selected = []
+        missing = []
+        seen_emails = set()
+        for requested in requested_ids:
+            row = next(
+                (
+                    candidate for candidate in rows
+                    if str(candidate.get("id") or "") == requested
+                    or str(candidate.get("relay_account_id") or "") == requested
+                    or str(candidate.get("email") or "").strip().lower() == requested.lower()
+                ),
+                None,
+            )
+            if row is None:
+                missing.append(requested)
+                continue
+            email = str(row.get("email") or "").strip().lower()
+            if email and email not in seen_emails:
+                selected.append(row)
+                seen_emails.add(email)
+        if missing:
+            return jsonify({"ok": False, "error": f"找不到账号：{', '.join(missing[:3])}"}), 404
+        not_registered = [row.get("email") or "" for row in selected if row.get("registration_status") != "registered"]
+        if not_registered:
+            return jsonify({"ok": False, "error": f"以下账号尚未完成 GPT 注册：{', '.join(not_registered[:3])}"}), 409
+
+        materials = []
+        try:
+            for row in selected:
+                material = gpt_account_service.authorization_material(row)
+                # Validate the complete batch before creating any Relay rows;
+                # one malformed account must not leave earlier rows half-bridged.
+                materials.append(codex_relay_service.validate_account_material(material))
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+        relay_ids = []
+        created = []
+        try:
+            for row, material in zip(selected, materials):
+                ensured = codex_relay_service.ensure_account_material(material)
+                relay_id = str(ensured.get("id") or "")
+                if not relay_id:
+                    raise ValueError(f"账号 {row.get('email') or ''} 未生成 Relay ID")
+                relay_ids.append(relay_id)
+                if ensured.get("created"):
+                    created.append(relay_id)
+            result = codex_relay_service.start_jobs(
+                relay_ids,
+                workers=workers,
+                phone_ids=data.get("phone_ids") or [],
+            )
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        result.update({
+            "created_relay_account_ids": created,
+            "relay_account_ids": relay_ids,
+            "emails": [row.get("email") for row in selected],
+        })
+        return jsonify(result)
+
     @app.post("/api/codex-relay/import")
     def api_codex_relay_import():
         data = request.get_json(silent=True) or {}
         try:
-            return jsonify(codex_relay_service.import_accounts(
+            result = codex_relay_service.import_accounts(
                 data.get("text") or "",
                 format_name=data.get("format") or "auto",
-            ))
+                include_emails=True,
+            )
+            restored = gpt_account_service.restore_deleted_accounts(result.pop("emails", []))
+            if restored["restored"]:
+                result["restored"] = restored["restored"]
+                result["message"] = f"导入完成，已恢复 {restored['restored']} 个 GPT 账号"
+            else:
+                result["message"] = "导入完成"
+            return jsonify(result)
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
@@ -2605,7 +2708,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.post("/api/jobs/<int:job_id>/retry")
     def api_job_retry(job_id: int):
-        """重试失败/停止/取消任务；服务端自动判断完整注册或 Codex 补跑。"""
+        """重试失败/停止/取消的注册任务；不会隐式发起 Codex 授权。"""
         data = request.get_json(silent=True) or {}
         try:
             workers = max(1, min(16, int(data.get("workers", svc.get_executor_workers()))))

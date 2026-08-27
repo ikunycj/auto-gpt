@@ -11,7 +11,6 @@ import logging
 import time
 
 from config import twofa as _twofa_cfg
-from config import email as _email_cfg
 from config import openai_protocol as _protocol_cfg
 from core.session import BrowserSession
 from core.chatgpt_auth import get_providers, get_csrf_token, signin_openai
@@ -32,7 +31,7 @@ from core.account_export import (
     setup_2fa,
     save_account_data,
 )
-from core.email_provider import wait_for_otp
+from core.email_provider import automatic_email_enabled, wait_for_otp
 from core.humanize import delay as human_delay
 from core.profile_utils import generate_random_birthday
 from registration.application.models import RegistrationRequest, RegistrationResult
@@ -136,6 +135,7 @@ def _run_protocol_registration(
     logger.debug(f"[注册] 设备ID={session.device_id}，会话日志ID={session.auth_session_logging_id}")
 
     create_acknowledged = False
+    account_id = None
     try:
         # 网络预检必须在 signin/follow_authorize 之前完成；预检不带邮箱，不会触发 OTP。
         network_preflight(session)
@@ -179,20 +179,17 @@ def _run_protocol_registration(
         # Sentinel Token 不提前生成；等 OTP 到手后紧贴 validate 请求生成，
         # 避免等待邮箱期间 challenge 过期或与重新发送后的状态不一致。
 
-        # 等待验证码：USE_EMAIL_SERVICE=True 时自动从 Outlook 取件，否则人工输入。
         # 如果验证码错误/过期，自动重新发送并重新取最新验证码。
         validate_result = None
         max_otp_attempts = 3
         current_otp = otp_code
         for otp_attempt in range(1, max_otp_attempts + 1):
             if current_otp is None:
-                if _email_cfg.USE_EMAIL_SERVICE:
+                if automatic_email_enabled():
                     logger.info(f"[OTP] 等待验证码：{email}（第 {otp_attempt}/{max_otp_attempts} 次）")
-                    current_otp = wait_for_otp(email, after_ts=otp_after_ts)
                 else:
-                    logger.info("")
-                    logger.info(f"[OTP] 请检查邮箱，输入收到的 6 位验证码（第 {otp_attempt}/{max_otp_attempts} 次）:")
-                    current_otp = input(">>> 验证码: ").strip()
+                    logger.info(f"[OTP] 等待手动提交验证码：{email}（第 {otp_attempt}/{max_otp_attempts} 次）")
+                current_otp = wait_for_otp(email, after_ts=otp_after_ts)
 
             human_delay("otp_input")
             try:
@@ -320,12 +317,49 @@ def _run_protocol_registration(
                 )
             human_delay("post_auth")
 
+        # accessToken 代表 GPT 注册已经真实完成。先落库，再执行可选的 2FA，
+        # 让 WebUI 下一轮轮询即可看到账号、邮箱渠道与真实登录方式。
+        from core.email_provider import resolve_email_source, snapshot_email_context
+
+        email_source = resolve_email_source(email)
+        provider_context = snapshot_email_context(email, source=email_source)
+        codex_result = {
+            "status": "not_authorized",
+            "ok": False,
+            "message": "GPT 注册完成，等待在 GPT账号 页面手动发起 Codex 授权",
+        }
+        account_extra = {
+            "user": session_info.get("user"),
+            "account": session_info.get("account"),
+            "expires": session_info.get("expires"),
+            "device_id": session.device_id,
+            "sentinel_sid": getattr(session, "sentinel_sid", None),
+            "browser_profile": getattr(session, "browser_profile", None),
+            "registration_password": None,
+            "login_method": "email_otp",
+            "email_provider": email_source,
+            "email_provider_context": provider_context,
+            "codex": codex_result,
+        }
+        account_id = save_account_data(
+            email=email,
+            access_token=access_token,
+            totp_secret=None,
+            email_source=email_source,
+            proxy_used=session.proxy or None,
+            batch_dir=batch_dir,
+            extra=account_extra,
+            archive=False,
+            enqueue_plan=True,
+        )
+        logger.info(f"[检查点] GPT 注册结果已即时写入：{email}，账号ID={account_id}")
+
         # ==================== 阶段7: 设置 2FA（受 config.ENABLE_2FA 控制）====================
         totp_secret = None
         if _twofa_cfg.ENABLE_2FA:
             # 步骤14-20: 重认证（要再收一次邮箱 OTP）→ enroll TOTP → activate
             try:
-                totp_secret = setup_2fa(session, email)
+                totp_secret = setup_2fa(session, email, otp_provider=wait_for_otp)
             except Exception as exc:
                 logger.error(f"2FA 设置失败: {exc}")
                 logger.debug("2FA 错误详情:", exc_info=True)
@@ -333,59 +367,37 @@ def _run_protocol_registration(
         else:
             logger.debug("已跳过 2FA 设置 (config.ENABLE_2FA=False)")
 
-        # ==================== 阶段 7.5: Codex OAuth（注册成功→拿回调/CPA凭证）====================
-        # 用全新干净 session 从头登录该邮箱，走 邮箱OTP→手机短信验证(接码)→选workspace
-        # →拿 code 的标准路径（不复用注册 session，避免撞 choose-an-account）。
-        # 产出：
-        #   1) codex_result["callback_url"]  命中 redirect_uri 的整条 Location（携带 code/state）
-        #   2) codex_result["file_path"]     CPA 可直接导入的 codex-{email}.json
-        codex_result = {"status": "skipped", "ok": False, "message": "未触发"}
-        try:
-            from core.codex_oauth import run_codex_oauth
-            codex_result = run_codex_oauth(email)
-        except Exception as exc:
-            codex_result = {
-                "status": "failed",
-                "ok": False,
-                "message": f"{type(exc).__name__}: {str(exc)[:180]}",
-            }
-
-        if codex_result.get("ok"):
-            logger.info(
-                f"[Codex] 成功：{email}，file={codex_result.get('file_path')}，"
-                f"callback={codex_result.get('callback_url')}"
+        if totp_secret:
+            account_id = save_account_data(
+                email=email,
+                access_token=access_token,
+                totp_secret=totp_secret,
+                email_source=email_source,
+                proxy_used=session.proxy or None,
+                batch_dir=batch_dir,
+                extra=account_extra,
+                archive=False,
+                enqueue_plan=False,
             )
-        elif codex_result.get("status") == "skipped":
-            logger.info(f"[Codex] 跳过：{email}，原因={codex_result.get('message')}")
-        else:
-            logger.warning(
-                f"[Codex] 失败：{email}，原因={codex_result.get('message')}"
-            )
+            logger.info(f"[检查点] 2FA 已即时写入账号列表：{email}")
 
-        # ==================== 阶段8: 持久化账号 ====================
-        from core.email_provider import resolve_email_source
+        # ==================== 阶段8: 写批次归档 ====================
         account_id = save_account_data(
             email=email,
             access_token=access_token,
             totp_secret=totp_secret,
-            email_source=resolve_email_source(email),
+            email_source=email_source,
             proxy_used=session.proxy or None,
             batch_dir=batch_dir,
-            extra={
-                "user": session_info.get("user"),
-                "account": session_info.get("account"),
-                "expires": session_info.get("expires"),
-                "device_id": session.device_id,
-                "sentinel_sid": getattr(session, "sentinel_sid", None),
-                "browser_profile": getattr(session, "browser_profile", None),
-                "codex": codex_result,
-            },
+            extra=account_extra,
+            archive=True,
+            enqueue_plan=False,
         )
 
         logger.info(f"[完成] {email}，账号ID={account_id}，Token={access_token[:16]}...")
 
         # ==================== 阶段9: 后置自动触发 flow ====================
-        # 只有走完回调、拿到 token 并保存成功的账号，才会触发 flow。
+        # 只有 GPT 注册拿到 token 并保存成功的账号，才会触发 flow。
         # flow 请求不影响账号保存状态，但会记录结果并参与批量统计。
         flow_result = {"status": "skipped", "ok": False, "message": "未触发"}
         try:
@@ -409,20 +421,10 @@ def _run_protocol_registration(
 
         logger.debug(f"[完成] TOTP Secret: {totp_secret or '(未设置)'}")
 
-        # 注册任务的成功判定：账号本身(注册+token)+Codex 授权都成功才算 success。
-        # Codex 失败时账号仍保存（token 拿到了、有补跑机会），但任务状态标失败，
-        # 让 WebUI 任务表能清楚区分"完整成功"和"差 Codex"两种结果。
-        codex_ok = codex_result.get("ok") or codex_result.get("status") == "skipped"
-        task_success = codex_ok
-        task_error = None
-        if not task_success:
-            task_error = f"Codex 未完成: {codex_result.get('message', '未知')}"
-            logger.warning(f"[任务结果] {email} 账号已保存但任务标失败，原因: {task_error}")
-
-        return {"success": task_success, "email": email, "account_id": account_id,
+        return {"success": True, "email": email, "account_id": account_id,
                 "access_token": access_token, "totp_secret": totp_secret,
                 "flow": flow_result, "codex": codex_result,
-                "error": task_error}
+                "error": None}
 
     except Exception as e:
         logger.error(f"[失败] {email}: {type(e).__name__}: {e}")

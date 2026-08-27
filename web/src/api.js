@@ -33,14 +33,19 @@ async function parseResponse(response) {
 }
 
 export async function api(path, options = {}) {
-  const response = await fetch(path, {
-    credentials: 'same-origin',
-    ...options,
-    headers: {
-      ...(options.body && !(options.body instanceof FormData) ? jsonHeaders : {}),
-      ...(options.headers || {}),
-    },
-  });
+  let response;
+  try {
+    response = await fetch(path, {
+      credentials: 'same-origin',
+      ...options,
+      headers: {
+        ...(options.body && !(options.body instanceof FormData) ? jsonHeaders : {}),
+        ...(options.headers || {}),
+      },
+    });
+  } catch (error) {
+    throw new ApiError('无法连接本地后端服务，请确认 WebUI 已启动（127.0.0.1:5000）', 0, { cause: error?.message || 'network error' });
+  }
   if (response.status === 401) {
     goToLogin();
   }

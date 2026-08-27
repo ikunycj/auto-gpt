@@ -142,7 +142,16 @@ cmd_start() {
 
   echo "启动 WebUI：http://${HOST}:${PORT}"
   echo "日志存储：SQLite（逻辑键：data/runtime/webui.log）"
-  nohup "$py" "${args[@]}" >/dev/null 2>&1 &
+  # Start the WebUI in its own process session. Some terminal runners terminate
+  # the entire command process group after this script exits; nohup alone does
+  # not detach from that group.
+  nohup "$py" -c '
+import os
+import sys
+
+os.setsid()
+os.execv(sys.argv[1], sys.argv[1:])
+' "$py" "${args[@]}" >/dev/null 2>&1 &
   pid=$!
   echo "$pid" > "$PID_FILE"
 

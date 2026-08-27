@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from core import codex_relay_service as relay
+from core import gpt_account_service
 from apps.web.app import create_app
 
 
@@ -22,6 +23,7 @@ class CodexRelayWebUiTests(unittest.TestCase):
             patch.object(relay, "_LOG_DIR", root / "logs"),
             patch.object(relay, "_CREDENTIAL_DIR", root / "codex_accounts"),
             patch.object(relay, "_SUB2_SERVICES_PATH", root / "sub2-services.json"),
+            patch.object(gpt_account_service, "_DELETIONS_KEY", root / "gpt-account-deletions.json"),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -34,6 +36,53 @@ class CodexRelayWebUiTests(unittest.TestCase):
         for patcher in reversed(self.patchers):
             patcher.stop()
         self.tempdir.cleanup()
+
+    def test_summary_counts_the_unified_gpt_account_projection(self):
+        with patch.object(gpt_account_service, "list_accounts", return_value=[
+            {"id": "relay-1", "email": "one@example.com"},
+            {"id": "registered:2", "email": "two@example.com"},
+        ]):
+            response = self.client.get("/api/summary")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["accounts"], 2)
+
+    def test_legacy_codex_retry_endpoints_cannot_bypass_phone_pool(self):
+        for endpoint in ("/api/codex/retry", "/api/codex/retry-bulk"):
+            response = self.client.post(endpoint, json={})
+            self.assertEqual(response.status_code, 410)
+            self.assertIn("GPT账号", response.get_json()["error"])
+
+    def test_unified_soft_delete_uses_gpt_account_ids_and_returns_real_count(self):
+        result = {
+            "ok": True,
+            "deleted": 2,
+            "deleted_count": 2,
+            "items": [{"id": "relay-1"}, {"id": "registered:2"}],
+            "skipped": [],
+            "message": "已软删除 2 个 GPT 账号（账号数据与日志已保留）",
+        }
+        with patch.object(gpt_account_service, "soft_delete_accounts", return_value=result) as soft_delete:
+            response = self.client.delete("/api/gpt-accounts", json={
+                "account_ids": ["relay-1", "registered:2"],
+            })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["deleted_count"], 2)
+        soft_delete.assert_called_once_with(["relay-1", "registered:2"])
+
+    def test_unified_soft_delete_rejects_empty_and_busy_requests(self):
+        response = self.client.delete("/api/gpt-accounts", json={"account_ids": []})
+        self.assertEqual(response.status_code, 400)
+
+        with patch.object(
+            gpt_account_service,
+            "soft_delete_accounts",
+            side_effect=gpt_account_service.AccountBusyError("请先停止任务"),
+        ):
+            response = self.client.delete("/api/gpt-accounts", json={"account_ids": ["relay-1"]})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("停止任务", response.get_json()["error"])
 
     def test_import_and_list_return_plaintext_materials(self):
         response = self.client.post("/api/codex-relay/import", json={
@@ -60,6 +109,140 @@ class CodexRelayWebUiTests(unittest.TestCase):
         self.assertIn("chatgpt-password", serialized)
         self.assertIn("JBSWY3DPEHPK3PXP", serialized)
         self.assertIn("https://sms.example/code", phone_response.get_data(as_text=True))
+
+    def test_reimport_restores_a_soft_deleted_unified_account(self):
+        material = "restore@example.com----chatgpt-password----JBSWY3DPEHPK3PXP"
+        first = self.client.post("/api/codex-relay/import", json={"text": material})
+        self.assertEqual(first.status_code, 200)
+
+        account = self.client.get("/api/gpt-accounts", query_string={"q": "restore@example.com"}).get_json()["items"][0]
+        deleted = self.client.delete("/api/gpt-accounts", json={"account_ids": [account["id"]]})
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(self.client.get("/api/gpt-accounts", query_string={"q": "restore@example.com"}).get_json()["total"], 0)
+
+        restored = self.client.post("/api/codex-relay/import", json={"text": material})
+        self.assertEqual(restored.status_code, 200)
+        self.assertEqual(restored.get_json()["restored"], 1)
+        payload = self.client.get("/api/gpt-accounts", query_string={"q": "restore@example.com"}).get_json()
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["items"][0]["email"], "restore@example.com")
+
+    def test_unified_authorize_lazily_creates_registered_only_relay_account(self):
+        registered_row = {
+            "id": "registered:17",
+            "email": "registered-only@example.com",
+            "registration_status": "registered",
+            "codex_status": "unauthorized",
+            "password": "chatgpt-password",
+            "chatgpt_password": "chatgpt-password",
+            "email_code_url": "https://mail.example/code",
+            "totp_secret": "JBSWY3DPEHPK3PXP",
+            "relay_account_id": "",
+        }
+        captured = {}
+
+        with patch.object(gpt_account_service, "list_accounts", return_value=[registered_row]), \
+                patch.object(gpt_account_service, "authorization_material", return_value={
+                    "email": "registered-only@example.com",
+                    "chatgpt_password": "chatgpt-password",
+                    "email_code_url": "https://mail.example/code",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                }), \
+                patch.object(relay, "start_jobs", side_effect=lambda ids, **kwargs: captured.update({"ids": ids, "kwargs": kwargs}) or {"ok": True, "submitted": len(ids), "jobs": []}):
+            response = self.client.post("/api/gpt-accounts/authorize", json={
+                "account_ids": ["registered:17"],
+                "workers": 2,
+            })
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["created_relay_account_ids"], captured["ids"])
+        self.assertEqual(captured["kwargs"]["workers"], 2)
+        relay_rows = relay._read(relay._ACCOUNTS_PATH)
+        self.assertEqual(len(relay_rows), 1)
+        self.assertEqual(relay_rows[0]["email"], "registered-only@example.com")
+        self.assertEqual(relay_rows[0]["chatgpt_password"], "chatgpt-password")
+
+        # The second request reuses the same Relay ID and does not create a
+        # duplicate row.
+        with patch.object(gpt_account_service, "list_accounts", return_value=[{
+            **registered_row,
+            "relay_account_id": relay_rows[0]["id"],
+        }]), \
+                patch.object(gpt_account_service, "authorization_material", return_value={
+                    "email": "registered-only@example.com",
+                    "chatgpt_password": "new-value-is-ignored",
+                    "email_code_url": "https://mail.example/code",
+                }), \
+                patch.object(relay, "start_jobs", return_value={"ok": True, "submitted": 1, "jobs": []}):
+            repeated = self.client.post("/api/gpt-accounts/authorize", json={"account_ids": ["registered:17"]})
+        self.assertEqual(repeated.status_code, 200)
+        self.assertEqual(len(relay._read(relay._ACCOUNTS_PATH)), 1)
+
+    def test_unified_authorize_accepts_mailnest_otp_login_without_password(self):
+        registered_row = {
+            "id": "registered:18",
+            "email": "otp-only@example.com",
+            "registration_status": "registered",
+            "codex_status": "unauthorized",
+            "password": "",
+            "chatgpt_password": "",
+            "totp_secret": "JBSWY3DPEHPK3PXP",
+            "email_provider": "mailnest",
+            "email_provider_label": "MailNest",
+            "login_method": "email_otp",
+            "relay_account_id": "",
+        }
+        material = {
+            "email": "otp-only@example.com",
+            "chatgpt_password": "",
+            "totp_secret": "JBSWY3DPEHPK3PXP",
+            "email_provider": "mailnest",
+            "email_provider_context": {"project_code": "chatgpt001"},
+            "login_method": "email_otp",
+        }
+
+        with patch.object(gpt_account_service, "list_accounts", return_value=[registered_row]), \
+                patch.object(gpt_account_service, "authorization_material", return_value=material), \
+                patch.object(relay, "start_jobs", return_value={"ok": True, "submitted": 1, "jobs": []}):
+            response = self.client.post("/api/gpt-accounts/authorize", json={
+                "account_ids": ["registered:18"],
+            })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["submitted"], 1)
+        stored = relay._read(relay._ACCOUNTS_PATH)
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["email_provider"], "mailnest")
+        self.assertEqual(stored[0]["login_method"], "email_otp")
+        self.assertEqual(stored[0].get("chatgpt_password") or "", "")
+
+    def test_unified_authorize_reports_empty_phone_pool_before_starting_jobs(self):
+        registered_row = {
+            "id": "registered:19",
+            "email": "no-phone@example.com",
+            "registration_status": "registered",
+            "codex_status": "unauthorized",
+            "password": "chatgpt-password",
+            "chatgpt_password": "chatgpt-password",
+            "email_code_url": "https://mail.example/code",
+            "relay_account_id": "",
+        }
+        material = {
+            "email": "no-phone@example.com",
+            "chatgpt_password": "chatgpt-password",
+            "email_code_url": "https://mail.example/code",
+        }
+
+        with patch.object(gpt_account_service, "list_accounts", return_value=[registered_row]), \
+                patch.object(gpt_account_service, "authorization_material", return_value=material):
+            response = self.client.post("/api/gpt-accounts/authorize", json={
+                "account_ids": ["registered:19"],
+            })
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("手机号池可用资源不足", response.get_json()["error"])
+        self.assertEqual(relay._read(relay._JOBS_PATH), [])
 
     def test_verification_requires_matching_wait_state(self):
         relay._write(relay._JOBS_PATH, [{

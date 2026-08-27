@@ -12,7 +12,7 @@ Codex OAuth 单独验证脚本（2026-06-15 重写：全新 session + 接码方�
 
 前提：
     - 该邮箱在 SQLite 邮箱池中有完整凭证（client_id/refresh_token），用于收邮箱 OTP
-    - config/codex.py 里 ENABLE_CODEX_AUTO=True，接码配置（SMS_*）已填好
+    - 接码配置（SMS_*）已填好；WebUI 的 GPT账号授权则改用手机号池
     - 会真实消耗：该邮箱一封邮箱 OTP + 一个接码短信（约 $0.13）
 
 输出：

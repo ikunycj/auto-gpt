@@ -146,7 +146,7 @@ class ChromeCDPSeleniumDriver(CloakSeleniumDriver):
         self._chrome_profile_dir = profile_dir
         self._keep_open = bool(keep_open)
         self._closed = False
-        self._registration_log_prefix = "[ChromeCDP]"
+        self._registration_log_prefix = "[Chrome注册]"
 
     def quit(self) -> None:
         if self._closed:
@@ -193,6 +193,7 @@ def build_chrome_cdp_driver(
     proxy: str | None = None,
     *,
     background: bool = False,
+    keep_open: bool | None = None,
 ) -> tuple[ChromeCDPSeleniumDriver, ChromeCDPOpenResult]:
     selected_proxy = proxy
     if selected_proxy is None:
@@ -243,7 +244,11 @@ def build_chrome_cdp_driver(
             playwright=playwright,
             process=process,
             profile_dir=profile_dir,
-            keep_open=bool(getattr(_cfg, "CHROME_CDP_KEEP_BROWSER_OPEN", False)),
+            keep_open=(
+                bool(getattr(_cfg, "CHROME_CDP_KEEP_BROWSER_OPEN", False))
+                if keep_open is None
+                else bool(keep_open)
+            ),
         )
         driver.set_page_load_timeout(int(getattr(_cfg, "CHROME_CDP_PAGE_TIMEOUT", 90) or 90))
 

@@ -1733,11 +1733,16 @@ def _new_job_row(
     }
 
 
-def create_job(email_source: str) -> dict:
-    """创建一个首次执行的 pending 注册任务。"""
+def create_job(email_source: str, *, email: str | None = None, account_id: int | None = None) -> dict:
+    """创建一个首次执行的 pending 注册任务。
+
+    ``email``/``account_id`` are optional so the unified GPT account view can
+    target one known mailbox.  Legacy batch callers omit them and retain the
+    original pool-allocation behavior.
+    """
     with _LOCK:
         rows = _load_jobs()
-        row = _new_job_row(rows, email_source=email_source)
+        row = _new_job_row(rows, email_source=email_source, email=email, account_id=account_id)
         rows.append(row)
         _save_jobs(rows)
         return dict(row)

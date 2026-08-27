@@ -43,8 +43,6 @@ SECRET_ENV_KEYS: dict[str, str] = {
     "FLOW_TRIGGER_BEARER": "Flow Trigger Bearer Token",
     "FLOW_TRIGGER_COOKIE": "Flow Trigger Cookie",
     "SMS_API_KEY": "接码平台 API Key（如 GrizzlySMS）",
-    "FIXED_SMS_PHONE": "固定短信通道手机号",
-    "FIXED_SMS_CODE_URL": "固定短信通道取码 URL（含敏感 token）",
     "L_ADMIN_AUTH_CODE": "本地 L 接码服务 ADMIN_AUTH_CODE",
     "H_ADMIN_AUTH_CODE": "本地 H 接码服务 ADMIN_AUTH_CODE",
     "REGISTER_PASSWORD": "注册流程备用密码",

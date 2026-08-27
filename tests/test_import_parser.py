@@ -39,7 +39,20 @@ def test_markdown_link_and_backslash_escaping_are_normalized():
 
     assert result == {
         "email": "eric.walker@example.com",
-        "email_code_url": "http://mail.example/rc?u=eric.walker%40example.com&k=abc----XFSY5&G@Wi@4*V",
+        "email_code_url": "http://mail.example/rc?u=eric.walker%40example.com&k=abc",
+        "chatgpt_password": "XFSY5&G@Wi@4*V",
+    }
+
+
+def test_password_punctuation_is_not_absorbed_into_code_url():
+    result = parse_account_material_line(
+        "mail@example.com----https://mail.example/rc?token=abc----Password&With#Chars"
+    )
+
+    assert result == {
+        "email": "mail@example.com",
+        "email_code_url": "https://mail.example/rc?token=abc",
+        "chatgpt_password": "Password&With#Chars",
     }
 
 

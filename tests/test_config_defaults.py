@@ -69,6 +69,58 @@ class ConfigDefaultFallbackTests(unittest.TestCase):
         )
         self.assertTrue(config_editor._coerce_raw_value("", True, "bool"))
 
+    def test_every_browser_field_is_assigned_to_one_webui_module(self):
+        browser_keys = {
+            field["key"]
+            for field in config_editor.EDITABLE_FIELDS
+            if field["group"] == "代理浏览器"
+        }
+        self.assertEqual(browser_keys, set(config_editor._BROWSER_FIELD_MODULE))
+        counts = {
+            module: list(config_editor._BROWSER_FIELD_MODULE.values()).count(module)
+            for module in set(config_editor._BROWSER_FIELD_MODULE.values())
+        }
+        self.assertEqual(
+            counts,
+            {
+                "general": 1,
+                "roxy": 31,
+                "cloak": 12,
+                "browser_use": 14,
+                "skyvern": 10,
+                "system_chrome": 4,
+                "locale": 4,
+            },
+        )
+
+    def test_sms_fields_are_assigned_to_platform_sections(self):
+        fields = {field["key"]: field for field in config_editor.get_config()}
+        self.assertEqual(
+            {
+                key: (fields[key].get("sms_section"), fields[key].get("sms_channel"))
+                for key in (
+                    "SMS_POOL_PLATFORM_ENABLED",
+                    "SMS_PROVIDER",
+                    "SMS_API_BASE",
+                    "SMS_API_KEY",
+                    "L_API_BASE",
+                    "L_ADMIN_AUTH_CODE",
+                    "H_API_BASE",
+                    "H_ADMIN_AUTH_CODE",
+                )
+            },
+            {
+                "SMS_POOL_PLATFORM_ENABLED": ("sms", "general"),
+                "SMS_PROVIDER": ("sms", "general"),
+                "SMS_API_BASE": ("sms", "grizzly"),
+                "SMS_API_KEY": ("sms", "grizzly"),
+                "L_API_BASE": ("sms", "l"),
+                "L_ADMIN_AUTH_CODE": ("sms", "l"),
+                "H_API_BASE": ("sms", "h"),
+                "H_ADMIN_AUTH_CODE": ("sms", "h"),
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

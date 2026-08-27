@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-注册成功后自动跑 Codex OAuth 授权的配置项。
-设置 ENABLE_CODEX = False 可完全跳过此步骤。
+独立 Codex OAuth 授权的配置项。
+
+GPT 注册与 Codex 授权是两个独立动作。注册流程不会读取本模块的授权配置；
+只有用户显式发起 Codex 授权时才会使用这些参数。
 
 参数来源：CLIProxyAPI 源码 internal/auth/codex/openai_auth.go + pkce.go，
 对照 https://github.com/router-for-me/CLIProxyAPI 逐行确认。
 """
 from config.env_loader import env_str, apply_env_overrides
 
-
-# 是否启用 Codex OAuth 授权（False = 跳过，不影响注册结果）
-ENABLE_CODEX: bool = False
 
 # Codex OAuth 客户端 ID（固定值，来自 CLIProxyAPI openai_auth.go:27 ClientID）
 CODEX_CLIENT_ID: str = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -47,9 +46,6 @@ CODEX_REQUEST_TIMEOUT: int = 30
 # （邮箱 OTP → 手机短信验证 → 选 workspace → 拿 code），
 # 手机验证靠接码平台 GrizzlySMS 自动收码。
 # ============================================================
-
-# 注册成功后是否自动跑 Codex 授权（True=自动，False=跳过）
-ENABLE_CODEX_AUTO: bool = False
 
 # Codex OAuth 授权驱动：
 #   "protocol" = 原有 curl_cffi 协议授权
@@ -106,16 +102,20 @@ CPA_SAVE_CALLBACK_RECEIPT: bool = True
 #   "grizzly" = GrizzlySMS，接口说明见 https://api.grizzlysms.com
 #   "l"       = 本地 L 取号服务，接口说明见 L_API.md
 #   "h"       = 本地 H 取号服务，接口说明见 H_API.md
-#   "fixed_url" = 固定手机号 + 页面取码 URL（本项目扩展）
 # ============================================================
 
 SMS_PROVIDER: str = "l"
 
+# 是否把当前接码平台作为手机号池的动态来源。
+# 开启后，GPT账号页面的 Codex 授权会优先向该平台取号；
+# 关闭后只使用“手机号池”中手工导入的号码。
+SMS_POOL_PLATFORM_ENABLED: bool = False
+
 # 接码 API 基址（GET handler）
 SMS_API_BASE: str = "https://api.grizzlysms.com/stubs/handler_api.php"
 
-# 接码 API 密钥（在 GrizzlySMS 后台 → 设置 获取）
-# 留空时 Codex 授权的手机验证步会失败；如不需要 Codex 自动授权，把 ENABLE_CODEX_AUTO=False。
+# 接码 API 密钥（在 GrizzlySMS 后台 → 设置 获取）。这些 SMS_* 参数仅供
+# 独立命令行授权使用；GPT账号页面的授权统一使用手机号池。
 SMS_API_KEY: str = env_str("SMS_API_KEY", "")
 
 # 服务代码：OpenAI = "dr"
@@ -138,12 +138,6 @@ SMS_POLL_INTERVAL: int = 5
 
 # 接码平台 HTTP 请求超时（秒）
 SMS_REQUEST_TIMEOUT: int = 30
-
-# 固定手机号取码通道（SMS_PROVIDER="fixed_url" 时使用）。
-# URL 通常包含一次性访问令牌，只放在 .env，不要提交到源码。
-FIXED_SMS_PHONE: str = env_str("FIXED_SMS_PHONE", "")
-FIXED_SMS_CODE_URL: str = env_str("FIXED_SMS_CODE_URL", "")
-
 
 # ============================================================
 # H 取号服务（SMS_PROVIDER="h" 时使用）
@@ -180,7 +174,6 @@ L_PHONE_PREFIX: str = ""
 
 # ---- .env overrides for WebUI editable fields ----
 apply_env_overrides(globals(), {
-    'ENABLE_CODEX_AUTO': 'bool',
     'CODEX_REQUEST_TIMEOUT': 'int',
     'CODEX_OAUTH_DRIVER': 'str',
     'CHROME_CDP_EXECUTABLE_PATH': 'str',
@@ -195,6 +188,7 @@ apply_env_overrides(globals(), {
     'CPA_CALLBACK_SUBMIT_RETRY_DELAY': 'int',
     'CPA_SAVE_CALLBACK_RECEIPT': 'bool',
     'SMS_PROVIDER': 'str',
+    'SMS_POOL_PLATFORM_ENABLED': 'bool',
     'SMS_API_BASE': 'str',
     'SMS_COUNTRY': 'str',
     'SMS_SERVICE': 'str',
@@ -204,8 +198,6 @@ apply_env_overrides(globals(), {
     'SMS_POLL_INTERVAL': 'int',
     'SMS_REQUEST_TIMEOUT': 'int',
     'SMS_API_KEY': 'str',
-    'FIXED_SMS_PHONE': 'str',
-    'FIXED_SMS_CODE_URL': 'str',
     'H_API_BASE': 'str',
     'H_ADMIN_AUTH_CODE': 'str',
     'H_PHONE_PREFIX': 'str',

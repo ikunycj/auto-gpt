@@ -10,6 +10,7 @@ export const statusLabels = {
   completed: '完成', cancelled: '已取消', stopped: '已停止', partial_success: '部分成功',
   authorized: '已授权', not_authorized: '未授权', retrying: '补跑中', deactivated: '已禁用',
   queued: '排队中', error: '错误', unknown: '未知', alive: '存活', dead: '失效',
+  bound: '已绑定', reserved: '已预留', invalid: '已失效',
 };
 
 export function formatStatus(value) {

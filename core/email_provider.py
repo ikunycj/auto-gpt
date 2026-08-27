@@ -14,11 +14,38 @@ EMAIL_SOURCE 支持单个或多个来源：
     ["outlook", "generic_api", "mailnest", "cloudmail"]  # 也兼容列表写法
 """
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Iterable
 
 logger = logging.getLogger(__name__)
 
 _VALID_SOURCES = ("outlook", "generic_api", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail")
+
+EMAIL_SOURCE_LABELS = {
+    "outlook": "Outlook",
+    "generic_api": "通用接码 API",
+    "cloudflare_domain": "Cloudflare 域名邮箱",
+    "cloudflare": "Cloudflare Worker",
+    "gptmail": "GPTMail",
+    "mailnest": "MailNest",
+    "cloudmail": "CloudMail",
+}
+
+_SOURCE_KINDS = {
+    "outlook": "pool",
+    "generic_api": "pool",
+    "cloudflare_domain": "generated",
+    "cloudflare": "generated",
+    "gptmail": "generated",
+    "mailnest": "generated",
+    "cloudmail": "generated",
+}
+
+_TASK_EMAIL_SOURCES: ContextVar[tuple[str, ...] | None] = ContextVar(
+    "registration_email_sources",
+    default=None,
+)
 
 
 def parse_email_sources(value=None) -> list[str]:
@@ -46,6 +73,194 @@ def parse_email_sources(value=None) -> list[str]:
     return out or ["outlook"]
 
 
+def validate_email_sources(value) -> list[str]:
+    """Validate an explicit, task-scoped source selection without fallback."""
+    if isinstance(value, str):
+        raw = value.replace(";", ",").replace("|", ",").split(",")
+    elif isinstance(value, Iterable):
+        raw = list(value)
+    else:
+        raise ValueError("邮箱渠道必须是数组或逗号分隔的文本")
+
+    normalized: list[str] = []
+    unknown: list[str] = []
+    for item in raw:
+        source = str(item or "").strip().strip('"\'')
+        if not source:
+            continue
+        if source not in _VALID_SOURCES:
+            unknown.append(source)
+            continue
+        if source not in normalized:
+            normalized.append(source)
+    if unknown:
+        raise ValueError(f"不支持的邮箱渠道：{', '.join(unknown)}")
+    if not normalized:
+        raise ValueError("请至少选择一个邮箱渠道")
+    return normalized
+
+
+@contextmanager
+def bind_email_sources(value):
+    """Bind one registration task's ordered email sources to this context."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        sources: tuple[str, ...] = ()
+    else:
+        sources = tuple(validate_email_sources(value))
+    token = _TASK_EMAIL_SOURCES.set(sources)
+    try:
+        yield list(sources)
+    finally:
+        _TASK_EMAIL_SOURCES.reset(token)
+
+
+def automatic_email_enabled() -> bool:
+    """Return whether the current task should fetch email OTP automatically."""
+    task_sources = _TASK_EMAIL_SOURCES.get()
+    if task_sources is not None:
+        return bool(task_sources)
+    try:
+        from config import email as email_config
+
+        return bool(getattr(email_config, "USE_EMAIL_SERVICE", True))
+    except Exception:
+        return True
+
+
+def _text_config(config, name: str, default: str = "") -> str:
+    return str(getattr(config, name, default) or default).strip()
+
+
+def email_source_statuses(value=None) -> list[dict]:
+    """Return safe, local readiness checks for the selected email sources.
+
+    This deliberately performs no provider network request and never returns a
+    credential value.  Dynamic providers are checked for required settings;
+    pool providers are checked for currently available SQLite rows.
+    """
+    from config import email as email_config
+    from core import db
+
+    sources = parse_email_sources(value)
+    statuses: list[dict] = []
+    for priority, source in enumerate(sources, start=1):
+        missing: list[str] = []
+        available: int | None = None
+        total: int | None = None
+        configured = True
+
+        if source == "outlook":
+            pool = db.outlook_pool_summary()
+            available = int(pool.get("available", 0) or 0)
+            total = int(pool.get("total", 0) or 0)
+            configured = total > 0
+            if available < 1:
+                missing.append("可用 Outlook 邮箱素材")
+        elif source == "generic_api":
+            pool = db.generic_api_email_pool_summary()
+            available = int(pool.get("available", 0) or 0)
+            total = int(pool.get("total", 0) or 0)
+            configured = total > 0
+            if available < 1:
+                missing.append("可用的邮箱 + HTTP 接码地址")
+        elif source == "cloudflare_domain":
+            required = (
+                ("EMAIL_DOMAIN", "转发域名"),
+                ("QQ_EMAIL", "QQ 邮箱地址"),
+                ("QQ_IMAP_PASSWORD", "QQ 邮箱 IMAP 授权码"),
+            )
+            missing.extend(label for key, label in required if not _text_config(email_config, key))
+            configured = not missing
+        elif source == "cloudflare":
+            if not _text_config(email_config, "CLOUDFLARE_API_BASE"):
+                missing.append("Cloudflare API 地址")
+            auth_mode = _text_config(email_config, "CLOUDFLARE_AUTH_MODE", "none").lower()
+            accounts_path = _text_config(email_config, "CLOUDFLARE_PATH_ACCOUNTS", "/api/new_address").lower()
+            needs_key = auth_mode in {"x-admin-auth", "bearer", "x-api-key", "query-key"} or accounts_path.rstrip("/").endswith("/admin/new_address")
+            if needs_key and not _text_config(email_config, "CLOUDFLARE_API_KEY"):
+                missing.append("Cloudflare API Key")
+            configured = not missing
+        elif source == "gptmail":
+            if not _text_config(email_config, "GPTMAIL_API_KEY"):
+                missing.append("GPTMail API Key")
+            configured = not missing
+        elif source == "mailnest":
+            if not _text_config(email_config, "MAIL_NEST_API_KEY"):
+                missing.append("MailNest API Key")
+            if not _text_config(email_config, "MAIL_NEST_PROJECT_CODE"):
+                missing.append("MailNest 项目代码")
+            configured = not missing
+        elif source == "cloudmail":
+            if not _text_config(email_config, "CLOUDMAIL_API_BASE"):
+                missing.append("CloudMail API 地址")
+            if not _text_config(email_config, "CLOUDMAIL_AUTH_TOKEN"):
+                missing.append("CloudMail Token")
+            configured = not missing
+
+        ready = not missing
+        if ready and available is not None:
+            message = f"可用 {available} 个，共 {total} 个"
+        elif ready:
+            message = "配置完整，任务启动时自动领取邮箱并收取 OTP"
+        elif source in {"outlook", "generic_api"}:
+            message = "请导入 " + "、".join(missing)
+        else:
+            message = "请填写 " + "、".join(missing)
+        statuses.append({
+            "id": source,
+            "label": EMAIL_SOURCE_LABELS[source],
+            "priority": priority,
+            "kind": _SOURCE_KINDS[source],
+            "requires_import": source in {"outlook", "generic_api"},
+            "configured": configured,
+            "ready": ready,
+            "available": available,
+            "total": total,
+            "missing": missing,
+            "message": message,
+        })
+    return statuses
+
+
+def registration_email_status(*, include_all: bool = True) -> dict:
+    """Return the complete safe runtime status consumed by the WebUI."""
+    from config import email as email_config
+    from config import register as register_config
+
+    automatic = bool(getattr(email_config, "USE_EMAIL_SERVICE", True))
+    sources = parse_email_sources(getattr(email_config, "EMAIL_SOURCE", None))
+    if include_all:
+        all_channels = email_source_statuses(_VALID_SOURCES)
+        status_by_id = {item["id"]: item for item in all_channels}
+        channels = []
+        for priority, source in enumerate(sources, start=1):
+            item = dict(status_by_id[source])
+            item["priority"] = priority
+            item["enabled"] = True
+            channels.append(item)
+        for item in all_channels:
+            item["enabled"] = item["id"] in sources
+            item["priority"] = sources.index(item["id"]) + 1 if item["enabled"] else None
+    else:
+        channels = email_source_statuses(sources)
+        for item in channels:
+            item["enabled"] = True
+        all_channels = channels
+    usable_sources = [item["id"] for item in channels if item["ready"]]
+    manual_email = _text_config(register_config, "REGISTER_EMAIL")
+    manual_configured = bool(manual_email and "@" in manual_email)
+    return {
+        "automatic": automatic,
+        "sources": sources,
+        "channels": channels,
+        "all_channels": all_channels,
+        "usable_sources": usable_sources,
+        "ready_sources": [item["id"] for item in all_channels if item["ready"]],
+        "ready": bool(usable_sources) if automatic else manual_configured,
+        "manual_configured": manual_configured,
+    }
+
+
 def _pick_from_source(source: str) -> str:
     if source == "gptmail":
         from core.gptmail_client import pick_account
@@ -69,9 +284,9 @@ def _pick_from_source(source: str) -> str:
     return pick_account().email
 
 
-def acquire_email() -> str:
+def acquire_email(value=None) -> str:
     """根据 EMAIL_SOURCE 领取一个用于注册的邮箱地址；多个来源时按顺序兜底。"""
-    sources = parse_email_sources()
+    sources = parse_email_sources(value)
     last_exc: Exception | None = None
     for source in sources:
         try:
@@ -105,6 +320,10 @@ def resolve_email_source(email: str) -> str:
         return "generic_api"
     if db.get_outlook_by_email(email):
         return "outlook"
+    registered = db.get_account_by_email(email)
+    registered_source = str((registered or {}).get("email_source") or "").strip().lower()
+    if registered_source in _VALID_SOURCES:
+        return registered_source
     if db._find_domain_email(db._load_domain_pool(), email):  # 内部轻量查询，仅本项目使用
         return "cloudflare_domain"
     # 兜底：如果域名匹配 EMAIL_DOMAIN，则按域名邮箱处理
@@ -118,25 +337,74 @@ def resolve_email_source(email: str) -> str:
     return parse_email_sources()[0]
 
 
+def snapshot_email_context(email: str, source: str | None = None) -> dict:
+    """Return the minimum provider state needed to fetch later OTP messages.
+
+    Most providers can reopen a mailbox from the email address plus global
+    configuration. Cloudflare Worker mailboxes are the exception: their JWT is
+    issued per address, so it must travel with the registered account.
+    """
+    resolved = str(source or resolve_email_source(email) or "").strip().lower()
+    if resolved == "cloudflare":
+        from core.cf_temp_mail_client import get_account_context
+
+        account = get_account_context(email)
+        if account:
+            return {
+                "jwt": str(account.jwt or ""),
+                "domain": str(account.domain or ""),
+                "created_at": float(account.created_at or 0),
+            }
+    if resolved == "mailnest":
+        from core.mailnest_client import get_account_context
+
+        account = get_account_context(email)
+        if account and account.project_code:
+            return {"project_code": str(account.project_code)}
+    if resolved == "cloudmail":
+        from core.cloudmail_client import get_account_context
+
+        account = get_account_context(email)
+        if account and account.domain:
+            return {"domain": str(account.domain)}
+    return {}
+
+
+def _restore_email_context(email: str, source: str, context: dict | None) -> None:
+    """Restore process-local state for providers with per-mailbox credentials."""
+    if source != "cloudflare" or not isinstance(context, dict):
+        return
+    jwt = str(context.get("jwt") or "").strip()
+    if not jwt:
+        return
+    from core import cf_temp_mail_client as cloudflare_mail
+
+    cloudflare_mail._CONTEXT_CACHE[cloudflare_mail._cache_key(email)] = cloudflare_mail.CFTempMailAccount(
+        email=email,
+        jwt=jwt,
+        domain=str(context.get("domain") or ""),
+        created_at=float(context.get("created_at") or 0),
+    )
+
+
 def wait_for_otp(
     email: str,
     after_ts: float,
     max_wait: int | None = None,
     poll_interval: int | None = None,
     settle_seconds: int | None = None,
+    source: str | None = None,
+    context: dict | None = None,
 ) -> str:
     """等待并返回该邮箱最新的 ChatGPT OTP（6 位数字字符串）。
 
     USE_EMAIL_SERVICE=False 时走手动验证码通道（WebUI 提交 / CLI 输入），
     不再强制要求 Outlook clientId/refreshToken。
     """
-    try:
-        from config import email as _email_cfg
-        use_service = bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True))
-    except Exception:
-        use_service = True
+    explicit_source = bool(str(source or "").strip())
+    use_service = automatic_email_enabled()
 
-    if not use_service:
+    if not use_service and not explicit_source:
         from core.manual_otp import wait_for_manual_otp
         from config import email as _email_cfg
         timeout = int(max_wait if max_wait is not None else (getattr(_email_cfg, "OTP_MAX_WAIT", 180) or 180))
@@ -156,7 +424,10 @@ def wait_for_otp(
     if settle_seconds is not None:
         extra_kwargs["settle_seconds"] = settle_seconds
 
-    source = resolve_email_source(email)
+    source = str(source or resolve_email_source(email) or "").strip().lower()
+    if source not in _VALID_SOURCES:
+        raise RuntimeError(f"未知邮箱来源，无法自动取码: {source or '空'}")
+    _restore_email_context(email, source, context)
     if source == "gptmail":
         from core.gptmail_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)

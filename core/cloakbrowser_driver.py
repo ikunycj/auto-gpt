@@ -64,6 +64,13 @@ class CloakElement:
         else:
             self.handle.click(timeout=10000)
 
+    def focus(self) -> None:
+        """Focus the element without changing its caret or text selection."""
+        if self.locator is not None:
+            self.locator.focus(timeout=10000)
+        else:
+            self.handle.focus(timeout=10000)
+
     def clear(self) -> None:
         try:
             if self.locator is not None:
@@ -88,7 +95,10 @@ class CloakElement:
         text = "".join(str(v or "") for v in values)
         lower = text.lower()
         try:
-            self.click()
+            # send_keys() must preserve the current caret/selection.  Clicking on
+            # every chunk cancels Command+A before Backspace and can relocate the
+            # caret while a controlled React input is being typed.
+            self.focus()
         except Exception:
             pass
         if "\ue03d" in text or "\ue009" in text or "command" in lower or "control" in lower:

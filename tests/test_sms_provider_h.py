@@ -73,6 +73,14 @@ class HSmsProviderTests(unittest.TestCase):
         self.assertTrue(http.calls[0]["url"].endswith("/api/admin/h/fetch-code"))
         self.assertIn('"id": "hid-1"', http.calls[0]["data"])
 
+    def test_set_status_does_not_call_grizzly_for_h(self):
+        http = _Http([])
+        with patch.object(codex_config, "SMS_PROVIDER", "h"), patch.object(codex_config, "H_API_BASE", "http://localhost:8788"), patch.object(codex_config, "H_ADMIN_AUTH_CODE", "adm"), patch.object(codex_config, "SMS_API_BASE", "https://grizzly.example/handler"):
+            result = sms_provider.set_status("hid-1", 1, http=http)
+
+        self.assertEqual(result, "OK")
+        self.assertEqual(http.calls, [])
+
     def test_cancel_uses_h_release(self):
         http = _Http([{"released": 1, "failed": []}])
         with patch.object(codex_config, "SMS_PROVIDER", "h"), patch.object(codex_config, "H_API_BASE", "http://localhost:8788"), patch.object(codex_config, "H_ADMIN_AUTH_CODE", "adm"):

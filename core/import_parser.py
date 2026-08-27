@@ -174,16 +174,16 @@ def looks_like_phone(value: object) -> bool:
 def _looks_like_password_candidate(value: object) -> bool:
     """Return whether an opaque field is plausibly a password.
 
-    This is deliberately conservative only for the URL-embedded-separator
-    ambiguity.  Query-string punctuation, URL escapes, and very short values
-    are more likely to be part of a code URL than a separate password.
+    The configured separator is an explicit field boundary. Passwords commonly
+    contain query-string punctuation such as ``&`` and ``#``, so those
+    characters must not make a trailing password look like part of the URL.
     """
     text = clean_import_value(value)
     if not text or len(text) < 6 or len(text) > 512:
         return False
     if is_email(text) or is_http_url(text) or looks_like_totp(text) or looks_like_phone(text):
         return False
-    if any(marker in text for marker in ("://", "?", "&", "#", "%")):
+    if "://" in text:
         return False
     return True
 

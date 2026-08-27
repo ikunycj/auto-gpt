@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import random
-import string
 import time
 import uuid
 from pathlib import Path
@@ -15,6 +14,7 @@ from core.account_export import save_account_data
 from core.email_provider import wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
 from core.roxybrowser_client import RoxyBrowserClient, RoxyOpenResult
+from registration.application.passwords import generate_registration_password, registration_password
 from registration.ports.stop_signal import check_stop_requested
 
 logger = logging.getLogger(__name__)
@@ -1488,29 +1488,11 @@ def _fill_birthday_or_age(driver, birthday: str, age: int) -> str | None:
 
 
 def _generate_roxy_password() -> str:
-    """参考 FlowPilot 密码策略：8~64 位，含大小写、数字、符号。"""
-    upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
-    lower = 'abcdefghjkmnpqrstuvwxyz'
-    digits = '23456789'
-    symbols = '!@#$%^&*?_-+='
-    groups = [upper, lower, digits, symbols]
-    all_chars = ''.join(groups)
-    chars = [random.choice(g) for g in groups]
-    while len(chars) < 14:
-        chars.append(random.choice(all_chars))
-    random.shuffle(chars)
-    return ''.join(chars)
+    return generate_registration_password()
 
 
 def _registration_password() -> str:
-    try:
-        from config import register as _register_cfg
-        configured = str(getattr(_register_cfg, 'REGISTER_PASSWORD', '') or '').strip()
-        if configured:
-            return configured
-    except Exception:
-        pass
-    return _generate_roxy_password()
+    return registration_password()
 
 
 def _password_page_state(driver) -> dict:
@@ -1650,7 +1632,10 @@ def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str
             continue
         passwordless = _click_passwordless_signup_if_present(driver)
         if passwordless.get('ok'):
-            logger.info("%s 检测到 password 页，已点击一次性验证码入口：email=%s detail=%s", _log_prefix(driver), email, passwordless)
+            logger.info(
+                "%s 检测到密码页，按原注册流程已切换到邮箱一次性验证码：email=%s detail=%s",
+                _log_prefix(driver), email, passwordless,
+            )
             wait_end = time.time() + 20
             while time.time() < wait_end:
                 if _is_email_verification_page(driver):
@@ -1660,7 +1645,7 @@ def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str
                     logger.info("%s 一次性验证码入口后已检测到登录态", _log_prefix(driver))
                     return None
                 time.sleep(0.5)
-            logger.info("%s 已点击一次性验证码入口，未立即检测到 OTP 页，交给后续 OTP 阶段继续处理", _log_prefix(driver))
+            logger.info("%s 已点击一次性验证码入口，交给后续 OTP 阶段继续处理", _log_prefix(driver))
             return None
         if is_login_password:
             logger.info("%s 当前是登录密码页但未找到一次性验证码入口，跳过密码填写并交给 OTP 阶段：state=%s", _log_prefix(driver), last)
@@ -1691,7 +1676,23 @@ def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str
         """) or {}
         if not result.get('ok'):
             raise RuntimeError(f"密码页处理失败：{result} state={last}")
-        _human_type_text(driver, result.get("input"), password, clear=True)
+        password_input = result.get("input")
+        _human_type_text(driver, password_input, password, clear=True)
+        actual_password = str(password_input.get_attribute("value") or "")
+        if actual_password != password:
+            logger.warning(
+                "%s 密码写入值不一致，使用 React 原生 setter 修正：expected_length=%s actual_length=%s",
+                _log_prefix(driver),
+                len(password),
+                len(actual_password),
+            )
+            _set_element_value(driver, password_input, password)
+            actual_password = str(password_input.get_attribute("value") or "")
+        if actual_password != password:
+            raise RuntimeError(
+                f"密码写入校验失败，已停止提交: "
+                f"expected_length={len(password)} actual_length={len(actual_password)}"
+            )
         human_delay("form", minimum=0.4, maximum=1.4)
         _human_click(driver, result.get("button"), label="password_submit")
         logger.info("%s 已填写并提交密码页", _log_prefix(driver))
@@ -1704,10 +1705,15 @@ def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str
             if _has_access_token(driver):
                 logger.info("%s 密码提交后已检测到登录态", _log_prefix(driver))
                 return password
-            if not _is_signup_password_page(driver):
+            page_state = _page_snapshot(driver)
+            if _is_profile_like(page_state):
+                logger.info("%s 密码提交后已进入资料页", _log_prefix(driver))
                 return password
             time.sleep(0.5)
-        return password
+        raise RuntimeError(
+            f"密码已提交，但页面未进入验证码页、资料页或登录态，不能确认密码已设置: "
+            f"state={_password_page_state(driver)}"
+        )
     logger.info("%s 未检测到密码页，继续后续流程 last=%s", _log_prefix(driver), last)
     return None
 
@@ -2007,12 +2013,23 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
 
         # 新版注册流可能先进入 /create-account/password；参考 FlowPilot 的 fill-password 步骤，
         # 先设置密码并提交，然后再等待邮箱验证码页。
-        openai_password = None if next_state == "otp" else _fill_password_page_if_present(driver, email, timeout=25)
+        if next_state == "logged_in":
+            openai_password = None
+            create_acknowledged = True
+            needs_email_otp = False
+        elif next_state == "password":
+            openai_password = _fill_password_page_if_present(driver, email, timeout=25)
+            if openai_password or _has_access_token(driver):
+                create_acknowledged = True
+            needs_email_otp = _is_email_verification_page(driver)
+        else:
+            openai_password = None
+            needs_email_otp = True
         _check_manual_stop()
 
         current_otp = otp_code
         max_otp_attempts = 3
-        for otp_attempt in range(1, max_otp_attempts + 1):
+        for otp_attempt in (range(1, max_otp_attempts + 1) if needs_email_otp else ()):
             if current_otp is None:
                 logger.info("[Roxy注册][OTP] 等待验证码：%s（第 %s/%s 次）", email, otp_attempt, max_otp_attempts)
                 try:
@@ -2046,6 +2063,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
 
             outcome = _wait_after_email_otp_submit(driver, timeout=10)
             if outcome == 'accepted':
+                create_acknowledged = True
                 break
             if otp_attempt >= max_otp_attempts:
                 raise RuntimeError("邮箱验证码连续错误/过期，已达到最大重试次数")
@@ -2068,6 +2086,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         _check_manual_stop()
         session_info = _fetch_chatgpt_session(driver, timeout=120)
         access_token = session_info["accessToken"]
+        create_acknowledged = True
         logger.info("[Roxy注册] 已拿到 accessToken：%s", email)
         _check_manual_stop()
 
@@ -2075,57 +2094,56 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
             logger.warning("[Roxy注册] 当前 Roxy 自动化路径暂不执行 2FA 设置，已跳过")
         totp_secret = None
 
+        email_source = resolve_email_source(email)
         codex_result = {
-            "status": "skipped",
-            "ok": True,
-            "message": "ENABLE_CODEX_AUTO=False，跳过 Codex",
+            "status": "not_authorized",
+            "ok": False,
+            "message": "GPT 注册完成，等待在 GPT账号 页面手动发起 Codex 授权",
         }
-        try:
-            from config import codex as _codex_cfg
-            if bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False)):
-                # 注册流程本身已创建 Roxy 一号一环境。这里不能再新建第二个 Roxy 环境；
-                # 复用当前注册窗口，先清理 Cookie/session/localStorage/cache，再开始 Codex 授权。
-                from core.roxy_codex_oauth import run_roxy_codex_oauth
-                logger.info("[Roxy注册][Codex] ENABLE_CODEX_AUTO=True，复用当前注册 Roxy 窗口执行 Codex 授权，不创建新环境")
-                _check_manual_stop()
-                codex_result = run_roxy_codex_oauth(
-                    email,
-                    reuse_existing_profile=True,
-                    existing_driver=driver,
-                    existing_opened=opened,
-                    force=True,
-                    clear_existing_state=True,
-                )
-            else:
-                logger.info("[Roxy注册][Codex] ENABLE_CODEX_AUTO=False，注册后跳过 Codex OAuth")
-        except Exception as exc:
-            codex_result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {str(exc)[:180]}"}
+        account_extra = {
+            "user": session_info.get("user"),
+            "account": session_info.get("account"),
+            "expires": session_info.get("expires"),
+            "roxybrowser": {"profile_id": opened.profile_id, "open_result": opened.raw},
+            "registration_password": openai_password,
+            "login_method": "password" if openai_password else "email_otp",
+            "codex": codex_result,
+        }
+        account_id = save_account_data(
+            email=email,
+            access_token=access_token,
+            totp_secret=totp_secret,
+            email_source=email_source,
+            proxy_used=proxy or None,
+            batch_dir=batch_dir,
+            extra=account_extra,
+            archive=False,
+            enqueue_plan=True,
+        )
+        if openai_password:
+            logger.info("[Roxy注册][检查点] 账号及登录密码已即时写入：%s，账号ID=%s", email, account_id)
+        else:
+            logger.info("[Roxy注册][检查点] 账号已即时写入（OTP 登录，未经过密码创建页）：%s，账号ID=%s", email, account_id)
 
         account_id = save_account_data(
             email=email,
             access_token=access_token,
             totp_secret=totp_secret,
-            email_source=resolve_email_source(email),
+            email_source=email_source,
             proxy_used=proxy or None,
             batch_dir=batch_dir,
-            extra={
-                "user": session_info.get("user"),
-                "account": session_info.get("account"),
-                "expires": session_info.get("expires"),
-                "roxybrowser": {"profile_id": opened.profile_id, "open_result": opened.raw},
-                "registration_password": openai_password,
-                "codex": codex_result,
-            },
+            extra=account_extra,
+            archive=True,
+            enqueue_plan=False,
         )
-        codex_ok = codex_result.get("ok") or codex_result.get("status") == "skipped"
         return {
-            "success": bool(codex_ok),
+            "success": True,
             "email": email,
             "account_id": account_id,
             "access_token": access_token,
             "totp_secret": totp_secret,
             "codex": codex_result,
-            "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}",
+            "error": None,
         }
     except Exception as exc:
         logger.error("[Roxy注册] 失败：%s: %s", type(exc).__name__, exc)

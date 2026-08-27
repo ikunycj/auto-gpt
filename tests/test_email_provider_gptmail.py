@@ -52,6 +52,17 @@ class GPTMailProviderTests(unittest.TestCase):
             self.assertEqual(email_provider.wait_for_otp("fresh@mailnest.test", after_ts=123.0), "112233")
         fetch_latest_otp.assert_called_once_with("fresh@mailnest.test", after_ts=123.0)
 
+    @patch("core.mailnest_client.fetch_latest_otp", return_value="445566")
+    def test_explicit_mailnest_source_works_when_global_mode_is_manual(self, fetch_latest_otp):
+        with patch.object(email_config, "USE_EMAIL_SERVICE", False):
+            code = email_provider.wait_for_otp(
+                "saved@mailnest.test",
+                after_ts=456.0,
+                source="mailnest",
+            )
+        self.assertEqual(code, "445566")
+        fetch_latest_otp.assert_called_once_with("saved@mailnest.test", after_ts=456.0)
+
     @patch("core.cloudmail_client.pick_account")
     def test_acquire_email_uses_cloudmail_client(self, pick_account):
         pick_account.return_value.email = "fresh@cloudmail.test"

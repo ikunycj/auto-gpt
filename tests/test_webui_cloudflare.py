@@ -57,6 +57,20 @@ class CloudflareWebUiTests(unittest.TestCase):
         outlook_pool_summary.assert_not_called()
         submit_registration.assert_called_once_with(count=1, workers=1)
 
+    @patch("apps.web.app.svc.submit_registration")
+    def test_jobs_rejects_incomplete_cloudflare_domain_channel(self, submit_registration):
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
+            email_config, "EMAIL_SOURCE", "cloudflare_domain"
+        ), patch.object(email_config, "EMAIL_DOMAIN", "mail.example.com"), patch.object(
+            email_config, "QQ_EMAIL", ""
+        ), patch.object(email_config, "QQ_IMAP_PASSWORD", ""):
+            response = self.client.post("/api/jobs", json={"count": 1, "workers": 1})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("QQ 邮箱地址", response.get_json()["error"])
+        self.assertIn("QQ 邮箱 IMAP 授权码", response.get_json()["error"])
+        submit_registration.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

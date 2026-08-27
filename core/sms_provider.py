@@ -7,8 +7,9 @@
     2. wait_for_sms_code()    轮询 getStatus 直到拿到短信验证码
     3. complete() / cancel()  setStatus 标记完成(6) / 取消(8)
 
-Relay 任务可以通过 fixed_sms_context(acquire_provider=...) 延迟取号：只有页面
-实际要求手机验证时才消耗号码；失败/过期由上层号码池记录为失效。
+Relay 任务通过 fixed_sms_context(acquire_provider=...) 使用已预留的手机号池
+资源：只有页面实际要求手机验证且验证成功时才消耗次数；失败/过期由上层
+号码池记录为失效。全局固定号码配置不参与任务取号。
 
 当前支持：
     - GrizzlySMS：GET 文本接口，文档 https://api.grizzlysms.com
@@ -47,6 +48,7 @@ _MIN_CANCEL_DELAY = 125
 # 用模块级 dict 而不是改 acquire_number 返回值，保持向后兼容。
 _ACQUIRED_AT: dict[str, float] = {}
 _FIXED_SMS_OVERRIDE: ContextVar[dict | None] = ContextVar("fixed_sms_override", default=None)
+_SMS_PROVIDER_OVERRIDE: ContextVar[str] = ContextVar("sms_provider_override", default="")
 
 
 class SmsProviderError(RuntimeError):
@@ -72,8 +74,18 @@ def _http() -> CurlSession:
 
 
 def _provider() -> str:
-    if _FIXED_SMS_OVERRIDE.get():
+    override = _FIXED_SMS_OVERRIDE.get()
+    if override:
+        # Relay jobs normally bind a hand-imported phone-pool URL and therefore
+        # use the fixed_url adapter. A platform-backed pool row explicitly
+        # supplies the real provider so its API can acquire and poll numbers.
+        provider = str(override.get("provider") or "").strip().lower()
+        if provider:
+            return provider
         return "fixed_url"
+    provider_override = _SMS_PROVIDER_OVERRIDE.get()
+    if provider_override:
+        return provider_override
     return str(getattr(_cfg, "SMS_PROVIDER", "grizzly") or "grizzly").strip().lower()
 
 
@@ -92,13 +104,15 @@ def _fixed_sms_code(text: str) -> str:
 
 
 def _fixed_sms_config() -> tuple[str, str]:
-    override = _FIXED_SMS_OVERRIDE.get() or {}
-    phone = "".join(ch for ch in str(override.get("phone") or getattr(_cfg, "FIXED_SMS_PHONE", "") or "") if ch.isdigit())
-    url = str(override.get("code_url") or getattr(_cfg, "FIXED_SMS_CODE_URL", "") or "").strip()
+    override = _FIXED_SMS_OVERRIDE.get()
+    if not override:
+        raise SmsProviderError("固定号码配置已停用，请从 GPT账号 发起授权并使用手机号池")
+    phone = "".join(ch for ch in str(override.get("phone") or "") if ch.isdigit())
+    url = str(override.get("code_url") or "").strip()
     if not phone:
-        raise SmsProviderError("FIXED_SMS_PHONE 不能为空")
+        raise SmsProviderError("手机号池任务未提供手机号")
     if not url.startswith(("http://", "https://")):
-        raise SmsProviderError("FIXED_SMS_CODE_URL 必须是 http(s) URL")
+        raise SmsProviderError("手机号池取码地址必须是 http(s) URL")
     return phone, url
 
 
@@ -106,20 +120,21 @@ def _fixed_sms_config() -> tuple[str, str]:
 def fixed_sms_context(
     phone: str = "",
     code_url: str = "",
+    provider: str = "",
     code_provider=None,
     acquire_provider=None,
     failure_provider=None,
     success_provider=None,
 ):
-    """Bind per-job SMS material without mutating process-wide config.
+    """Bind phone-pool material to one job without mutating global config.
 
-    ``acquire_provider`` is intentionally lazy: relay jobs can start without
-    reserving a phone and only choose one if OpenAI actually shows the phone
-    verification page.
+    ``acquire_provider`` resolves the slot already reserved when the relay batch
+    started. The pool use count is only consumed by the success hook.
     """
     token = _FIXED_SMS_OVERRIDE.set({
         "phone": str(phone or "").strip(),
         "code_url": str(code_url or "").strip(),
+        "provider": str(provider or "").strip().lower(),
         "code_provider": code_provider,
         "acquire_provider": acquire_provider,
         "failure_provider": failure_provider,
@@ -127,10 +142,26 @@ def fixed_sms_context(
     })
     try:
         if not callable(acquire_provider):
-            _fixed_sms_config()
+            if not str(provider or "").strip():
+                _fixed_sms_config()
         yield
     finally:
         _FIXED_SMS_OVERRIDE.reset(token)
+
+
+@contextmanager
+def direct_provider_context(provider: str):
+    """Temporarily call one real platform from inside a Relay task context."""
+    normalized = str(provider or "").strip().lower()
+    if normalized not in {"grizzly", "l", "h"}:
+        raise SmsProviderError(f"不支持的接码平台：{normalized or '未选择'}")
+    fixed_token = _FIXED_SMS_OVERRIDE.set(None)
+    provider_token = _SMS_PROVIDER_OVERRIDE.set(normalized)
+    try:
+        yield
+    finally:
+        _SMS_PROVIDER_OVERRIDE.reset(provider_token)
+        _FIXED_SMS_OVERRIDE.reset(fixed_token)
 
 
 def _request_grizzly(http: CurlSession, params: dict) -> str:
@@ -389,6 +420,23 @@ def acquire_number(
     own_http = http is None
     http = http or _http()
     try:
+        override = _FIXED_SMS_OVERRIDE.get()
+        if override and str(override.get("provider") or "").strip().lower() not in {"", "fixed_url"}:
+            acquire_provider = override.get("acquire_provider")
+            if not callable(acquire_provider):
+                raise SmsProviderError("动态接码平台任务未提供取号回调")
+            material = acquire_provider() or {}
+            if not isinstance(material, dict):
+                raise SmsProviderError("动态接码平台取号回调返回格式错误")
+            activation_id = str(material.get("activation_id") or "").strip()
+            phone = "".join(ch for ch in str(material.get("phone") or "") if ch.isdigit())
+            if not activation_id or not phone:
+                raise SmsProviderError("动态接码平台未返回有效激活 ID 或手机号")
+            override["activation_id"] = activation_id
+            override["phone"] = phone
+            override["code_url"] = str(material.get("code_url") or "").strip()
+            _ACQUIRED_AT[activation_id] = time.time()
+            return activation_id, phone
         if _provider() == "fixed_url":
             override = _FIXED_SMS_OVERRIDE.get() or {}
             acquire_provider = override.get("acquire_provider")
@@ -409,7 +457,7 @@ def acquire_number(
             if not phone or not code_url.startswith(("http://", "https://")):
                 raise SmsProviderError("延迟取号提供器未返回有效手机号或短信 URL")
             _ACQUIRED_AT[activation_id] = time.time()
-            logger.info("[SMS:fixed_url] 使用固定号码：+%s", phone)
+            logger.info("[SMS:phone_pool] 使用手机号池号码：+%s", phone)
             return activation_id, phone
 
         if _provider() == "l":
@@ -523,6 +571,12 @@ def wait_for_sms_code(
     interval = poll_interval or _cfg.SMS_POLL_INTERVAL
     try:
         provider = _provider()
+        if provider not in {"fixed_url", "grizzly", "l", "h"}:
+            raise SmsProviderError(f"不支持的接码平台：{provider}")
+        override = _FIXED_SMS_OVERRIDE.get()
+        if override and provider != "fixed_url":
+            with direct_provider_context(provider):
+                return wait_for_sms_code(activation_id, http=http, max_wait=max_wait, poll_interval=poll_interval)
         total_wait = max_wait or _cfg.SMS_CODE_WAIT
         logger.info(f"[SMS] 等待短信验证码 activation_id={activation_id}，最长 {total_wait}s...")
         round_no = 0
@@ -541,18 +595,18 @@ def wait_for_sms_code(
                 if callable(code_provider):
                     code = str(code_provider() or "").strip()
                     if not code:
-                        raise SmsCodeTimeout("固定短信验证码为空")
+                        raise SmsCodeTimeout("手机号池短信验证码为空")
                     return code
                 _phone, code_url = _fixed_sms_config()
                 response = http.get(code_url)
                 if response.status_code != 200:
-                    raise SmsProviderError(f"固定短信 URL HTTP {response.status_code}")
+                    raise SmsProviderError(f"手机号池取码 URL HTTP {response.status_code}")
                 code = _fixed_sms_code(response.text)
                 if code:
-                    logger.info("[SMS:fixed_url] 第 %s 轮收到验证码", round_no)
+                    logger.info("[SMS:phone_pool] 第 %s 轮收到验证码", round_no)
                     return code
                 remaining = max(0, int(deadline - time.time()))
-                logger.info("[SMS:fixed_url] 第 %s 轮未收到验证码，%ss 后重试（剩余 %ss）", round_no, interval, remaining)
+                logger.info("[SMS:phone_pool] 第 %s 轮未收到验证码，%ss 后重试（剩余 %ss）", round_no, interval, remaining)
                 time.sleep(interval)
                 continue
 
@@ -622,11 +676,20 @@ def set_status(activation_id: str, status: int, http: CurlSession | None = None)
     own_http = http is None
     http = http or _http()
     try:
+        override = _FIXED_SMS_OVERRIDE.get()
+        if override and str(override.get("provider") or "").strip().lower() not in {"", "fixed_url"}:
+            with direct_provider_context(str(override.get("provider") or "")):
+                return set_status(activation_id, status, http=http)
         if _provider() == "fixed_url":
-            logger.debug("[SMS:fixed_url] 忽略状态设置 id=%s, status=%s", activation_id, status)
+            logger.debug("[SMS:phone_pool] 忽略外部平台状态设置 id=%s, status=%s", activation_id, status)
             return "OK"
         if _provider() == "l":
             logger.debug(f"[SMS:L] 忽略状态设置 id={activation_id}, status={status}")
+            return "OK"
+        if _provider() == "h":
+            # H 的管理接口不需要 Grizzly 风格的 setStatus 调用；短信状态
+            # 由 take/fetch/release 生命周期维护，避免把请求误发到 Grizzly。
+            logger.debug(f"[SMS:H] 忽略状态设置 id={activation_id}, status={status}")
             return "OK"
         return _request_grizzly(http, {"action": "setStatus", "status": str(status), "id": activation_id})
     finally:
@@ -636,14 +699,18 @@ def set_status(activation_id: str, status: int, http: CurlSession | None = None)
 
 def complete(activation_id: str, http: CurlSession | None = None) -> None:
     """标记激活完成（status=6）。失败只告警不抛，避免影响主流程。"""
+    override = _FIXED_SMS_OVERRIDE.get()
+    if override and str(override.get("provider") or "").strip().lower() not in {"", "fixed_url"}:
+        with direct_provider_context(str(override.get("provider") or "")):
+            return complete(activation_id, http=http)
     if _provider() == "fixed_url":
-        logger.info("[SMS:fixed_url] 已完成 id=%s", activation_id)
+        logger.info("[SMS:phone_pool] 已完成 id=%s", activation_id)
         success_provider = (_FIXED_SMS_OVERRIDE.get() or {}).get("success_provider")
         if callable(success_provider):
             try:
                 success_provider()
             except Exception as exc:
-                logger.warning("[SMS:fixed_url] 记录号码成功使用失败：%s", exc)
+                logger.warning("[SMS:phone_pool] 记录号码成功使用失败：%s", exc)
         _ACQUIRED_AT.pop(activation_id, None)
         return
     if _provider() == "l":
@@ -663,7 +730,7 @@ def complete(activation_id: str, http: CurlSession | None = None) -> None:
         logger.warning(f"[SMS] 标记完成失败（不影响结果）：{exc}")
 
 
-def _do_cancel_sync(activation_id: str, http_factory) -> None:
+def _do_cancel_sync(activation_id: str, http_factory, provider: str = "") -> None:
     """实际的同步取消逻辑：等够 2 分钟限制 → 发请求 → 失败重试一次。"""
     acquired_at = _ACQUIRED_AT.get(activation_id)
     if acquired_at is not None:
@@ -681,7 +748,11 @@ def _do_cancel_sync(activation_id: str, http_factory) -> None:
     try:
         for attempt in range(1, 3):
             try:
-                set_status(activation_id, 8, http=http)
+                if provider:
+                    with direct_provider_context(provider):
+                        set_status(activation_id, 8, http=http)
+                else:
+                    set_status(activation_id, 8, http=http)
                 logger.info(f"[SMS] 已取消 activation_id={activation_id}")
                 _ACQUIRED_AT.pop(activation_id, None)
                 return
@@ -712,14 +783,18 @@ def cancel(activation_id: str, http: CurlSession | None = None, background: bool
 
     失败只告警不抛，不影响主流程。
     """
+    override = _FIXED_SMS_OVERRIDE.get()
+    if override and str(override.get("provider") or "").strip().lower() not in {"", "fixed_url"}:
+        with direct_provider_context(str(override.get("provider") or "")):
+            return cancel(activation_id, http=http, background=background)
     if _provider() == "fixed_url":
-        logger.info("[SMS:fixed_url] 固定号码无需释放 id=%s", activation_id)
+        logger.info("[SMS:phone_pool] 号码无需调用外部释放接口 id=%s", activation_id)
         failure_provider = (_FIXED_SMS_OVERRIDE.get() or {}).get("failure_provider")
         if callable(failure_provider):
             try:
                 failure_provider(activation_id)
             except Exception as exc:
-                logger.warning("[SMS:fixed_url] 记录号码失败状态失败：%s", exc)
+                logger.warning("[SMS:phone_pool] 记录号码失败状态失败：%s", exc)
         _ACQUIRED_AT.pop(activation_id, None)
         return
     if _provider() == "l":
@@ -738,12 +813,12 @@ def cancel(activation_id: str, http: CurlSession | None = None, background: bool
         return
 
     if not background:
-        _do_cancel_sync(activation_id, _http)
+        _do_cancel_sync(activation_id, _http, _provider())
         return
 
     t = threading.Thread(
         target=_do_cancel_sync,
-        args=(activation_id, _http),
+        args=(activation_id, _http, _provider()),
         name=f"sms-cancel-{activation_id}",
         daemon=True,
     )

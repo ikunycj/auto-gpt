@@ -25,32 +25,27 @@ class _Http:
 
 
 class FixedUrlSmsProviderTests(unittest.TestCase):
-    def test_config_is_registered_as_secret_webui_fields(self):
-        self.assertIn("FIXED_SMS_CODE_URL", env_loader.SECRET_ENV_KEYS)
+    def test_legacy_fixed_config_is_redacted_but_not_exposed_in_webui(self):
+        self.assertNotIn("FIXED_SMS_PHONE", env_loader.SECRET_ENV_KEYS)
+        self.assertNotIn("FIXED_SMS_CODE_URL", env_loader.SECRET_ENV_KEYS)
         fields = {field["key"]: field for field in config_editor.EDITABLE_FIELDS}
-        self.assertTrue(fields["FIXED_SMS_PHONE"].get("secret"))
-        self.assertTrue(fields["FIXED_SMS_CODE_URL"].get("secret"))
+        self.assertNotIn("FIXED_SMS_PHONE", fields)
+        self.assertNotIn("FIXED_SMS_CODE_URL", fields)
 
-    def test_acquire_and_poll_fixed_url(self):
-        http = _Http([_Response("OpenAI 验证码：123456")])
+    def test_global_fixed_url_config_is_rejected_even_when_legacy_values_exist(self):
+        http = _Http([])
         with patch.object(codex_config, "SMS_PROVIDER", "fixed_url"), \
-             patch.object(codex_config, "FIXED_SMS_PHONE", "+14155550123"), \
-             patch.object(codex_config, "FIXED_SMS_CODE_URL", "https://sms.example/code"):
-            activation_id, phone = sms_provider.acquire_number(http=http)
-            self.assertEqual(sms_provider.set_status(activation_id, 1, http=http), "OK")
-            code = sms_provider.wait_for_sms_code(activation_id, http=http, max_wait=1, poll_interval=0)
-            sms_provider.complete(activation_id, http=http)
+             patch.object(codex_config, "FIXED_SMS_PHONE", "+14155550123", create=True), \
+             patch.object(codex_config, "FIXED_SMS_CODE_URL", "https://sms.example/code", create=True):
+            with self.assertRaisesRegex(sms_provider.SmsProviderError, "手机号池"):
+                sms_provider.acquire_number(http=http)
 
-        self.assertTrue(activation_id.startswith("fixed-"))
-        self.assertEqual(phone, "14155550123")
-        self.assertEqual(code, "123456")
-        self.assertEqual(http.calls, ["https://sms.example/code"])
+        self.assertEqual(http.calls, [])
 
-    def test_fixed_url_requires_http_url(self):
+    def test_phone_pool_context_requires_http_url(self):
         with patch.object(codex_config, "SMS_PROVIDER", "fixed_url"), \
-             patch.object(codex_config, "FIXED_SMS_PHONE", "+14155550123"), \
-             patch.object(codex_config, "FIXED_SMS_CODE_URL", "not-a-url"):
-            with self.assertRaisesRegex(sms_provider.SmsProviderError, "http"):
+             self.assertRaisesRegex(sms_provider.SmsProviderError, "http"):
+            with sms_provider.fixed_sms_context(phone="+14155550123", code_url="not-a-url"):
                 sms_provider.acquire_number(http=_Http([]))
 
     def test_fixed_url_can_acquire_material_lazily(self):

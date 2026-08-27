@@ -30,7 +30,9 @@ def test_registration_request_is_driver_neutral(tmp_path: Path):
 
 def test_driver_aliases_and_plugin_registration():
     assert normalize_driver_name("browser-use") == "browser_use"
+    assert normalize_driver_name("system_chrome") == "chrome_cdp"
     assert get_driver("api").name == "protocol"
+    assert get_driver("chrome").name == "chrome_cdp"
 
     class StubDriver:
         name = "stub"
@@ -60,7 +62,8 @@ def test_registry_import_does_not_load_optional_browser_implementations():
         "mods = ('registration.drivers.roxy.implementation', "
         "'registration.drivers.cloak.implementation', "
         "'registration.drivers.browser_use.implementation', "
-        "'registration.drivers.skyvern.implementation')\n"
+        "'registration.drivers.skyvern.implementation', "
+        "'registration.drivers.chrome_cdp.implementation')\n"
         "assert not any(name in sys.modules for name in mods)\n"
     )
     result = subprocess.run(
@@ -71,4 +74,3 @@ def test_registry_import_does_not_load_optional_browser_implementations():
         text=True,
     )
     assert result.returncode == 0, result.stderr
-

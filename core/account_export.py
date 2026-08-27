@@ -341,9 +341,7 @@ def _activate_totp(
 def setup_2fa(session: BrowserSession, email: str, otp_code: str | None = None, otp_provider=None) -> str:
     """
     完整的 2FA 设置流程。
-    会触发再发一份邮箱验证码：
-        - USE_EMAIL_SERVICE=True 时自动从 Outlook 账号池拉取
-        - 否则需要用户手动输入
+    会触发一份新的邮箱验证码，并复用当前注册任务的自动或手动收码策略。
 
     Args:
         session: 已完成注册的会话
@@ -353,9 +351,6 @@ def setup_2fa(session: BrowserSession, email: str, otp_code: str | None = None, 
     Returns:
         TOTP secret（Base32 字符串），可直接用于 pyotp.TOTP() 生成 6 位动态码
     """
-    # 用模块属性读，支持 WebUI 热加载
-    from config import email as _email_cfg
-
     logger.info("=" * 60)
     logger.info("开始设置 2FA")
     logger.info("=" * 60)
@@ -368,17 +363,12 @@ def setup_2fa(session: BrowserSession, email: str, otp_code: str | None = None, 
     human_delay("navigate")
 
     if otp_code is None:
-        if callable(otp_provider):
-            logger.info("[2FA] 使用当前任务邮箱取码提供器等待重认证 OTP...")
-            otp_code = otp_provider(email, after_ts=reauth_otp_after_ts)
-        elif _email_cfg.USE_EMAIL_SERVICE:
+        if not callable(otp_provider):
             from core.email_provider import wait_for_otp
-            logger.info("[2FA] 自动等待邮箱重认证 OTP...")
-            otp_code = wait_for_otp(email, after_ts=reauth_otp_after_ts)
-        else:
-            logger.info("")
-            logger.info("[2FA] 请检查邮箱，输入新收到的 6 位验证码")
-            otp_code = input(">>> 2FA 验证码: ").strip()
+
+            otp_provider = wait_for_otp
+        logger.info("[2FA] 使用当前任务邮箱取码策略等待重认证 OTP...")
+        otp_code = otp_provider(email, after_ts=reauth_otp_after_ts)
 
     human_delay("otp_input")
     continue_url = _validate_reauth_otp(session, otp_code)
@@ -406,13 +396,33 @@ def save_account_data(
     email_source: str | None = None,
     proxy_used: str | None = None,
     batch_dir: Path | None = None,
+    archive: bool = True,
+    enqueue_plan: bool = True,
 ) -> int:
     """
     将账号信息保存到 SQLite，并把本次批次归档写入 SQLite 文件集合。
     返回新插入/更新的 row id。
     """
     from core.db import insert_account
-    extra = extra or {}
+    extra = dict(extra or {})
+    source = str(email_source or "").strip()
+    if source:
+        extra.setdefault("email_provider", source)
+    password = str(
+        extra.get("registration_password")
+        or extra.get("openai_password")
+        or ""
+    ).strip()
+    extra.setdefault("login_method", "password" if password else "email_otp")
+    if source and not extra.get("email_provider_context"):
+        try:
+            from core.email_provider import snapshot_email_context
+
+            provider_context = snapshot_email_context(email, source=source)
+            if provider_context:
+                extra["email_provider_context"] = provider_context
+        except Exception as exc:
+            logger.debug("[Save] 邮箱渠道上下文快照失败（不影响账号保存）: %s", exc)
     user = extra.get("user") or {}
     account = extra.get("account") or {}
     # 从 extra.codex 抽出顶层 codex 状态/错误，方便 WebUI 直接读账号字段
@@ -437,35 +447,37 @@ def save_account_data(
         codex_status=codex_status,
         codex_error=codex_error,
     )
-    batch_folder = _append_batch_archive(
-        row_id=row_id,
-        email=email,
-        access_token=access_token,
-        totp_secret=totp_secret,
-        email_source=email_source,
-        proxy_used=proxy_used,
-        extra=extra,
-        batch_dir=batch_dir,
-    )
     logger.info(f"[Save] 账号已写入 DB, id={row_id}, email={email}")
-    logger.info(f"[Save] 批次归档目录: {batch_folder}")
+    if archive:
+        batch_folder = _append_batch_archive(
+            row_id=row_id,
+            email=email,
+            access_token=access_token,
+            totp_secret=totp_secret,
+            email_source=email_source,
+            proxy_used=proxy_used,
+            extra=extra,
+            batch_dir=batch_dir,
+        )
+        logger.info(f"[Save] 批次归档目录: {batch_folder}")
     # session 中的 account.planType 不能说明 Plus 试用资格。账号落库后只负责
     # 入队，由专用线程池异步查询并回写，避免占用注册工作线程。
     try:
-        from core.plan_check_service import enqueue_account_plan_check
+        if enqueue_plan:
+            from core.plan_check_service import enqueue_account_plan_check
 
-        queued = enqueue_account_plan_check(
-            account_id=row_id,
-            email=email,
-            access_token=access_token,
-            trigger="registration_auto",
-        )
-        if queued.get("accepted"):
-            logger.info(f"[Plan] 注册后自动查询已入队: id={row_id}, email={email}")
-        elif queued.get("busy"):
-            logger.info(f"[Plan] 账号已有套餐查询，注册流程不重复入队: id={row_id}, email={email}")
-        else:
-            logger.warning(f"[Plan] 注册后自动查询入队失败（不影响注册结果）: {email}, {queued.get('error')}")
+            queued = enqueue_account_plan_check(
+                account_id=row_id,
+                email=email,
+                access_token=access_token,
+                trigger="registration_auto",
+            )
+            if queued.get("accepted"):
+                logger.info(f"[Plan] 注册后自动查询已入队: id={row_id}, email={email}")
+            elif queued.get("busy"):
+                logger.info(f"[Plan] 账号已有套餐查询，注册流程不重复入队: id={row_id}, email={email}")
+            else:
+                logger.warning(f"[Plan] 注册后自动查询入队失败（不影响注册结果）: {email}, {queued.get('error')}")
     except Exception as exc:
         logger.warning(
             f"[Plan] 注册后自动查询入队异常（不影响注册结果）: "

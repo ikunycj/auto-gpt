@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from core import db, sqlite_store
+from core.account_login_material import registered_account_login_material
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +221,22 @@ def run_worker(
         logger.info("[Codex 补跑] 开始：%s", email)
         logger.info("[Codex 补跑] 阶段说明：获取授权地址 → 登录邮箱 → 邮箱 OTP → 手机验证 → 捕获 callback → 提交/保存凭证")
         check_stop_requested(email)
-        result = run_codex_oauth(email, force=True)
+        account = db.get_account_by_email(email) or {}
+        login_material = registered_account_login_material(account)
+        login_password = login_material.get("chatgpt_password") or None
+        totp_secret = login_material.get("totp_secret") or ""
+        totp_provider = None
+        if totp_secret:
+            import pyotp
+
+            totp_provider = lambda: pyotp.TOTP(totp_secret).now()
+        result = run_codex_oauth(
+            email,
+            force=True,
+            login_password=login_password,
+            totp_provider=totp_provider,
+            require_browser=bool(login_password),
+        )
         check_stop_requested(email)
         logger.info(
             "[Codex 补跑] 结果：status=%s ok=%s file=%s callback=%s",

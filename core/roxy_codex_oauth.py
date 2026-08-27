@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import inspect
 import random
+import re
 import time
 from contextvars import ContextVar
 from urllib.parse import urlparse
@@ -179,7 +180,10 @@ def _is_callback_url(url: str) -> bool:
 def _safe_diagnostic_url(url: str) -> str:
     """Keep only non-secret URL location data in timeout errors."""
     try:
-        parsed = urlparse(str(url or ""))
+        raw = str(url or "")
+        if raw.lower().startswith("chrome-error://"):
+            return "chrome-error://chromewebdata/"
+        parsed = urlparse(raw)
         host = (parsed.hostname or "").lower()
         if host not in {"localhost", "127.0.0.1"} and not host.endswith(".openai.com"):
             return "[URL已隐藏]"
@@ -190,6 +194,115 @@ def _safe_diagnostic_url(url: str) -> str:
         return safe + ("?[参数已隐藏]" if parsed.query or parsed.fragment else "")
     except Exception:
         return "[URL已隐藏]"
+
+
+_DIAGNOSTIC_EMAIL_RE = re.compile(r"(?i)\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
+_DIAGNOSTIC_SECRET_RE = re.compile(
+    r"(?i)\b(password|passwd|token|secret|authorization|cookie|otp|code)\s*[:=]\s*[^\s,;]+"
+)
+_DIAGNOSTIC_LONG_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{40,}\b")
+
+
+def _redact_diagnostic_text(value: object, limit: int = 260) -> str:
+    """Normalize a short page fragment without logging credentials or OTPs."""
+    text = " ".join(str(value or "").split())
+    if not text:
+        return "-"
+    text = _DIAGNOSTIC_EMAIL_RE.sub("[邮箱]", text)
+    text = _DIAGNOSTIC_SECRET_RE.sub(lambda match: f"{match.group(1)}=[已隐藏]", text)
+    text = _DIAGNOSTIC_LONG_TOKEN_RE.sub("[长令牌已隐藏]", text)
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _classify_browser_page(url: str, title: str, text: str) -> str:
+    """Give operators a compact, human-readable description of the page."""
+    lower_url = str(url or "").lower()
+    lower_text = str(text or "").lower()
+    combined = f"{lower_url} {str(title or '').lower()} {lower_text}"
+    if "chrome-error://" in lower_url:
+        return "Chrome错误页"
+    if detect_account_unusable_text(combined):
+        return "账号停用提示页"
+    if (
+        "challenge-platform" in lower_url
+        or "challenges.cloudflare.com" in lower_url
+        or "just a moment" in combined
+        or "verify you are human" in combined
+    ):
+        return "Cloudflare验证页"
+    if "email-verification" in lower_url or any(marker in lower_text for marker in ("verification code", "验证码", "one-time code")):
+        return "邮箱验证码页"
+    if "/log-in/password" in lower_url or "password" in lower_text:
+        return "登录密码页"
+    if any(marker in lower_url for marker in ("/add-phone", "/phone", "/sms")):
+        return "手机号验证页"
+    if any(marker in lower_url for marker in ("/authorize", "/consent", "/workspace")):
+        return "OAuth授权页"
+    if "auth.openai.com/log-in" in lower_url:
+        return "OpenAI登录页"
+    return "未知页面"
+
+
+def _browser_page_summary(driver, fallback_text: str = "") -> str:
+    """Return a short, redacted description of the currently visible browser page."""
+    fallback_url = ""
+    try:
+        fallback_url = str(getattr(driver, "current_url", "") or "")
+    except Exception:
+        pass
+    raw = {}
+    try:
+        raw = driver.execute_script(
+            """
+            (() => {
+              const visible = el => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+              const text = el => String(el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
+              return {
+                url: location.href,
+                title: document.title || '',
+                text: document.body ? document.body.innerText || '' : '',
+                buttons: [...document.querySelectorAll('button')].filter(visible).slice(0, 6).map(text),
+                inputs: [...document.querySelectorAll('input')].filter(visible).slice(0, 8).map(el => ({
+                  type: el.type || '', name: el.name || '', id: el.id || '', autocomplete: el.autocomplete || '',
+                })),
+              };
+            })()
+            """
+        ) or {}
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    url = str(raw.get("url") or fallback_url or "")
+    title = _redact_diagnostic_text(raw.get("title"), limit=100)
+    page_text = str(raw.get("text") or fallback_text or "")
+    body = _redact_diagnostic_text(page_text, limit=280)
+    kind = _classify_browser_page(url, str(raw.get("title") or ""), page_text)
+    buttons = [
+        _redact_diagnostic_text(item, limit=42)
+        for item in (raw.get("buttons") or [])
+        if str(item or "").strip()
+    ][:6]
+    inputs = []
+    for item in (raw.get("inputs") or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        marker = "/".join(
+            str(item.get(key) or "").strip()
+            for key in ("type", "name", "id", "autocomplete")
+            if str(item.get(key) or "").strip()
+        )
+        if marker:
+            inputs.append(_redact_diagnostic_text(marker, limit=60))
+    summary = (
+        f"页面类型={kind}；标题={title}；URL={_safe_diagnostic_url(url)}；"
+        f"正文摘要={body}"
+    )
+    if buttons:
+        summary += f"；按钮={buttons}"
+    if inputs:
+        summary += f"；输入框={inputs}"
+    return summary
 
 
 def _extract_callback_url_from_page(driver) -> str:
@@ -359,10 +472,16 @@ _PASSWORD_ERROR_MARKERS = (
 )
 
 
-def _raise_explicit_password_page_error(text: str) -> None:
+def _raise_explicit_password_page_error(text: str, driver=None) -> None:
     dead_code = detect_account_unusable_text(text)
     if dead_code:
-        raise AccountUnusableError(f"账号已禁用（{dead_code}）", dead_code)
+        summary = _browser_page_summary(driver, fallback_text=text) if driver is not None else f"正文摘要={_redact_diagnostic_text(text)}"
+        logger.warning(
+            "[Codex][Browser] 页面检测到账号已废：错误类型=%s；%s",
+            dead_code,
+            summary,
+        )
+        raise AccountUnusableError(f"账号已废（{dead_code}）；{summary}", dead_code)
     if any(marker in str(text or "").lower() for marker in _PASSWORD_ERROR_MARKERS):
         raise RuntimeError("ChatGPT 密码错误或账号密码已变更")
 
@@ -399,7 +518,7 @@ def _login_step_state(driver) -> str:
                 return "next"
         return "next"
     text = _page_text(driver)
-    _raise_explicit_password_page_error(text)
+    _raise_explicit_password_page_error(text, driver=driver)
     if any(x in text for x in (
         "authenticator", "authentication app", "two-factor", "2fa", "验证器", "身份验证器", "認証アプリ",
     )):
@@ -480,26 +599,14 @@ def _post_password_challenge(driver, totp_provider, timeout: int = 25) -> str:
     while time.time() < end:
         url = str(getattr(driver, "current_url", "") or "").lower()
         text = _page_text(driver)
-        _raise_explicit_password_page_error(text)
+        _raise_explicit_password_page_error(text, driver=driver)
         if any(x in url for x in ("phone", "workspace", "consent", "authorize", "localhost:1455")):
             return "next"
         is_totp = any(x in text for x in (
             "authenticator", "authentication app", "two-factor", "2fa", "验证器", "身份验证器", "認証アプリ",
         ))
         if is_totp:
-            if not callable(totp_provider):
-                raise RuntimeError("账号要求 2FA，但没有可用的 TOTP 提供器")
-            code = str(totp_provider() or "").strip()
-            if not code:
-                raise RuntimeError("TOTP 提供器未返回验证码")
-            _type_otp(driver, code)
-            if not _click_if_present(driver, [
-                "button[type='submit']",
-                "//button[contains(., 'Continue')]",
-                "//button[contains(., '继续')]",
-            ], timeout=8):
-                raise RuntimeError("未找到 2FA 提交按钮")
-            logger.info("[Codex][Browser] 已提交本地生成的 2FA 验证码")
+            _handle_totp_challenge_if_present(driver, totp_provider, detection_timeout=1, transition_timeout=timeout)
             return "next"
         if _is_email_verification_page(driver):
             return "email_otp"
@@ -508,13 +615,105 @@ def _post_password_challenge(driver, totp_provider, timeout: int = 25) -> str:
         return "email_otp"
     current = str(getattr(driver, "current_url", "") or "").lower()
     if _is_login_password_page(driver) or "/log-in/password" in current:
-        _raise_explicit_password_page_error(_page_text(driver))
+        _raise_explicit_password_page_error(_page_text(driver), driver=driver)
         raise RuntimeError(
             "提交密码后仍停留在密码页，页面没有可识别的明确错误提示。"
             "可能是密码不正确、登录请求被风控拦截，或页面未完成跳转；"
             "请检查任务日志后点击重新授权"
         )
     return "next"
+
+
+_TOTP_PAGE_MARKERS = (
+    "authenticator", "authentication app", "two-factor", "2fa",
+    "验证器", "身份验证器", "双重验证", "两步验证", "認証アプリ",
+)
+
+
+def _is_totp_challenge_page(driver) -> bool:
+    """Identify the MFA challenge separately from email and phone OTP pages."""
+    current = str(getattr(driver, "current_url", "") or "").lower()
+    if any(marker in current for marker in ("/mfa-challenge", "/totp-challenge", "/authenticator-challenge")):
+        return True
+    if "email-verification" in current:
+        return False
+    try:
+        if _has_strict_add_phone_form(driver) or _is_phone_code_page(driver):
+            return False
+    except Exception:
+        pass
+    text = _page_text(driver)
+    # Do not use the shared email detector here: it intentionally recognizes
+    # generic code inputs and would classify an MFA input as email OTP.
+    return any(marker in text for marker in _TOTP_PAGE_MARKERS)
+
+
+def _handle_totp_challenge_if_present(
+    driver,
+    totp_provider,
+    *,
+    detection_timeout: int = 8,
+    transition_timeout: int = 30,
+) -> bool:
+    """Submit TOTP when OAuth shows MFA after password or email verification."""
+    detect_end = time.time() + max(0, detection_timeout)
+    while not _is_totp_challenge_page(driver):
+        current = str(getattr(driver, "current_url", "") or "")
+        if _is_callback_url(current):
+            return False
+        try:
+            if _has_strict_add_phone_form(driver) or _is_phone_code_page(driver):
+                return False
+        except Exception:
+            pass
+        lower = current.lower()
+        if any(marker in lower for marker in ("/workspace", "/consent", "localhost:1455")):
+            return False
+        if "/authorize" in lower:
+            try:
+                state = _email_otp_page_state(driver)
+                attrs = " ".join(
+                    " ".join(str(item.get(key) or "") for key in ("type", "name", "id", "autocomplete"))
+                    for item in (state.get("inputs") or [])
+                ).lower()
+                if "email" not in attrs and "username" not in attrs:
+                    return False
+            except Exception:
+                pass
+        if time.time() >= detect_end:
+            return False
+        time.sleep(0.4)
+
+    if not callable(totp_provider):
+        raise RuntimeError("账号要求 2FA，但没有可用的 TOTP 提供器")
+    code = str(totp_provider() or "").strip()
+    if not code:
+        raise RuntimeError("TOTP 提供器未返回验证码")
+    _clear_otp_inputs(driver)
+    _type_otp(driver, code)
+    if not _click_if_present(driver, [
+        "button[type='submit']",
+        "//button[contains(., 'Continue')]",
+        "//button[contains(., '继续')]",
+        "//button[contains(., 'Verify')]",
+        "//button[contains(., '验证')]",
+    ], timeout=8):
+        raise RuntimeError("未找到 2FA 提交按钮")
+    logger.info("[Codex][Browser] 已识别 MFA 页面并提交本地生成的 2FA 验证码")
+
+    transition_end = time.time() + max(1, transition_timeout)
+    while time.time() < transition_end:
+        if not _is_totp_challenge_page(driver):
+            logger.info("[Codex][Browser] 2FA 验证通过，继续检查手机号或授权确认页")
+            return True
+        text = _page_text(driver)
+        if any(marker in text for marker in (
+            "invalid code", "incorrect code", "wrong code", "expired",
+            "验证码错误", "验证码无效", "验证码已过期", "コードが正しく", "無効",
+        )):
+            raise RuntimeError("2FA 验证码错误或已过期")
+        time.sleep(0.5)
+    raise RuntimeError("提交 2FA 后页面未跳转，仍停留在 MFA 验证页")
 
 
 def _fill_email_and_otp(
@@ -645,6 +844,12 @@ def _fill_email_and_otp(
         outcome = _wait_after_email_otp_submit(driver, timeout=45)
         logger.info("[Codex][Browser] 邮箱 OTP 提交后状态：%s", outcome)
         if outcome == "accepted":
+            _handle_totp_challenge_if_present(
+                driver,
+                totp_provider,
+                detection_timeout=8,
+                transition_timeout=30,
+            )
             return
         if str(outcome).startswith("deactivated:"):
             error_code = str(outcome).split(":", 1)[1] or "account_deactivated"
@@ -761,9 +966,10 @@ def _read_email_otp_validate_dead_code(driver) -> str:
         code = detect_account_unusable_response_body(str(row.get("body") or ""))
         if code:
             logger.warning(
-                "[Codex][Browser] email-otp/validate 响应识别账号已废：code=%s status=%s",
+                "[Codex][Browser] email-otp/validate 响应识别账号已废：错误类型=%s status=%s；%s",
                 code,
                 row.get("status"),
+                _browser_page_summary(driver),
             )
             return code
     return ""
@@ -1556,13 +1762,11 @@ def _run_roxy_codex_oauth_once(
 ) -> dict:
     """指纹浏览器 Codex OAuth 入口。
 
-    existing_driver/existing_opened 用于“注册成功后立刻跑 Codex”：
-    复用注册时的 Roxy 窗口，不新建环境，只清理浏览器状态后开始授权。
+    existing_driver/existing_opened 供显式调用方复用已有 Roxy 窗口：不新建
+    环境，只清理浏览器状态后开始授权。GPT 注册流程本身不会调用此入口。
     """
     from core import codex_oauth as proto
 
-    if not force and not proto._cfg.ENABLE_CODEX_AUTO:
-        return proto._codex_result(status="skipped", message="ENABLE_CODEX_AUTO=False")
     if not email:
         return proto._codex_result(status="skipped", message="email 为空")
     if otp_provider is None:
@@ -1621,6 +1825,12 @@ def _run_roxy_codex_oauth_once(
             browser_assist_provider=browser_assist_provider,
         )
         human_delay("api")
+        _handle_totp_challenge_if_present(
+            driver,
+            totp_provider,
+            detection_timeout=8,
+            transition_timeout=30,
+        )
         logger.info("[Codex][Browser] 检查是否需要手机号验证")
         phone_verified = _do_phone_verification_if_present(driver)
         logger.info("[Codex][Browser] 手机验证处理完成/无需处理，等待授权确认和 callback")
@@ -1710,11 +1920,21 @@ def _run_roxy_codex_oauth_once(
             result["phone_verified"] = True
         return result
     except AccountUnusableError as exc:
-        logger.warning("[Codex][Browser] 账号已废：%s，%s", email, exc.error_code)
+        error_code = exc.error_code or "account_deactivated"
+        base_message = f"账号已废（{error_code}）"
+        detail = str(exc).strip()
+        for prefix in (base_message, f"账号已禁用（{error_code}）"):
+            if detail.startswith(prefix):
+                detail = detail[len(prefix):].lstrip("；: ")
+                break
+        message = base_message
+        if detail:
+            message += f"；{detail[:620]}"
+        logger.warning("[Codex][Browser] 账号已废：%s，%s；%s", email, error_code, detail or "未获取页面摘要")
         return proto._codex_result(
             status="deactivated",
             email=email,
-            message=f"账号已废（{exc.error_code or 'account_deactivated'}）",
+            message=message,
         )
     except Exception as exc:
         logger.warning("[Codex][Browser] 失败：%s，%s: %s", email, type(exc).__name__, str(exc)[:240])

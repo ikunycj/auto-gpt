@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-注册成功后的 Codex OAuth 授权模块（2026-06-15 改造：全新 session + 接码）。
+独立 Codex OAuth 授权模块（2026-06-15 改造：全新 session + 接码）。
 
 旧方案"复用注册的已登录 session"会撞 /choose-an-account 卡死（React SPA 解析不出
 可提交字段）。新方案改为用**全新干净 session**从头登录，走 OpenAI 标准风控路径，
@@ -120,6 +120,7 @@ def _codex_result(
     file_path: str | None = None,
     callback_url: str | None = None,
     message: str = "",
+    phone_verified: bool = False,
 ) -> dict:
     """构造与 flow_trigger._flow_result 同形态的结构化结果。"""
     return {
@@ -130,6 +131,7 @@ def _codex_result(
         "file_path": file_path,
         "callback_url": callback_url,
         "message": message,
+        "phone_verified": bool(phone_verified),
     }
 
 
@@ -1473,7 +1475,7 @@ def run_codex_oauth(
     _cpa_reauth_round: int = 1,
 ) -> dict:
     """
-    注册成功后的 Codex OAuth 授权入口（全新 session + 接码方案）。
+    已注册 GPT 账号的独立 Codex OAuth 授权入口（全新 session + 接码方案）。
 
     不复用注册的 session：内部新建干净 BrowserSession，从头登录该邮箱，
     走 邮箱 OTP → 手机短信验证 → 选 workspace → 拿 code → 换 token → 落盘。
@@ -1482,13 +1484,11 @@ def run_codex_oauth(
         email: 已注册成功的账号邮箱
         otp_provider: 邮箱 OTP 获取回调 fn(email, after_ts)->code，默认用 wait_for_otp
         proxy: 代理（不传从 PROXY_POOL 抽）
-        force: True 时跳过 ENABLE_CODEX_AUTO 开关限制，供手动补跑使用
+        force: 兼容旧调用方的保留参数；显式调用本函数即表示执行授权
 
     Returns:
-        结构化结果 dict。任何异常都被吞掉转 status=failed，不向上抛，不影响注册主流程。
+        结构化结果 dict。任何异常都被吞掉并转换为 status=failed。
     """
-    if not force and not _cfg.ENABLE_CODEX_AUTO:
-        return _codex_result(status="skipped", message="ENABLE_CODEX_AUTO=False")
     if not email:
         return _codex_result(status="skipped", message="email 为空")
 
@@ -1515,10 +1515,24 @@ def run_codex_oauth(
             )
         if oauth_driver in ("browser_use", "browseruse", "browser-use", "bu"):
             from core.browser_use_codex_oauth import run_browser_use_codex_oauth
-            return run_browser_use_codex_oauth(email, otp_provider=otp_provider, proxy=proxy, force=True)
+            return run_browser_use_codex_oauth(
+                email,
+                otp_provider=otp_provider,
+                login_password=login_password,
+                totp_provider=totp_provider,
+                proxy=proxy,
+                force=True,
+            )
         if oauth_driver in ("skyvern", "sv"):
             from core.skyvern_codex_oauth import run_skyvern_codex_oauth
-            return run_skyvern_codex_oauth(email, otp_provider=otp_provider, proxy=proxy, force=True)
+            return run_skyvern_codex_oauth(
+                email,
+                otp_provider=otp_provider,
+                login_password=login_password,
+                totp_provider=totp_provider,
+                proxy=proxy,
+                force=True,
+            )
         if oauth_driver in ("chrome_cdp", "chrome-cdp", "chrome", "local_chrome", "system_chrome"):
             from core.chrome_cdp_driver import build_chrome_cdp_driver
             from core.roxy_codex_oauth import run_roxy_codex_oauth
@@ -1580,7 +1594,11 @@ def run_codex_oauth(
         pass
 
     if login_password:
-        return _codex_result(status="failed", email=email, message="已有账号密码登录仅支持 chrome_cdp/cloak/roxy 浏览器驱动")
+        return _codex_result(
+            status="failed",
+            email=email,
+            message="当前 Codex 授权驱动不支持密码登录，请切换到浏览器驱动（Chrome/Roxy/Cloak/Browser Use/Skyvern）",
+        )
 
     if otp_provider is None:
         from core.email_provider import wait_for_otp as otp_provider
@@ -1653,11 +1671,13 @@ def run_codex_oauth(
         human_delay("api")
 
         # 5. 先尝试直接选 workspace。只有服务端明确返回手机验证要求时才接码。
+        phone_verified = False
         try:
             callback_url = _select_workspace_and_get_callback(session, state)
         except PhoneVerificationRequired:
             logger.info("[Codex] workspace 选择明确要求手机验证，开始接码")
             _do_phone_verification(session)
+            phone_verified = True
             human_delay("post_auth")
             callback_url = _select_workspace_and_get_callback(session, state)
         code = _extract_code(callback_url, state)
@@ -1683,6 +1703,7 @@ def run_codex_oauth(
                 file_path=str(path) if path else None,
                 callback_url=callback_url,
                 message=str(msg),
+                phone_verified=phone_verified,
             )
 
         # 7A-sub2. sub2 模式：把 callback URL 上传给 sub2。
@@ -1708,6 +1729,7 @@ def run_codex_oauth(
                 file_path=str(path) if path else None,
                 callback_url=callback_url,
                 message=str(msg),
+                phone_verified=phone_verified,
             )
 
         # 7B. local 模式：保留旧实现，用本地 verifier 换 token 并保存 CPA 兼容授权文件。
@@ -1732,6 +1754,7 @@ def run_codex_oauth(
             file_path=str(path),
             callback_url=callback_url,
             message=f"plan={id_claims.get('plan_type') or 'unknown'}",
+            phone_verified=phone_verified,
         )
     except AccountUnusableError as exc:
         logger.warning(f"[Codex] 账号已废（{exc.error_code}）：{email}")

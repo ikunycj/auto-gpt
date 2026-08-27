@@ -10,7 +10,8 @@ from config.env_loader import apply_env_overrides
 # 注册邮箱（留空 + USE_EMAIL_SERVICE=True 时从 Outlook 池领取）
 REGISTER_EMAIL = ""
 
-# 注册密码（OTP-only 流程已不需要，留作备用）
+# 注册密码兜底。注册优先使用邮箱 OTP；仅当 OpenAI 没有 OTP 入口且强制创建密码时使用。
+# 留空时为当前账号生成独立随机密码；protocol 驱动始终是 OTP-only。
 REGISTER_PASSWORD = ""
 
 # 用户名（注册完成后设置的显示名称，留空会自动生成 "Foo Bar" 形式）

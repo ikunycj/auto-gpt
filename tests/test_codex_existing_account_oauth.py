@@ -6,6 +6,7 @@ from urllib.parse import parse_qs
 import pytest
 
 from core import codex_oauth
+from core import browser_use_codex_oauth as browser_use_oauth
 from core import roxy_codex_oauth as browser_oauth
 
 
@@ -98,6 +99,36 @@ def test_password_step_marks_explicitly_deleted_account_without_password_input(m
     assert exc.value.error_code == "account_deleted"
 
 
+def test_dead_account_page_log_contains_redacted_page_summary(caplog):
+    class DiagnosticDriver:
+        current_url = "https://auth.openai.com/log-in/password?token=private"
+
+        def execute_script(self, script):
+            if "document.title" in script:
+                return {
+                    "url": self.current_url,
+                    "title": "Account deactivated",
+                    "text": "",
+                    "buttons": ["Continue"],
+                    "inputs": [{"type": "password", "name": "password"}],
+                }
+            return "Your account has been deactivated."
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(browser_oauth.AccountUnusableError) as exc:
+            browser_oauth._raise_explicit_password_page_error(
+                "Your account has been deactivated.",
+                driver=DiagnosticDriver(),
+            )
+
+    assert exc.value.error_code == "account_deactivated"
+    assert "页面类型=账号停用提示页" in caplog.text
+    assert "标题=Account deactivated" in caplog.text
+    assert "URL=https://auth.openai.com/log-in/password?[参数已隐藏]" in caplog.text
+    assert "private-password" not in caplog.text
+    assert "private-token" not in caplog.text
+
+
 def test_cloudflare_challenge_is_reported_before_login_selectors(monkeypatch):
     monkeypatch.setattr(browser_oauth, "human_delay", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(browser_oauth, "_maybe_accept", lambda _driver: None)
@@ -143,6 +174,89 @@ def test_run_codex_oauth_dispatches_existing_account_to_chrome_cdp(monkeypatch):
     assert kwargs["login_password"] == "password"
     assert kwargs["reuse_existing_profile"] is True
     assert kwargs["clear_existing_state"] is True
+
+
+@pytest.mark.parametrize(
+    ("driver_name", "module_name", "function_name"),
+    [
+        ("browser_use", "core.browser_use_codex_oauth", "run_browser_use_codex_oauth"),
+        ("skyvern", "core.skyvern_codex_oauth", "run_skyvern_codex_oauth"),
+    ],
+)
+def test_run_codex_oauth_passes_password_to_cloud_browser_drivers(
+    monkeypatch,
+    driver_name,
+    module_name,
+    function_name,
+):
+    import importlib
+
+    calls = []
+    module = importlib.import_module(module_name)
+    monkeypatch.setattr(codex_oauth._cfg, "CODEX_OAUTH_DRIVER", driver_name)
+    monkeypatch.setattr(
+        module,
+        function_name,
+        lambda email, **kwargs: calls.append((email, kwargs)) or {"ok": True, "status": "success"},
+    )
+    totp_provider = lambda: "123456"
+
+    result = codex_oauth.run_codex_oauth(
+        "cloud@example.com",
+        login_password="chatgpt-password",
+        totp_provider=totp_provider,
+        force=True,
+    )
+
+    assert result["ok"] is True
+    email, kwargs = calls[0]
+    assert email == "cloud@example.com"
+    assert kwargs["login_password"] == "chatgpt-password"
+    assert kwargs["totp_provider"] is totp_provider
+
+
+def test_browser_use_submits_known_password_before_email_otp(monkeypatch):
+    states = iter(["password", "next"])
+    filled = []
+    monkeypatch.setattr(browser_use_oauth, "_password_error_text", lambda _page: "")
+    monkeypatch.setattr(browser_use_oauth, "_browser_login_step_state", lambda _page: next(states))
+    monkeypatch.setattr(browser_use_oauth, "_has_visible_password_input", lambda _page: True)
+    monkeypatch.setattr(
+        browser_use_oauth,
+        "_fill_first_any_frame",
+        lambda _page, _selectors, value, timeout_ms=0: filled.append(value) or True,
+    )
+    monkeypatch.setattr(browser_use_oauth, "_click_first_any_frame", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(browser_use_oauth, "_bu_delay", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(browser_use_oauth.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        browser_use_oauth,
+        "_click_passwordless_signup_if_present",
+        lambda _page: pytest.fail("passwordless entry must not be used when a password input exists"),
+    )
+
+    outcome = browser_use_oauth._submit_browser_use_login_password(
+        object(),
+        "chatgpt-password",
+        timeout=1,
+    )
+
+    assert outcome == "next"
+    assert filled == ["chatgpt-password"]
+
+
+def test_browser_use_password_flow_accepts_direct_email_otp(monkeypatch):
+    monkeypatch.setattr(browser_use_oauth, "_password_error_text", lambda _page: "")
+    monkeypatch.setattr(browser_use_oauth, "_browser_login_step_state", lambda _page: "email_otp")
+
+    assert browser_use_oauth._submit_browser_use_login_password(object(), "password", timeout=1) == "email_otp"
+
+
+def test_browser_use_password_error_is_terminal(monkeypatch):
+    monkeypatch.setattr(browser_use_oauth, "_password_error_text", lambda _page: "wrong email or password")
+
+    with pytest.raises(RuntimeError, match="密码错误"):
+        browser_use_oauth._submit_browser_use_login_password(object(), "wrong-password", timeout=1)
 
 
 def test_cloudflare_challenge_can_be_released_by_browser_assist(monkeypatch):
@@ -234,7 +348,9 @@ def test_callback_timeout_keeps_location_but_hides_query(monkeypatch):
 
 def test_totp_challenge_uses_local_provider_without_logging_code(monkeypatch, caplog):
     typed = []
+    challenge_states = iter([True, False])
     monkeypatch.setattr(browser_oauth, "_page_text", lambda _driver: "enter the code from your authenticator app")
+    monkeypatch.setattr(browser_oauth, "_is_totp_challenge_page", lambda _driver: next(challenge_states, False))
     monkeypatch.setattr(browser_oauth, "_type_otp", lambda _driver, code: typed.append(code))
     monkeypatch.setattr(browser_oauth, "_click_if_present", lambda *_args, **_kwargs: True)
 
@@ -244,6 +360,29 @@ def test_totp_challenge_uses_local_provider_without_logging_code(monkeypatch, ca
     assert outcome == "next"
     assert typed == ["987654"]
     assert "987654" not in caplog.text
+
+
+def test_mfa_challenge_url_wins_over_generic_email_otp_input_detection(monkeypatch):
+    class MfaDriver:
+        current_url = "https://auth.openai.com/mfa-challenge/abc123"
+
+    # The shared email detector deliberately recognizes generic code inputs;
+    # an MFA route must take precedence over that broad heuristic.
+    monkeypatch.setattr(browser_oauth, "_is_email_verification_page", lambda _driver: True)
+
+    assert browser_oauth._is_totp_challenge_page(MfaDriver()) is True
+
+
+def test_totp_page_text_wins_on_ambiguous_authorize_url(monkeypatch):
+    class MfaDriver:
+        current_url = "https://auth.openai.com/authorize"
+
+    monkeypatch.setattr(browser_oauth, "_has_strict_add_phone_form", lambda _driver: False)
+    monkeypatch.setattr(browser_oauth, "_is_phone_code_page", lambda _driver: False)
+    monkeypatch.setattr(browser_oauth, "_page_text", lambda _driver: "enter the code from your authenticator app")
+    monkeypatch.setattr(browser_oauth, "_is_email_verification_page", lambda _driver: True)
+
+    assert browser_oauth._is_totp_challenge_page(MfaDriver()) is True
 
 
 def test_password_challenge_fails_when_page_never_leaves_password_step(monkeypatch):
