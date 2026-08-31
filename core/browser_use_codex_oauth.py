@@ -1562,7 +1562,7 @@ def _run_browser_use_codex_oauth_once(
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
-        return proto._codex_result(status="failed", email=email, message="缺少 playwright，请执行 pip install playwright")
+        return proto._codex_result(status="failed", email=email, message="缺少 playwright，请执行 uv sync --locked")
 
     provider = str(cloud_provider or "browser_use").strip().lower()
     if provider in ("skyvern", "sv"):

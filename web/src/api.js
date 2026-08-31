@@ -9,13 +9,6 @@ export class ApiError extends Error {
   }
 }
 
-function goToLogin() {
-  if (window.location.pathname !== '/login') {
-    const next = `${window.location.pathname}${window.location.search}`;
-    window.location.assign(`/login?next=${encodeURIComponent(next || '/')}`);
-  }
-}
-
 async function parseResponse(response) {
   const type = response.headers.get('content-type') || '';
   if (type.includes('application/json')) {
@@ -44,10 +37,7 @@ export async function api(path, options = {}) {
       },
     });
   } catch (error) {
-    throw new ApiError('无法连接本地后端服务，请确认 WebUI 已启动（127.0.0.1:5000）', 0, { cause: error?.message || 'network error' });
-  }
-  if (response.status === 401) {
-    goToLogin();
+    throw new ApiError('无法连接本地后端服务，请确认 WebUI 已启动（127.0.0.1:5555 / 127.0.0.1:6666）', 0, { cause: error?.message || 'network error' });
   }
   return parseResponse(response);
 }
@@ -85,10 +75,6 @@ export async function download(path, options = {}) {
     credentials: 'same-origin',
     ...options,
   });
-  if (response.status === 401) {
-    goToLogin();
-    throw new ApiError('未授权', 401);
-  }
   if (!response.ok) {
     const type = response.headers.get('content-type') || '';
     let message = `下载失败（${response.status}）`;

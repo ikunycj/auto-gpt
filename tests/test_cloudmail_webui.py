@@ -7,8 +7,7 @@ from apps.web.app import create_app
 
 class CloudMailWebUiTests(unittest.TestCase):
     def setUp(self):
-        self.client = create_app(auth_code="test-auth").test_client()
-        self.client.environ_base["HTTP_X_AUTH_CODE"] = "test-auth"
+        self.client = create_app().test_client()
 
     @patch("config.reload_all")
     @patch("config.env_loader.write_env_values")

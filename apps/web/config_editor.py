@@ -30,17 +30,6 @@ EXPLICIT_EMPTY_LIST_KEYS = {"PROXY_POOL"}
 # ============================================================
 
 EDITABLE_FIELDS = [
-    # ---- WebUI 授权 ----
-    {
-        "key": "WEBUI_AUTH_CODE", "file": "codex.py", "type": "str", "group": "WebUI 授权",
-        "label": "WebUI 授权码", "help": "仅保存在 .env（WEBUI_AUTH_CODE），避免出现在进程命令行中；保存后立即刷新鉴权，已有会话可能需要重新登录",
-        "storage": "env", "secret": True,
-    },
-    {
-        "key": "WEBUI_SESSION_SECRET", "file": "codex.py", "type": "str", "group": "WebUI 授权",
-        "label": "Session 签名密钥", "help": "可选，保存在 .env（WEBUI_SESSION_SECRET）；不填则从授权码派生，修改此密钥会使已有登录失效",
-        "storage": "env", "secret": True,
-    },
     {
         "key": "REGISTRATION_DRIVER", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "注册驱动", "help": "本机推荐 chrome_cdp；浏览器驱动优先邮箱 OTP，仅在 OpenAI 没有 OTP 入口且强制创建密码时使用密码兜底；protocol 始终是纯邮箱 OTP 流程",

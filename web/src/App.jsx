@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Activity, Gauge, Inbox, LogOut, Menu, Settings2, Smartphone,
+  Activity, Gauge, Inbox, Menu, Settings2, Smartphone,
   Users, X,
 } from 'lucide-react';
 import { get, post } from './api';
@@ -53,7 +53,7 @@ function Sidebar({ active, onChange, open, onClose, backendOnline }) {
 }
 
 function Topbar({ active, onMenu, summary, backendOnline, onRefresh, refreshing }) {
-  return <header className="topbar"><div className="topbar-leading"><IconButton label="打开导航" icon={Menu} className="menu-button" onClick={onMenu} /><div><div className="breadcrumb">工作区 <span>/</span> <strong>{PAGE_TITLES[active]}</strong></div><h1>{PAGE_TITLES[active]}</h1></div></div><div className="topbar-actions"><div className={`topbar-health ${backendOnline ? 'is-online' : 'is-offline'}`} aria-live="polite"><span className={`status-dot ${backendOnline ? 'is-online' : 'is-offline'}`} /> <span>{backendOnline ? 'API 在线' : 'API 离线'}</span><small>{backendOnline ? `${summary?.accounts ?? 0} 个账号` : '无法连接后端'}</small></div><IconButton label="刷新概览" icon={Activity} className={refreshing ? 'is-loading' : ''} onClick={onRefresh} disabled={refreshing} /><form method="post" action="/logout"><button className="logout-button" type="submit"><LogOut size={15} />退出</button></form></div></header>;
+  return <header className="topbar"><div className="topbar-leading"><IconButton label="打开导航" icon={Menu} className="menu-button" onClick={onMenu} /><div><div className="breadcrumb">工作区 <span>/</span> <strong>{PAGE_TITLES[active]}</strong></div><h1>{PAGE_TITLES[active]}</h1></div></div><div className="topbar-actions"><div className={`topbar-health ${backendOnline ? 'is-online' : 'is-offline'}`} aria-live="polite"><span className={`status-dot ${backendOnline ? 'is-online' : 'is-offline'}`} /> <span>{backendOnline ? 'API 在线' : 'API 离线'}</span><small>{backendOnline ? `${summary?.accounts ?? 0} 个账号` : '无法连接后端'}</small></div><IconButton label="刷新概览" icon={Activity} className={refreshing ? 'is-loading' : ''} onClick={onRefresh} disabled={refreshing} /></div></header>;
 }
 
 function LoadingView() {

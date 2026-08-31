@@ -8,7 +8,7 @@ Codex OAuth 单独验证脚本（2026-06-15 重写：全新 session + 接码方�
     首跑用于校准各 /api/accounts/* 接口的响应处理。
 
 用法：
-    python scripts/operations/codex_oauth.py --email <已注册邮箱> [--verbose]
+    uv run --locked python scripts/operations/codex_oauth.py --email <已注册邮箱> [--verbose]
 
 前提：
     - 该邮箱在 SQLite 邮箱池中有完整凭证（client_id/refresh_token），用于收邮箱 OTP
@@ -26,7 +26,8 @@ import sys
 from pathlib import Path
 
 # 让独立操作脚本能 import 到项目根的 core / config
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# This file lives two directories below the project root (scripts/operations).
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from core.codex_oauth import run_codex_oauth

@@ -724,13 +724,13 @@ def main() -> None:
     使用方式：
 
     1. 直接传入 JWT：
-       python codex_agent.py --token "eyJhbGci..."
+       uv run --locked python -m core.codex_agent --token "eyJhbGci..."
 
     2. 传入 JSON 文件（包含 accessToken）：
-       python codex_agent.py --file session.json
+       uv run --locked python -m core.codex_agent --file session.json
 
     3. 交互式输入：
-       python codex_agent.py
+       uv run --locked python -m core.codex_agent
     """
 
     import argparse

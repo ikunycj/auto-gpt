@@ -1,0 +1,30 @@
+[project]
+name = "turb-gpt-free-register"
+version = "0.1.0"
+description = "Local ChatGPT account registration and Codex OAuth management tool"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "curl-cffi>=0.15.0",
+    "pyotp>=2.9.0",
+    "flask>=3.0.0",
+    "requests>=2.31.0",
+    "pycryptodome>=3.23.0",
+    "selenium>=4.20.0",
+    "cryptography>=41",
+    "cloakbrowser[geoip]>=0.4.10",
+    "playwright>=1.49.0",
+    "python-dotenv>=1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv]
+# This repository is an application with top-level source directories rather
+# than an installable package. Keep uv focused on environment management.
+package = false
+# Prefer the interpreter downloaded and maintained by uv when available.
+python-preference = "managed"

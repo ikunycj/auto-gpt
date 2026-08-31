@@ -1,7 +1,7 @@
 """Compatibility CLI entrypoint.
 
 The implementation lives in :mod:`apps.cli.main`; this file keeps the historic
-``python main.py`` command and ``import main`` path stable.
+``uv run --locked python main.py`` command and ``import main`` path stable.
 """
 from __future__ import annotations
 
@@ -15,4 +15,3 @@ if __name__ == "__main__":
 else:
     _implementation = importlib.import_module("apps.cli.main")
     sys.modules[__name__] = _implementation
-

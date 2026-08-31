@@ -30,7 +30,6 @@ from core.import_parser import (
     parse_account_material_line,
     split_import_line,
 )
-from apps.web.auth import init_auth, register_auth_routes, reload_auth_from_environment
 from registration.application import job_service as svc
 from apps.web import config_editor
 
@@ -180,7 +179,7 @@ def _job_status_counts(rows: list[dict]) -> dict:
     counts["active"] = sum(int(counts.get(s, 0) or 0) for s in ("pending", "running", "stopping"))
     return counts
 
-def create_app(auth_code: str | None = None) -> Flask:
+def create_app() -> Flask:
     project_root = Path(__file__).resolve().parents[2]
     react_dist = project_root / "web" / "dist"
     app = Flask(
@@ -188,7 +187,6 @@ def create_app(auth_code: str | None = None) -> Flask:
         static_folder=str(react_dist / "assets") if (react_dist / "assets").is_dir() else None,
         static_url_path="/assets",
     )
-    app.config["REACT_INDEX_PATH"] = str(react_dist / "index.html") if (react_dist / "index.html").is_file() else ""
     _prepared_downloads: dict[str, dict] = {}
 
     def _put_prepared_download(content: bytes, filename: str, mimetype: str = "application/zip") -> str:
@@ -227,7 +225,6 @@ def create_app(auth_code: str | None = None) -> Flask:
             },
         )
 
-    init_auth(app, auth_code=auth_code)
     # Import any still-present legacy input before recovery workers inspect it.
     # SQLite is authoritative after this idempotent migration; normal runtime
     # writes never create JSON/TXT/HTML mirrors in the repository.
@@ -244,7 +241,6 @@ def create_app(auth_code: str | None = None) -> Flask:
     except Exception:
         logger.exception("SQLite 存储初始化失败")
         raise
-    register_auth_routes(app)
     recovered_plan_checks = db.recover_interrupted_plan_checks()
     if recovered_plan_checks:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
@@ -2957,26 +2953,16 @@ def create_app(auth_code: str | None = None) -> Flask:
             reload_err = f"{type(exc).__name__}: {exc}"
             logger.exception("配置热加载失败")
 
-        auth_reload = None
-        if reload_ok and set(result.get("updated") or ()) & {"WEBUI_AUTH_CODE", "WEBUI_SESSION_SECRET"}:
-            try:
-                auth_reload = reload_auth_from_environment(app)
-            except Exception as exc:
-                reload_ok = False
-                reload_err = f"鉴权刷新失败：{type(exc).__name__}: {exc}"
-                logger.exception("WebUI 鉴权配置刷新失败")
-
         return jsonify({
             "ok": True,
             "updated": result["updated"],
             "ignored": result["ignored"],
             "reloaded": reload_ok,
-            "auth_reloaded": bool(auth_reload),
             "note": (
                 "✅ 已保存并热加载，新值立即生效"
                 if reload_ok
                 else f"⚠️ 已写入文件但热加载失败（{reload_err}），需重启 Web 服务才能生效"
-            ) + ("；鉴权配置已刷新，必要时请重新登录" if auth_reload else ""),
+            ),
         })
 
     return app

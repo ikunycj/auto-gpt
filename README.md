@@ -10,7 +10,7 @@ ChatGPT / OpenAI 账号注册与 Codex OAuth 授权工具。项目提供本地 W
 
 项目解决的是一套本地注册任务的编排问题：准备邮箱素材，选择注册驱动，执行邮箱/手机验证，保存账号状态，并按需继续完成 Codex OAuth。管理服务和注册执行服务相互独立：
 
-- **Web 管理服务**：Flask 后端位于 `apps/web/`，负责鉴权、任务编排、配置编辑和 API；React/Vite 前端位于 `web/`。
+- **Web 管理服务**：Flask 后端位于 `apps/web/`，负责任务编排、配置编辑和 API；React/Vite 前端位于 `web/`。
 - **注册模拟服务**：注册用例位于 `registration/application/`，浏览器和协议适配器位于 `registration/drivers/`，可单独替换或扩展。
 - **基础业务模块**：`core/` 提供邮箱、短信、OAuth、浏览器客户端和业务数据访问能力。
 - **唯一运行时数据源**：`data/turb_gpt.sqlite3` 保存账号、邮箱池、任务、凭证、日志和批次归档。
@@ -22,10 +22,12 @@ ChatGPT / OpenAI 账号注册与 Codex OAuth 授权工具。项目提供本地 W
 | 入口 | 适用场景 | 启动命令 |
 |---|---|---|
 | WebUI | 日常配置、批量任务、账号和日志管理 | `./webui.sh start` |
-| CLI | 自动化脚本、无界面批量任务 | `python main.py` |
-| Codex 补跑 | 对已注册账号单独重试 OAuth | `python scripts/operations/codex_oauth.py ...` |
+| CLI | 自动化脚本、无界面批量任务 | `uv run --locked python main.py` |
+| Codex 补跑 | 对已注册账号单独重试 OAuth | `uv run --locked python scripts/operations/codex_oauth.py ...` |
 
-生产 WebUI 只使用 `http://127.0.0.1:5000` 一个监听器。开发前端使用 Vite 的 `5173` 端口，并将 API 代理到 `5000`。
+生产和开发环境使用同一组固定地址：浏览器访问 Vite 前端
+`http://127.0.0.1:5555`，Flask 后端监听 `http://127.0.0.1:6666`。Vite
+dev/preview 将 `/api` 代理到后端。WebUI 仅绑定本机回环地址，不再要求授权码登录。
 
 ## 2. 功能概览
 
@@ -70,7 +72,7 @@ WebUI「设置 → 邮箱 / OTP」中的 `EMAIL_SOURCE` 支持多个来源组合
 
 ### 2.4 WebUI 管理能力
 
-React WebUI 由 Flask 在生产环境提供，主导航合并为四个菜单：
+React WebUI 在生产环境由 Vite preview 提供，Flask 后端负责 API；主导航合并为四个菜单：
 
 - **邮箱**：邮箱注册工作区的预留入口，目前暂为空；后续使用邮箱完成 ChatGPT 注册后，生成的账号会注入 GPT账号流程。仅创建邮箱本身不会产生 GPT 账号。
 - **GPT账号**：同一张账号表承载账号导入、GPT 注册、Codex OAuth 认证、GPT/邮箱验活、限额查询、凭证导出和 Sub2API 同步。表格同时展示明文密码、2FA、邮箱接码 API、GPT 注册状态、Codex 授权状态、手机接码状态、已验证手机、GPT 状态、套餐、备注、创建/修改时间、操作和日志；任务仍在后台执行，不再单独展示任务列表。需要短信时系统自动从手机号池调度。
@@ -83,7 +85,7 @@ React WebUI 由 Flask 在生产环境提供，主导航合并为四个菜单：
 
 - SQLite 是运行时唯一事实来源，数据库文件默认位于 `data/turb_gpt.sqlite3`，权限按 `0600` 处理。
 - 项目不再生成 `accounts/`、`codex_accounts/`、`logs/`、`run/`、`注册日志/` 或 `codex_接码日志/` 等旧物理目录。
-- GPT账号表按当前运维需求直接展示密码和 TOTP/2FA；access token、refresh token 等更高风险凭证仍只在复制或下载动作中按需读取。请只在受控的本机 WebUI 上使用，并妥善保护数据库和授权码。
+- GPT账号表按当前运维需求直接展示密码和 TOTP/2FA；access token、refresh token 等更高风险凭证仍只在复制或下载动作中按需读取。WebUI 不设登录门禁，请只在受控的本机账户上使用，并妥善保护数据库。
 - `.env`、数据库、凭证和运行时文件均被 `.gitignore` 排除，禁止提交到仓库。
 
 ## 3. 使用指南
@@ -93,17 +95,37 @@ React WebUI 由 Flask 在生产环境提供，主导航合并为四个菜单：
 要求：
 
 - Python 3.10 或更高版本。
-- Node.js 18 或更高版本（仅前端开发/构建需要）。
+- [uv](https://docs.astral.sh/uv/)（用于管理 Python 解释器、虚拟环境和依赖）。
+- Node.js `20.19.0+`（20.x）或 `22.12.0+`（当前锁定的 Vite 8.2.2 要求；仅前端开发/构建需要）。
 - 可用的网络出口和代理；使用云端浏览器时还需要对应服务的 API Key。
 - 使用 RoxyBrowser 时，本机 Roxy API 必须可访问。
 
-安装 Python 依赖：
+`webui.sh` 是面向 macOS/Linux 的 Unix shell 管理脚本；Windows 用户请使用下面的
+`uv run` 前台启动命令（或在 WSL 中运行管理脚本）。
+
+安装 uv（如果尚未安装）：
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate       # Windows PowerShell: .venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows PowerShell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
+
+项目根目录的 `.python-version` 固定默认解释器系列为 Python 3.10；uv 会优先使用自己下载和维护的解释器，并在本机没有匹配版本时自动下载。在项目根目录同步锁定依赖（会自动创建或更新 `.venv`）：
+
+```bash
+uv sync --locked
+```
+
+日常命令通过 `uv run --locked` 执行，不需要手工激活虚拟环境。例如：
+
+```bash
+uv run --locked python -c "import sys; print(sys.executable)"
+```
+
+`uv.lock` 是可复现安装所需的锁文件，应与项目源码一起提交。若维护者修改了依赖，先运行 `uv lock` 更新锁文件，再用 `uv sync --locked` 验证；普通使用者不要删除或手工编辑 `uv.lock`。仓库保留的 `requirements.txt` 仅用于兼容旧版 pip 部署，新依赖只应维护在 `pyproject.toml` 中。
 
 日常启动不要求手工创建或编辑 `.env`。首次启动后，打开 WebUI 的“设置”页面即可填写邮箱、代理、浏览器、Codex、短信和第三方 API；保存时系统会自动把配置写入项目根目录 `.env` 并热加载。不要把真实密钥写入 `config/*.py`、README、Issue 或提交记录。
 
@@ -113,7 +135,7 @@ python -m pip install -r requirements.txt
 TURB_SQLITE_PATH=/path/to/turb_gpt.sqlite3
 ```
 
-如果需要无人值守启动，也可以在命令行传入 `AUTH_CODE` 或预先准备 `.env`；交互式使用不需要这样做。
+如果需要无人值守启动，可以预先准备 `.env`；交互式使用不需要这样做。
 
 ### 3.2 邮箱菜单与邮箱素材
 
@@ -169,16 +191,17 @@ Markdown 链接（`[说明](https://...)`）和聊天复制产生的反斜杠转
 ./webui.sh stop
 ```
 
-服务固定监听：<http://127.0.0.1:5000>。同一工作区只允许一个 WebUI 进程，不能通过参数改成其他端口。
+服务使用两个固定监听器：Vite 前端为 <http://127.0.0.1:5555>，Flask
+后端为 <http://127.0.0.1:6666>。浏览器只需访问前端；Vite 会把 API
+请求代理到后端。同一工作区只允许一组 WebUI 前后端进程，不能通过参数改成其他端口。
 
 首次使用的完整流程：
 
 1. 执行 `./webui.sh start`。
-2. 执行 `./webui.sh logs`，复制日志中自动生成的临时授权码（如果你没有预先配置授权码）。
-3. 打开 <http://127.0.0.1:5000> 登录。
-4. 进入“设置”，填写邮箱来源、注册/浏览器驱动、代理、API Key、Codex 和其他第三方服务参数；如需平台自动取号，在「接码平台」中选择平台、填写凭证并开启“加入手机号池”，点击“保存全部”。
-5. 如果不使用自动取号，进入“手机号池”导入手机号和接码链接，并确认可用次数大于 0；开启平台动态来源时无需预先导入固定号码。
-6. 进入“GPT账号”，导入已有账号或查看注册服务生成的账号。对未注册行点击“注册”，对已有账号点击“授权”；短信验证时系统自动从手机号池取号。
+2. 打开前端 <http://127.0.0.1:5555>，直接进入工作区。
+3. 进入“设置”，填写邮箱来源、注册/浏览器驱动、代理、API Key、Codex 和其他第三方服务参数；如需平台自动取号，在「接码平台」中选择平台、填写凭证并开启“加入手机号池”，点击“保存全部”。
+4. 如果不使用自动取号，进入“手机号池”导入手机号和接码链接，并确认可用次数大于 0；开启平台动态来源时无需预先导入固定号码。
+5. 进入“GPT账号”，导入已有账号或查看注册服务生成的账号。对未注册行点击“注册”，对已有账号点击“授权”；短信验证时系统自动从手机号池取号。
 
 因此，普通使用者不需要在启动前编辑 `.env` 或修改 `config/*.py`。数据库位置 `TURB_SQLITE_PATH` 和固定监听地址属于启动级设置，仍需在进程启动前准备。
 
@@ -186,17 +209,20 @@ Markdown 链接（`[说明](https://...)`）和聊天复制产生的反斜杠转
 
 ```bash
 OPEN_BROWSER=1 ./webui.sh start
-AUTH_CODE=你的授权码 ./webui.sh start
 VERBOSE=1 ./webui.sh start
 ```
 
 也可以前台启动：
 
 ```bash
-python web.py --open-browser
+uv run --locked python web.py
 ```
 
-前台启动同样使用 `127.0.0.1:5000`。启动前请先执行 `./webui.sh status`，避免多个进程同时读写同一份数据。
+这条命令只启动 `127.0.0.1:6666` 上的 Flask 后端；前端仍需在 `web/`
+目录执行 `npm run dev` 或 `npm run preview`，并通过
+`http://127.0.0.1:5555` 访问。两种 Vite 模式都会把 API 请求代理到
+`6666`。Unix 环境下启动前请先执行 `./webui.sh status`，避免多个进程同时
+读写同一份数据。
 
 ### 3.6 GPT账号注册、授权与手机号池资源
 
@@ -227,19 +253,19 @@ Codex 授权要完成 OAuth 登录和回调，至少需要：
 注册一个账号：
 
 ```bash
-python main.py
+uv run --locked python main.py
 ```
 
 批量注册 10 个账号、3 个并发线程，并在单个失败后继续：
 
 ```bash
-python main.py -n 10 --workers 3 --continue-on-fail
+uv run --locked python main.py -n 10 --workers 3 --continue-on-fail
 ```
 
 查看详细日志：
 
 ```bash
-python main.py -n 1 --verbose
+uv run --locked python main.py -n 1 --verbose
 ```
 
 常用参数：
@@ -259,7 +285,19 @@ CLI 批次归档也写入 SQLite；返回的 `accounts/...` 路径是稳定的�
 对已注册账号单独补跑 Codex：
 
 ```bash
-python scripts/operations/codex_oauth.py --email <已注册邮箱> --verbose
+uv run --locked python scripts/operations/codex_oauth.py --email <已注册邮箱> --verbose
+```
+
+协议接口诊断（不会把 token 写入文件）：
+
+```bash
+uv run --locked python scripts/diagnostics/chatgpt_curl_cffi.py --token '<JWT>' --verbose
+```
+
+分析脱敏后的 HAR 摘要：
+
+```bash
+uv run --locked python scripts/diagnostics/analyze_har_protocol.py /path/to/capture.har -o /tmp/protocol-summary.json
 ```
 
 无需启动 WebUI，也可以只读查询 SQLite：
@@ -285,7 +323,7 @@ with connect() as conn:
 
 ### 3.9 常见问题
 
-**配置保存后没有生效？** WebUI 保存的设置会写入 `.env` 并立即热加载；已经运行中的任务会继续使用启动时读取的值，新的任务才会使用新值。修改 `WEBUI_AUTH_CODE` 或 Session 密钥后，当前登录会话可能需要重新登录。直接修改 `config/*.py` 只影响默认值，通常需要重启 CLI 或 WebUI 才能重新读取。
+**配置保存后没有生效？** WebUI 保存的设置会写入 `.env` 并立即热加载；已经运行中的任务会继续使用启动时读取的值，新的任务才会使用新值。直接修改 `config/*.py` 只影响默认值，通常需要重启 CLI 或 WebUI 才能重新读取。
 
 **邮箱页面为什么是空的？** “邮箱”是后续邮箱注册能力的预留入口，当前注册素材和已有账号导入仍通过“设置”和“GPT账号”完成。
 
@@ -310,9 +348,12 @@ with connect() as conn:
 ├── main.py                         # CLI 兼容入口
 ├── web.py                          # WebUI 启动入口
 ├── webui.sh                        # 单实例 WebUI 管理脚本
+├── pyproject.toml                  # 项目元数据和依赖声明（uv）
+├── uv.lock                         # 锁定的可复现依赖解析结果
+├── .python-version                 # uv 使用的 Python 版本系列
 ├── apps/
 │   ├── cli/main.py                 # CLI 参数和批处理编排
-│   └── web/                        # Flask 管理服务、鉴权、配置编辑
+│   └── web/                        # Flask 管理服务、任务 API、配置编辑
 ├── config/                         # 可热加载的配置模块
 ├── core/                           # 邮箱、OAuth、浏览器客户端、SQLite 数据访问
 ├── registration/
@@ -332,7 +373,7 @@ with connect() as conn:
 
 ### 4.2 模块边界
 
-- `apps/web` 只负责 HTTP、鉴权、任务入口和展示所需的数据整形，不直接实现浏览器步骤。
+- `apps/web` 只负责 HTTP、任务入口和展示所需的数据整形，不直接实现浏览器步骤。
 - `registration/application` 负责注册任务生命周期；`registration/drivers` 通过统一接口实现具体浏览器或协议流程。
 - `core` 提供可复用客户端和业务服务；`core/db.py` 是业务数据访问层，`core/sqlite_store.py` 是通用 SQLite 存储适配器。
 - Web 管理服务和 CLI 都调用注册应用层，避免为两个入口复制注册逻辑。
@@ -348,21 +389,26 @@ npm ci
 npm run dev
 ```
 
-Vite 默认运行在 `http://127.0.0.1:5173`，`/api`、`/login` 和 `/logout` 代理到运行中的 Flask `127.0.0.1:5000`。生产构建：
+Vite dev 固定运行在 `http://127.0.0.1:5555`，将 `/api`
+代理到运行中的 Flask 后端 `http://127.0.0.1:6666`。生产构建和
+本地预览：
 
 ```bash
 npm run build
+npm run preview
 ```
 
-`web/dist/` 是 Flask 生产服务使用的构建产物；`web/node_modules/` 只属于本地开发环境，不应提交。
+Vite preview 同样固定运行在 `http://127.0.0.1:5555`，并使用相同代理访问
+`6666` 后端。`web/dist/` 是 preview 使用的构建产物；`web/node_modules/`
+只属于本地开发环境，不应提交。
 
 ### 4.4 测试与质量检查
 
 在项目根目录执行：
 
 ```bash
-source .venv/bin/activate
-PYTHONDONTWRITEBYTECODE=1 pytest -q
+uv sync --locked
+PYTHONDONTWRITEBYTECODE=1 uv run --locked pytest -q
 bash -n webui.sh
 git diff --check
 ```
@@ -373,7 +419,7 @@ git diff --check
 
 1. 未提交 `.env`、数据库、token、凭证或导出文件。
 2. 新增功能有对应测试或清晰的手工验证步骤。
-3. WebUI 仍只监听 `127.0.0.1:5000`，没有启动第二个生产实例。
+3. WebUI 仍只使用前端 `127.0.0.1:5555` 和后端 `127.0.0.1:6666`，没有启动第二组生产实例。
 4. 浏览器驱动能通过统一注册接口调用，未把驱动细节泄漏到 Web/API 层。
 
 ### 4.5 SQLite 与迁移约定

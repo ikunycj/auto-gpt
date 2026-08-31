@@ -459,12 +459,12 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
   }
 
   const phonePanel = showPhones ? <Card className="table-card relay-panel">
-    <SectionHeader title="手机号接码池" description={`${phoneTotal} 个号码或动态来源，维护状态、剩余次数和绑定关系。`} actions={<div className="section-actions">
+    <SectionHeader title="手机号接码池" description={`${phoneTotal} 个号码或动态来源，维护状态、剩余次数和绑定关系。`} actions={<>
       <Button icon={Upload} size="sm" onClick={() => setImportMode('phones')}>导入手机号</Button>
       <Button icon={Minus} size="sm" disabled={!phoneIds.length} onClick={() => runAction('/api/codex-relay/phones/available-uses', { phone_ids: phoneIds, delta: -1 }, '已减少可用次数', 'patch')}>-1</Button>
       <Button icon={Plus} size="sm" disabled={!phoneIds.length} onClick={() => runAction('/api/codex-relay/phones/available-uses', { phone_ids: phoneIds, delta: 1 }, '已增加可用次数', 'patch')}>+1</Button>
       <Button icon={Trash2} variant="danger" size="sm" disabled={!phoneIds.length} onClick={() => runAction('/api/codex-relay/phones', { phone_ids: phoneIds }, '已删除未绑定号码', 'delete')}>删除</Button>
-    </div>} />
+    </>} />
     <Toolbar><SearchField value={phoneQuery} onChange={setPhoneQuery} placeholder="搜索尾号或绑定邮箱…" /><Select value={phoneStatus} onChange={setPhoneStatus} options={[{ value: '', label: '全部状态' }, { value: 'available', label: '可用' }, { value: 'bound', label: '已绑定' }, { value: 'reserved', label: '已预留' }, { value: 'used', label: '已用尽' }, { value: 'invalid', label: '已失效' }]} /><RefreshButton onClick={refresh} loading={running} /></Toolbar>
     <Table><thead><tr><th className="check-col"><Checkbox checked={phones.filter((row) => !row.special).length > 0 && phones.filter((row) => !row.special).every((row) => phoneSelected.has(String(row.id || '')))} onChange={(checked) => setPhoneSelected(checked ? new Set(phones.filter((row) => !row.special).map((row) => String(row.id || ''))) : new Set())} /></th><th>手机号 / 来源</th><th>状态</th><th>可用次数</th><th>绑定账号</th></tr></thead><tbody>
       {loading ? <tr><td colSpan="5"><div className="table-loading"><span className="loading-bar" /><span className="loading-bar" /></div></td></tr> : phones.length === 0 ? <tr><td colSpan="5"><EmptyState title="没有手机号" description="导入接码手机号后，Codex 授权遇到短信验证时会自动取号。" /></td></tr> : phones.map((row) => { const id = String(row.id || ''); const state = phonePoolState(row); const special = Boolean(row.special); return <tr key={id} className={special ? 'phone-pool-special-row' : ''}><td>{special ? <span className="phone-special-mark">平台</span> : <Checkbox checked={phoneSelected.has(id)} onChange={(checked) => toggle(setPhoneSelected, id, checked)} />}</td><td className={special ? 'phone-special-source' : 'mono'}><strong>{special ? pretty(row.label || row.provider_label || '平台自动取号') : pretty(row.phone)}</strong>{special ? <small className="table-sub">{row.provider_label || row.provider || '接码平台'} · 动态号码</small> : null}</td><td><StatusPill value={state}>{state === 'used' ? '已用尽' : undefined}</StatusPill></td><td><strong>{special ? '动态' : pretty(row.available_uses ?? row.remaining_uses)}</strong>{row.reserved_count ? <small className="table-sub">占用 {row.reserved_count} 个任务</small> : null}</td><td>{special ? pretty(row.message || '授权时自动取号') : pretty(row.assigned_account_email)}</td></tr>; })}
@@ -472,7 +472,7 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
   </Card> : null;
 
   const accountPanel = showAccounts ? <Card className="table-card relay-panel gpt-account-panel">
-    <SectionHeader title="GPT账号" actions={<div className="section-actions">
+    <SectionHeader title="GPT账号" actions={<>
       <Button icon={Upload} size="sm" onClick={() => setImportMode('accounts')}>导入账号</Button>
       <Button icon={MailPlus} variant="primary" size="sm" onClick={() => setBatchRegisterOpen(true)}>注册新账号</Button>
       <Button icon={Activity} size="sm" disabled={!accountIds.length} onClick={() => registerSelected()}>注册选中</Button>
@@ -486,7 +486,7 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
       <Button icon={Download} size="sm" disabled={!accountIds.length} onClick={() => exportCredentials('rt')}>下载凭证</Button>
       <Button icon={Settings2} size="sm" onClick={() => { setSub2Open(true); loadSub2(); }}>sub2 服务</Button>
       <Button icon={Trash2} variant="danger" size="sm" disabled={!accountIds.length} onClick={() => softDeleteAccounts()}>删除</Button>
-    </div>} />
+    </>} />
     <Toolbar className="gpt-account-toolbar">
       <SearchField value={accountQuery} onChange={setAccountQuery} placeholder="搜索账号或备注…" />
       <Select value={providerFilter} onChange={setProviderFilter} options={[{ value: '', label: '邮箱来源' }, ...Object.entries(EMAIL_SOURCE_TEXT).map(([value, label]) => ({ value, label }))]} />

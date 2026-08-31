@@ -9,9 +9,8 @@ from core import generic_api_mail_client
 @pytest.fixture
 def web_client(tmp_path, monkeypatch):
     monkeypatch.setenv("TURB_SQLITE_PATH", str(tmp_path / "storage.sqlite3"))
-    app = create_app(auth_code="test-auth")
+    app = create_app()
     client = app.test_client()
-    client.environ_base["HTTP_X_AUTH_CODE"] = "test-auth"
     return client
 
 

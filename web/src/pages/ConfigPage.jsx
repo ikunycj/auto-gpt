@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDown, ArrowUp, AtSign, Cloud, CloudCog, Database, Info, KeyRound,
   Fingerprint, Globe2, Link2, Mail, MailPlus, Monitor, PanelsTopLeft, RefreshCw,
@@ -300,14 +300,14 @@ const BROWSER_LEGACY_KEYS = {
 };
 
 const GROUP_META = {
-  'WebUI 授权': '登录凭证和会话签名', '功能开关': '决定哪些自动流程运行',
+  '功能开关': '决定哪些自动流程运行',
   '代理浏览器': '浏览器驱动、指纹和运行参数', '人工节奏': '注册操作之间的随机等待',
   '代理池': '注册和查询使用的网络代理', '提链': '支付链接提取服务',
   Codex: '授权、Token 和同步服务', '接码平台': '手机号接码平台接口', 'Flow Trigger': '注册成功后的回调接口',
 };
 
 const SETTINGS_SECTIONS = [
-  { label: '运行与安全', groups: ['WebUI 授权', '功能开关', '人工节奏'] },
+  { label: '运行与安全', groups: ['功能开关', '人工节奏'] },
   { label: '浏览器与网络', groups: ['代理池'] },
   { label: '外部服务', groups: ['Codex', 'Flow Trigger', '提链', '接码平台'] },
 ];
@@ -401,8 +401,7 @@ export default function ConfigPage({ notify, summary, initialGroup = '', onOpenE
         const smsValid = normalized.startsWith('sms:') && SMS_CHANNELS.some((item) => `sms:${item.id}` === normalized);
         const groupValid = list.some((field) => !channelForField(field) && !smsChannelForField(field) && !browserModuleForField(field) && (field.group || '其他') === normalized);
         if (emailValid || browserValid || smsValid || groupValid) return normalized;
-        const firstGroup = list.find((field) => !channelForField(field) && !smsChannelForField(field) && !browserModuleForField(field))?.group || '';
-        return firstGroup || 'email:general';
+        return 'email:general';
       });
       setError('');
     } catch (loadError) {
@@ -578,11 +577,21 @@ function EmailChannelGroup({ channels, emailFields, draft, runtime, saving, load
 }
 
 function ConfigNavigation({ fields, emailFields, smsFields, browserFields, groups, activeKey, onSelect }) {
+  const navRef = useRef(null);
   const knownGroups = new Set(SETTINGS_SECTIONS.flatMap((section) => section.groups));
   const extraGroups = groups.filter((group) => !knownGroups.has(group));
+  useEffect(() => {
+    const revealActiveItem = () => {
+      const activeItem = navRef.current?.querySelector('.config-nav-item.is-active:not(.config-nav-parent)');
+      activeItem?.scrollIntoView({ block: 'nearest', inline: 'center' });
+    };
+    revealActiveItem();
+    window.addEventListener('resize', revealActiveItem);
+    return () => window.removeEventListener('resize', revealActiveItem);
+  }, [activeKey, fields]);
   const renderGroup = (group) => { const Icon = groupIcon(group); const count = fields.filter((field) => !channelForField(field) && !smsChannelForField(field) && !browserModuleForField(field) && (field.group || '其他') === group).length; return <button className={`config-nav-item ${activeKey === group ? 'is-active' : ''}`} key={group} title={GROUP_META[group] || group} onClick={() => onSelect(group)}><span className="config-nav-icon"><Icon size={15} /></span><span><strong>{group}</strong><small>{GROUP_META[group] || '运行参数'}</small></span><small>{count}</small></button>; };
   const renderBrowserNavigation = () => <><button className={`config-nav-item config-nav-parent ${activeKey.startsWith('browser:') ? 'is-active' : ''}`} title="代理浏览器总入口：先选择驱动，再进入对应浏览器模块填写参数" onClick={() => onSelect('browser:general')}><span className="config-nav-icon"><Globe2 size={15} /></span><span><strong>代理浏览器</strong><small>驱动、会话和指纹</small></span><small>{browserFields.length}</small></button><div className="config-browser-list">{BROWSER_MODULES.map((module) => { const Icon = module.icon; const count = fields.filter((field) => browserModuleForField(field) === module.id).length; return <button key={module.id} className={`config-nav-item config-browser-nav-item ${activeKey === `browser:${module.id}` ? 'is-active' : ''}`} title={module.tooltip} data-tooltip={module.tooltip} onClick={() => onSelect(`browser:${module.id}`)}><span className="config-nav-icon"><Icon size={14} /></span><span><strong>{module.label}</strong><small>{module.setup}</small></span><small>{count || '—'}</small></button>; })}</div></>;
-  return <Card className="config-nav"><div className="config-nav-heading"><ShieldCheck size={16} /><strong>配置目录</strong></div><div className="config-nav-label">邮箱与验证码</div><button className={`config-nav-item config-nav-parent ${activeKey.startsWith('email:') ? 'is-active' : ''}`} title="先准备邮箱渠道，再设置默认使用顺序" onClick={() => onSelect('email:general')}><span className="config-nav-icon"><Mail size={15} /></span><span><strong>邮箱与 OTP</strong><small>邮箱来源、收码与顺序</small></span><small>{emailFields.length}</small></button><div className="config-channel-list">{EMAIL_SETTING_GROUPS.map((group) => { const Icon = group.icon; const count = group.channelIds.reduce((total, channelId) => total + fields.filter((field) => channelForField(field) === channelId).length, 0); return <button key={group.id} className={`config-nav-item config-channel-nav-item ${activeKey === `email:${group.id}` ? 'is-active' : ''}`} title={group.tooltip} data-tooltip={group.tooltip} onClick={() => onSelect(`email:${group.id}`)}><span className="config-nav-icon"><Icon size={14} /></span><span><strong>{group.label}</strong><small>{group.navHint || group.description}</small></span><small>{count || '—'}</small></button>; })}</div><div className="config-nav-section"><div className="config-nav-divider" /><div className="config-nav-label">手机接码</div><button className={`config-nav-item config-nav-parent ${activeKey.startsWith('sms:') ? 'is-active' : ''}`} title="配置接码平台，并决定是否加入手机号池" onClick={() => onSelect('sms:general')}><span className="config-nav-icon"><Smartphone size={15} /></span><span><strong>接码平台</strong><small>平台、开关和动态取号</small></span><small>{smsFields.length}</small></button><div className="config-channel-list">{SMS_CHANNELS.map((channel) => { const Icon = channel.icon; const count = fields.filter((field) => smsChannelForField(field) === channel.id).length; return <button key={channel.id} className={`config-nav-item config-channel-nav-item ${activeKey === `sms:${channel.id}` ? 'is-active' : ''}`} title={channel.tooltip} data-tooltip={channel.tooltip} onClick={() => onSelect(`sms:${channel.id}`)}><span className="config-nav-icon"><Icon size={14} /></span><span><strong>{channel.label}</strong><small>{channel.navHint || channel.description}</small></span><small>{count || '—'}</small></button>; })}</div></div>{SETTINGS_SECTIONS.map((section) => <div className="config-nav-section" key={section.label}><div className="config-nav-divider" /><div className="config-nav-label">{section.label}</div>{section.label === '浏览器与网络' ? <><div className="config-browser-tree">{renderBrowserNavigation()}</div>{section.groups.filter((group) => groups.includes(group)).map(renderGroup)}</> : section.groups.filter((group) => groups.includes(group)).map(renderGroup)}</div>)}{extraGroups.length ? <div className="config-nav-section"><div className="config-nav-divider" /><div className="config-nav-label">其他设置</div>{extraGroups.map(renderGroup)}</div> : null}</Card>;
+  return <Card className="config-nav" ref={navRef}><div className="config-nav-heading"><ShieldCheck size={16} /><strong>配置目录</strong></div><div className="config-nav-label">邮箱与验证码</div><button className={`config-nav-item config-nav-parent ${activeKey.startsWith('email:') ? 'is-active' : ''}`} title="先准备邮箱渠道，再设置默认使用顺序" onClick={() => onSelect('email:general')}><span className="config-nav-icon"><Mail size={15} /></span><span><strong>邮箱与 OTP</strong><small>邮箱来源、收码与顺序</small></span><small>{emailFields.length}</small></button><div className="config-channel-list">{EMAIL_SETTING_GROUPS.map((group) => { const Icon = group.icon; const count = group.channelIds.reduce((total, channelId) => total + fields.filter((field) => channelForField(field) === channelId).length, 0); return <button key={group.id} className={`config-nav-item config-channel-nav-item ${activeKey === `email:${group.id}` ? 'is-active' : ''}`} title={group.tooltip} data-tooltip={group.tooltip} onClick={() => onSelect(`email:${group.id}`)}><span className="config-nav-icon"><Icon size={14} /></span><span><strong>{group.label}</strong><small>{group.navHint || group.description}</small></span><small>{count || '—'}</small></button>; })}</div><div className="config-nav-section"><div className="config-nav-divider" /><div className="config-nav-label">手机接码</div><button className={`config-nav-item config-nav-parent ${activeKey.startsWith('sms:') ? 'is-active' : ''}`} title="配置接码平台，并决定是否加入手机号池" onClick={() => onSelect('sms:general')}><span className="config-nav-icon"><Smartphone size={15} /></span><span><strong>接码平台</strong><small>平台、开关和动态取号</small></span><small>{smsFields.length}</small></button><div className="config-channel-list">{SMS_CHANNELS.map((channel) => { const Icon = channel.icon; const count = fields.filter((field) => smsChannelForField(field) === channel.id).length; return <button key={channel.id} className={`config-nav-item config-channel-nav-item ${activeKey === `sms:${channel.id}` ? 'is-active' : ''}`} title={channel.tooltip} data-tooltip={channel.tooltip} onClick={() => onSelect(`sms:${channel.id}`)}><span className="config-nav-icon"><Icon size={14} /></span><span><strong>{channel.label}</strong><small>{channel.navHint || channel.description}</small></span><small>{count || '—'}</small></button>; })}</div></div>{SETTINGS_SECTIONS.map((section) => <div className="config-nav-section" key={section.label}><div className="config-nav-divider" /><div className="config-nav-label">{section.label}</div>{section.label === '浏览器与网络' ? <><div className="config-browser-tree">{renderBrowserNavigation()}</div>{section.groups.filter((group) => groups.includes(group)).map(renderGroup)}</> : section.groups.filter((group) => groups.includes(group)).map(renderGroup)}</div>)}{extraGroups.length ? <div className="config-nav-section"><div className="config-nav-divider" /><div className="config-nav-label">其他设置</div>{extraGroups.map(renderGroup)}</div> : null}</Card>;
 }
 
 function ChannelGuide({ channel }) {

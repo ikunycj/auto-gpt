@@ -3,11 +3,11 @@
 WebUI 启动入口。
 
 用法：
-    python web.py                 # 默认 http://127.0.0.1:5000，仅本地访问，不自动打开浏览器
-    python web.py --open-browser  # 启动后自动打开浏览器
-    WebUI 仅支持 http://127.0.0.1:5000；请使用 ./webui.sh 管理服务。
+    uv run --locked python web.py                 # 后端 http://127.0.0.1:6666，仅本地访问
+    uv run --locked python web.py --open-browser  # 前端已运行时打开 http://127.0.0.1:5555
+    前端固定为 http://127.0.0.1:5555；请使用 ./webui.sh 同时管理前后端。
 
-与 CLI（python main.py）完全平行，互不影响。
+与 CLI（uv run --locked python main.py）完全平行，互不影响。
 """
 import argparse
 import logging
@@ -18,13 +18,17 @@ from pathlib import Path
 from threading import Timer
 
 from apps.web.app import create_app
-from apps.web.auth import is_generated_code
 from core import sqlite_store
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _WEBUI_LOG_PATH = _PROJECT_ROOT / "data" / "runtime" / "webui.log"
 _WEBUI_LOG_CATEGORY = "webui_process_logs"
+WEBUI_HOST = "127.0.0.1"
+FRONTEND_PORT = 5555
+BACKEND_PORT = 6666
+FRONTEND_URL = f"http://{WEBUI_HOST}:{FRONTEND_PORT}"
+BACKEND_URL = f"http://{WEBUI_HOST}:{BACKEND_PORT}"
 
 
 def _acquire_single_instance(port: int):
@@ -89,7 +93,7 @@ def _setup_logging(verbose: bool) -> None:
     sqlite_handler.setFormatter(formatter)
     root.addHandler(sqlite_handler)
 
-    # Keep foreground ``python web.py`` useful without making stdout the
+    # Keep foreground ``uv run --locked python web.py`` useful without making stdout the
     # background service's storage mechanism.
     stream_handler = logging.StreamHandler()
     stream_handler.setLevel(level)
@@ -99,21 +103,17 @@ def _setup_logging(verbose: bool) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="GPT 注册 WebUI 控制台")
-    parser.add_argument("--host", default="127.0.0.1", help=argparse.SUPPRESS)
-    parser.add_argument("--port", type=int, default=5000, help=argparse.SUPPRESS)
-    parser.add_argument("--open-browser", action="store_true", help="启动后自动打开浏览器")
-    parser.add_argument("--auth-code", default=None, help="WebUI 授权码；也可配置 .env: WEBUI_AUTH_CODE=...")
+    parser.add_argument("--host", default=WEBUI_HOST, help=argparse.SUPPRESS)
+    parser.add_argument("--port", type=int, default=BACKEND_PORT, help=argparse.SUPPRESS)
+    parser.add_argument("--open-browser", action="store_true", help="前端已运行时打开浏览器")
     parser.add_argument("--verbose", action="store_true", help="详细日志")
     args = parser.parse_args()
 
-    if args.host != "127.0.0.1" or args.port != 5000:
-        parser.error("WebUI 仅支持 http://127.0.0.1:5000")
+    if args.host != WEBUI_HOST or args.port != BACKEND_PORT:
+        parser.error(f"WebUI 后端仅支持 {BACKEND_URL}")
 
     _setup_logging(args.verbose)
     logger = logging.getLogger(__name__)
-
-    if args.auth_code:
-        os.environ["WEBUI_AUTH_CODE"] = args.auth_code
 
     try:
         instance_lock = _acquire_single_instance(args.port)
@@ -121,15 +121,11 @@ def main() -> None:
         logger.error(str(exc))
         raise SystemExit(2) from exc
 
-    app = create_app(auth_code=args.auth_code)
-    url = "http://127.0.0.1:5000"
-    logger.info(f"WebUI 已启动：{url}")
-    if is_generated_code():
-        from apps.web.auth import expected_auth_code
-        logger.warning("未配置 WEBUI_AUTH_CODE/AUTH_CODE，已生成本次临时授权码：%s", expected_auth_code())
+    app = create_app()
+    logger.info("WebUI 后端已启动：%s", BACKEND_URL)
     # 默认不自动打开浏览器；需要时显式传 --open-browser
     if args.open_browser:
-        Timer(1.0, lambda: webbrowser.open(url)).start()
+        Timer(1.0, lambda: webbrowser.open(FRONTEND_URL)).start()
 
     # debug=False：避免 reloader 双进程导致线程池/定时器重复
     try:

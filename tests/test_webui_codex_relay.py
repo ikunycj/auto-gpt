@@ -29,8 +29,7 @@ class CodexRelayWebUiTests(unittest.TestCase):
             patcher.start()
         relay._browser_controls.clear()
         relay._phone_locks.clear()
-        self.client = create_app(auth_code="test-auth").test_client()
-        self.client.environ_base["HTTP_X_AUTH_CODE"] = "test-auth"
+        self.client = create_app().test_client()
 
     def tearDown(self):
         for patcher in reversed(self.patchers):

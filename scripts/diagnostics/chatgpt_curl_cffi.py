@@ -9,16 +9,16 @@ ChatGPT backend-api 指纹环境请求测试脚本。
 
 用法：
     # 方式1：直接参数传 token
-    python3 scripts/diagnostics/chatgpt_curl_cffi.py --token '<JWT>' --verbose
+    uv run --locked python scripts/diagnostics/chatgpt_curl_cffi.py --token '<JWT>' --verbose
 
     # 方式2：从显式导出的 token 文件读取（默认取第一条非空行）
-    python3 scripts/diagnostics/chatgpt_curl_cffi.py --token-file /path/to/exported-tokens.txt
+    uv run --locked python scripts/diagnostics/chatgpt_curl_cffi.py --token-file /path/to/exported-tokens.txt
 
     # 方式3：测试 subscriptions，需要传 account_id
-    python3 scripts/diagnostics/chatgpt_curl_cffi.py --token '<JWT>' --endpoint subscriptions --account-id '<account_id>'
+    uv run --locked python scripts/diagnostics/chatgpt_curl_cffi.py --token '<JWT>' --endpoint subscriptions --account-id '<account_id>'
 
     # 代理：不传则沿用项目 pick_proxy()；传空字符串禁用代理；传具体地址使用指定代理
-    python3 scripts/diagnostics/chatgpt_curl_cffi.py --token '<JWT>' --proxy ''
+    uv run --locked python scripts/diagnostics/chatgpt_curl_cffi.py --token '<JWT>' --proxy ''
 
 说明：
     - 本脚本不会把 token 落盘。
@@ -36,7 +36,8 @@ from typing import Any, Dict, Optional
 from urllib.parse import quote
 
 # 让独立诊断脚本能 import 到项目根的 core / config
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# This file lives two directories below the project root (scripts/diagnostics).
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from core.session import BrowserSession  # noqa: E402

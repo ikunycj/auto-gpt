@@ -1641,7 +1641,7 @@ def run_browser_use_registration(
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise RuntimeError(
-            "缺少 playwright。请先执行: uv pip install playwright --python .venv/bin/python"
+            "缺少 playwright。请先执行: uv sync --locked"
         ) from exc
 
     provider = str(cloud_provider or "browser_use").strip().lower()

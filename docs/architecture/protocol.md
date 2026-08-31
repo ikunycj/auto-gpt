@@ -121,7 +121,7 @@ HAR 没有直接保存 `.js` 响应正文，但从 Sentinel `p[5]` 还原出被�
 ## 6. 重新生成摘要
 
 ```bash
-./scripts/diagnostics/analyze_har_protocol.py /path/to/capture.har -o /tmp/protocol-summary.json
+uv run --locked python scripts/diagnostics/analyze_har_protocol.py /path/to/capture.har -o /tmp/protocol-summary.json
 ```
 
 ## 7. `.env` 覆盖项

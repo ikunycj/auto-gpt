@@ -9,8 +9,7 @@ from apps.web.app import create_app
 
 class GPTMailWebUiTests(unittest.TestCase):
     def setUp(self):
-        self.client = create_app(auth_code="test-auth").test_client()
-        self.client.environ_base["HTTP_X_AUTH_CODE"] = "test-auth"
+        self.client = create_app().test_client()
 
     @patch("apps.web.app.svc.submit_registration")
     def test_jobs_rejects_gptmail_without_api_key_before_creating_tasks(self, submit_registration):

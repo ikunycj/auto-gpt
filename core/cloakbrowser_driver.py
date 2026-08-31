@@ -461,7 +461,7 @@ def build_cloak_driver(
     try:
         from cloakbrowser import launch, launch_persistent_context
     except ImportError as exc:
-        raise RuntimeError("未安装 cloakbrowser，请执行：pip install cloakbrowser") from exc
+        raise RuntimeError("未安装 cloakbrowser，请执行：uv sync --locked") from exc
 
     launch_args = list(getattr(_cfg, "CLOAK_EXTRA_ARGS", []) or [])
     seed = str(getattr(_cfg, "CLOAK_FINGERPRINT_SEED", "") or "").strip()

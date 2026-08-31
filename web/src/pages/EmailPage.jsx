@@ -292,13 +292,13 @@ export default function EmailPage({ notify, summary, onOpenSettings, onSummaryRe
     </div>
 
     <Card className="table-card email-management-panel">
-      <SectionHeader title="邮箱管理" actions={<div className="section-actions">
+      <SectionHeader title="邮箱管理" actions={<>
         <Button icon={Check} size="sm" disabled={!selectedKeys.length} onClick={() => updateStatus(selectedItems, 'available')}>标记可用</Button>
         <Button icon={Archive} size="sm" disabled={!selectedKeys.length} onClick={() => updateStatus(selectedItems, 'used')}>标记已用</Button>
         <Button icon={XCircle} size="sm" disabled={!selectedKeys.length} onClick={() => updateStatus(selectedItems, 'failed')}>标记失败</Button>
         <Button icon={Ban} size="sm" disabled={!selectedKeys.length} onClick={() => updateStatus(selectedItems, 'disabled')}>停用</Button>
         <Button icon={Trash2} variant="danger" size="sm" disabled={!selectedKeys.length} onClick={() => deleteItems(selectedItems)}>删除</Button>
-      </div>} />
+      </>} />
       <Toolbar className="filter-toolbar email-management-toolbar">
         <SearchField value={query} onChange={setQuery} placeholder="搜索邮箱、备注或来源…" />
         <Select value={source} onChange={setSource} options={SOURCES} />
