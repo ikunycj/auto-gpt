@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Archive, Ban, Check, Database, Inbox, Link2, MailPlus, Plus, Trash2,
+  Archive, Ban, Check, Database, Inbox, Link2, Plus, Trash2,
   Upload, XCircle,
 } from 'lucide-react';
 import { copyText, get, post } from '../api';
@@ -12,17 +12,10 @@ import {
 } from '../components/ui';
 
 const SOURCES = [
-  { value: 'all', label: '全部来源' },
+  { value: 'all', label: '全部邮箱' },
   { value: 'outlook', label: 'Outlook' },
   { value: 'generic_api', label: '接码 API' },
-  { value: 'cloudflare_domain', label: '域名邮箱' },
-  { value: 'cloudflare', label: 'Cloudflare Worker' },
-  { value: 'gptmail', label: 'GPTMail' },
-  { value: 'mailnest', label: 'MailNest' },
-  { value: 'cloudmail', label: 'CloudMail' },
 ];
-
-const FIXED_PROVIDER_SOURCES = ['cloudflare_domain', 'cloudflare', 'gptmail', 'mailnest', 'cloudmail'];
 
 const STATUSES = [
   { value: '', label: '全部状态' },
@@ -35,19 +28,6 @@ const STATUSES = [
 const SOURCE_LABELS = {
   outlook: 'Outlook',
   generic_api: '接码 API',
-  cloudflare_domain: '域名邮箱',
-  cloudflare: 'Cloudflare Worker',
-  gptmail: 'GPTMail',
-  mailnest: 'MailNest',
-  cloudmail: 'CloudMail',
-};
-
-const PROVIDER_SETTINGS_GROUP = {
-  cloudflare_domain: 'email:domain',
-  cloudflare: 'email:temporary',
-  gptmail: 'email:temporary',
-  mailnest: 'email:temporary',
-  cloudmail: 'email:temporary',
 };
 
 function sourceOf(row, fallback = 'outlook') {
@@ -74,7 +54,6 @@ function urlHost(value) {
 }
 
 function materialFor(row) {
-  if (row.fixed) return { value: '', preview: row.ready ? '自动领取邮箱' : '待完成配置' };
   const source = sourceOf(row);
   if (source === 'generic_api') {
     return { value: row.code_url || row.copy_line || '', preview: urlHost(row.code_url) };
@@ -82,7 +61,7 @@ function materialFor(row) {
   if (source === 'outlook') {
     return { value: row.copy_line || '', preview: 'OAuth 凭证' };
   }
-  return { value: '', preview: '域名邮箱' };
+  return { value: '', preview: '邮箱素材' };
 }
 
 function CopyValue({ value, preview, label, notify }) {
@@ -97,39 +76,6 @@ function CopyValue({ value, preview, label, notify }) {
     }
   };
   return <button type="button" className="copy-cell-button" title={`点击复制${label}`} onClick={copy}>{preview || text}</button>;
-}
-
-function fixedProviderRows(summary, source, status, query) {
-  const channels = Array.isArray(summary?.registration_email?.all_channels)
-    ? summary.registration_email.all_channels
-    : [];
-  const automatic = Boolean(summary?.registration_email?.automatic);
-  const normalizedQuery = String(query || '').trim().toLowerCase();
-  return channels
-    .filter((channel) => FIXED_PROVIDER_SOURCES.includes(channel.id))
-    .map((channel) => {
-      const enabled = automatic && Boolean(channel.enabled);
-      const ready = Boolean(channel.ready);
-      return {
-        fixed: true,
-        provider: true,
-        source: channel.id,
-        email: channel.label || SOURCE_LABELS[channel.id] || channel.id,
-        providerLabel: SOURCE_LABELS[channel.id] || channel.label || channel.id,
-        ready,
-        configured: Boolean(channel.configured),
-        enabled,
-        status: enabled && ready ? 'available' : 'disabled',
-        message: channel.message || (ready ? '配置完整，注册时自动领取邮箱' : '尚未完成配置'),
-      };
-    })
-    .filter((row) => source === 'all' || row.source === source)
-    .filter((row) => !status || row.status === status)
-    .filter((row) => {
-      if (!normalizedQuery) return true;
-      return [row.email, row.providerLabel, row.source, row.message]
-        .some((value) => String(value || '').toLowerCase().includes(normalizedQuery));
-    });
 }
 
 export default function EmailPage({ notify, summary, onOpenSettings, onSummaryRefresh }) {
@@ -151,15 +97,6 @@ export default function EmailPage({ notify, summary, onOpenSettings, onSummaryRe
 
   const load = useCallback(async () => {
     try {
-      // Generated providers do not have rows in the local SQLite pools. Their
-      // fixed status rows are derived from the summary below.
-      if (['cloudflare', 'gptmail', 'mailnest', 'cloudmail'].includes(source)) {
-        setRows([]);
-        setTotal(0);
-        setSelected(new Set());
-        setError('');
-        return;
-      }
       const response = await get('/api/outlook', {
         source,
         status,
@@ -183,15 +120,8 @@ export default function EmailPage({ notify, summary, onOpenSettings, onSummaryRe
   const { refresh, running } = usePolling(load, 5000, true);
   useEffect(() => { setPage(1); }, [debouncedQuery, pageSize, source, status]);
 
-  const fixedRows = useMemo(
-    () => fixedProviderRows(summary, source, status, debouncedQuery),
-    [debouncedQuery, source, status, summary],
-  );
-  const displayRows = useMemo(
-    () => (page === 1 ? [...fixedRows, ...rows] : rows),
-    [fixedRows, page, rows],
-  );
-  const displayTotal = total + fixedRows.length;
+  const displayRows = useMemo(() => rows, [rows]);
+  const displayTotal = total;
 
   const selectedKeys = useMemo(() => [...selected], [selected]);
   const selectedItems = useMemo(() => rows
@@ -235,29 +165,6 @@ export default function EmailPage({ notify, summary, onOpenSettings, onSummaryRe
     }
   }
 
-  async function toggleProvider(row) {
-    const runtime = summary?.registration_email;
-    const current = Array.isArray(runtime?.sources) ? runtime.sources : [];
-    if (!row.enabled && !row.ready) {
-      return notify(`${row.providerLabel}尚未完成配置，请先去配置`, 'warning');
-    }
-    const next = row.enabled
-      ? current.filter((item) => item !== row.source)
-      : [...current.filter((item) => item !== row.source), row.source];
-    try {
-      const response = await post('/api/config', {
-        updates: {
-          USE_EMAIL_SERVICE: next.length > 0,
-          EMAIL_SOURCE: next.join(','),
-        },
-      });
-      notify(response.note || (row.enabled ? `${row.providerLabel}已停用` : `${row.providerLabel}已启用`), 'success');
-      await onSummaryRefresh?.();
-    } catch (actionError) {
-      notify(actionError.message, 'error');
-    }
-  }
-
   async function importEmails() {
     if (!importText.trim()) return notify('请粘贴邮箱素材', 'warning');
     setImporting(true);
@@ -284,15 +191,14 @@ export default function EmailPage({ notify, summary, onOpenSettings, onSummaryRe
 
   return <div className="page-stack">
     <div className="page-intro">
-      <div><div className="eyebrow"><Inbox size={14} /> EMAIL WORKSPACE</div><h2>邮箱</h2></div>
+      <div><div className="eyebrow"><Inbox size={14} /> 邮箱来源</div><h2>邮箱</h2></div>
       <div className="intro-actions">
-        <Button icon={MailPlus} disabled title="邮箱注册暂未开放">注册邮箱</Button>
         <Button icon={Upload} variant="primary" onClick={() => setImportOpen(true)}>导入邮箱</Button>
       </div>
     </div>
 
     <Card className="table-card email-management-panel">
-      <SectionHeader title="邮箱管理" actions={<>
+      <SectionHeader title="已导入邮箱" actions={<>
         <Button icon={Check} size="sm" disabled={!selectedKeys.length} onClick={() => updateStatus(selectedItems, 'available')}>标记可用</Button>
         <Button icon={Archive} size="sm" disabled={!selectedKeys.length} onClick={() => updateStatus(selectedItems, 'used')}>标记已用</Button>
         <Button icon={XCircle} size="sm" disabled={!selectedKeys.length} onClick={() => updateStatus(selectedItems, 'failed')}>标记失败</Button>
@@ -315,27 +221,11 @@ export default function EmailPage({ notify, summary, onOpenSettings, onSummaryRe
         <th className="check-col"><Checkbox checked={allSelected} onChange={(checked) => setSelected(checked ? new Set(rows.map((row) => keyFor(row, source))) : new Set())} /></th>
         <th>邮箱</th><th>来源</th><th>接码凭证</th><th>状态</th><th>GPT账号</th><th>备注</th><th>时间</th><th>操作</th>
       </tr></thead><tbody>
-        {loading ? <tr><td colSpan="9"><div className="table-loading"><span className="loading-bar" /><span className="loading-bar" /><span className="loading-bar" /></div></td></tr> : displayRows.length === 0 ? <tr><td colSpan="9"><EmptyState title="暂无邮箱" description="导入 Outlook 或接码 API 邮箱后，可在这里统一维护。" action={<Button icon={Plus} size="sm" onClick={() => setImportOpen(true)}>导入邮箱</Button>} /></td></tr> : displayRows.map((row) => {
+        {loading ? <tr><td colSpan="9"><div className="table-loading"><span className="loading-bar" /><span className="loading-bar" /><span className="loading-bar" /></div></td></tr> : displayRows.length === 0 ? <tr><td colSpan="9"><EmptyState title="暂无已导入邮箱" description="这里仅显示手动导入的 Outlook 和接码 API 邮箱。" action={<Button icon={Plus} size="sm" onClick={() => setImportOpen(true)}>导入邮箱</Button>} /></td></tr> : displayRows.map((row) => {
           const rowSource = sourceOf(row, source);
           const rowKey = keyFor(row, source);
           const material = materialFor(row);
           const rowStatus = row.status || 'available';
-          if (row.fixed) {
-            return <tr key={rowKey} className="email-provider-row">
-              <td><span className="fixed-row-lock" title="固定渠道，不可删除">固定</span></td>
-              <td><strong>{row.providerLabel}</strong><small className="fixed-row-subtitle">固定邮箱来源</small></td>
-              <td><span className="source-tag source-tag-provider"><Database size={13} />{row.providerLabel}</span></td>
-              <td><span className="copy-cell-empty">{material.preview}</span></td>
-              <td><StatusPill value={rowStatus}>{row.enabled ? '已启用' : row.ready ? '未启用' : '待配置'}</StatusPill></td>
-              <td><span className="copy-cell-empty">注册时自动领取</span></td>
-              <td className="truncate" title={row.message || ''}>{row.message || '—'}</td>
-              <td className="cell-nowrap">—</td>
-              <td><div className="row-actions">
-                <Button size="sm" disabled={!row.enabled && !row.ready} onClick={() => toggleProvider(row)}>{row.enabled ? '停用' : '启用'}</Button>
-                <Button size="sm" onClick={() => onOpenSettings?.(PROVIDER_SETTINGS_GROUP[row.source] || 'email:temporary')}>配置</Button>
-              </div></td>
-            </tr>;
-          }
           return <tr key={rowKey}>
             <td><Checkbox checked={selected.has(rowKey)} onChange={(checked) => toggle(rowKey, checked)} /></td>
             <td><strong><CopyValue value={row.email} label="邮箱" notify={notify} /></strong></td>

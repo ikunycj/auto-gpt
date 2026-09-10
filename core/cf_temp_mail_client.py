@@ -74,7 +74,7 @@ def _base_url() -> str:
     base = _cfg_str("CLOUDFLARE_API_BASE")
     if not base:
         raise CFTempMailError(
-            "Cloudflare API 地址未配置，请填写 CLOUDFLARE_API_BASE（WebUI「配置 → 邮箱 / OTP」）。"
+            "Cloudflare API 地址未配置，请填写 CLOUDFLARE_API_BASE（WebUI「设置 → 邮箱设置」）。"
         )
     if not re.match(r"^https?://", base, re.I):
         base = "https://" + base

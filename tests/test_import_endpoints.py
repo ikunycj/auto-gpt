@@ -29,6 +29,33 @@ def test_webui_generic_api_import_uses_semantic_fields_and_configured_separators
     assert rows[0]["code_url"] == "https://mail.example/code"
 
 
+def test_webui_all_email_pool_contains_only_imported_sources(web_client, monkeypatch):
+    """The user-facing mailbox workspace must not expose generated domain mail."""
+    monkeypatch.setattr(
+        "apps.web.app.db.list_outlook_pool",
+        lambda status=None, limit=500: [{"email": "outlook@example.com", "created_at": "2026-01-02"}],
+    )
+    monkeypatch.setattr(
+        "apps.web.app.db.list_generic_api_email_pool",
+        lambda status=None, limit=500: [{"email": "api@example.com", "created_at": "2026-01-03"}],
+    )
+    monkeypatch.setattr(
+        "apps.web.app.db.list_domain_email_pool",
+        lambda status=None, limit=500: [{"email": "generated@example.com", "created_at": "2026-01-04"}],
+    )
+
+    response = web_client.get("/api/outlook?source=all")
+
+    assert response.status_code == 200
+    assert {row["email"] for row in response.get_json()} == {
+        "outlook@example.com",
+        "api@example.com",
+    }
+    explicit_domain = web_client.get("/api/outlook?source=cloudflare_domain")
+    assert explicit_domain.status_code == 200
+    assert [row["email"] for row in explicit_domain.get_json()] == ["generated@example.com"]
+
+
 def test_webui_generic_api_registered_import_keeps_legacy_token_and_totp(web_client):
     response = web_client.post("/api/outlook/import", json={
         "source": "generic_api",

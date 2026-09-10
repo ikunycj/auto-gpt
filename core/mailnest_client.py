@@ -38,7 +38,7 @@ def _cache_key(email: str) -> str:
 def _api_key() -> str:
     api_key = str(getattr(_email_cfg, "MAIL_NEST_API_KEY", "") or "").strip()
     if not api_key:
-        raise MailNestClientError("MailNest API Key 未配置，请填写 MailNest API Key（WebUI「配置 → 邮箱 / OTP」）。")
+        raise MailNestClientError("MailNest API Key 未配置，请填写 MailNest API Key（WebUI「设置 → 邮箱设置」）。")
     return api_key
 
 

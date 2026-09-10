@@ -1327,11 +1327,13 @@ def create_app() -> Flask:
             rows = []
             rows += _with_pool_source(db.list_outlook_pool(status=status, limit=fetch_limit), "outlook")
             rows += _with_pool_source(db.list_generic_api_email_pool(status=status, limit=fetch_limit), "generic_api")
-            rows += _with_pool_source(db.list_domain_email_pool(status=status, limit=fetch_limit), "cloudflare_domain")
             rows = sorted(rows, key=lambda x: str(x.get("created_at") or x.get("imported_at") or x.get("used_at") or ""), reverse=True)
         elif source == "generic_api":
             rows = _with_pool_source(db.list_generic_api_email_pool(status=status, limit=fetch_limit), "generic_api")
         elif source == "cloudflare_domain":
+            # Keep the explicit legacy endpoint available for diagnostics;
+            # the user-facing `source=all` workspace below intentionally omits
+            # generated domain/alias addresses.
             rows = _with_pool_source(db.list_domain_email_pool(status=status, limit=fetch_limit), "cloudflare_domain")
         else:
             rows = _with_pool_source(db.list_outlook_pool(status=status, limit=fetch_limit), "outlook")
@@ -2091,7 +2093,7 @@ def create_app() -> Flask:
             details = "；".join(f"{item['label']}：{item['message']}" for item in channels)
             return jsonify({
                 "ok": False,
-                "error": f"当前没有可用的邮箱渠道。{details}。请到「设置 → 邮箱与 OTP」完成配置。",
+                "error": f"当前没有可用的邮箱渠道。{details}。请到「设置 → 邮箱设置」完成配置。",
                 "registration_email": runtime,
             }), 400
 
@@ -2843,11 +2845,14 @@ def create_app() -> Flask:
 
     @app.post("/api/cloudmail/gen-token")
     def api_cloudmail_gen_token():
-        """手动生成 CloudMail Authorization Token，并把本次填写的 CloudMail 配置一并写入 .env。"""
+        """手动生成 CloudMail Authorization Token。
+
+        设置页编辑草稿时传入 ``persist=false``；未传该参数的旧 API 调用仍
+        保持原有的即时写入行为。
+        """
         data = request.get_json(silent=True) or {}
         try:
             from core.cloudmail_client import gen_token
-            from config.env_loader import write_env_values
 
             api_base = (data.get("api_base") or "").strip()
             admin_email = (data.get("email") or data.get("admin_email") or "").strip()
@@ -2859,28 +2864,31 @@ def create_app() -> Flask:
                 path=path,
                 base_url=api_base,
             )
-            updates = {"CLOUDMAIL_AUTH_TOKEN": token}
-            # 生成 Token 时用户通常尚未点“保存配置”；这里同步保存本次填写的字段，
-            # 避免 loadConfig() 后 API 地址/账号/密码被旧 .env 值覆盖。
-            if api_base:
-                updates["CLOUDMAIL_API_BASE"] = api_base
-            if admin_email:
-                updates["CLOUDMAIL_ADMIN_EMAIL"] = admin_email
-            if password:
-                updates["CLOUDMAIL_PASSWORD"] = password
-            if path:
-                updates["CLOUDMAIL_TOKEN_PATH"] = path
-            written = write_env_values(updates)
-            try:
-                import config as _config_pkg
-                _config_pkg.reload_all()
-            except Exception:
-                logger.exception("CloudMail Token 写入后热加载失败")
+            persist = data.get("persist", True) is not False
+            written = []
+            if persist:
+                from config.env_loader import write_env_values
+
+                updates = {"CLOUDMAIL_AUTH_TOKEN": token}
+                if api_base:
+                    updates["CLOUDMAIL_API_BASE"] = api_base
+                if admin_email:
+                    updates["CLOUDMAIL_ADMIN_EMAIL"] = admin_email
+                if password:
+                    updates["CLOUDMAIL_PASSWORD"] = password
+                if path:
+                    updates["CLOUDMAIL_TOKEN_PATH"] = path
+                written = write_env_values(updates)
+                try:
+                    import config as _config_pkg
+                    _config_pkg.reload_all()
+                except Exception:
+                    logger.exception("CloudMail Token 写入后热加载失败")
             return jsonify({
                 "ok": True,
                 "token": token,
                 "written": written,
-                "message": "CloudMail Token 已生成，且当前 CloudMail 配置已保存",
+                "message": "CloudMail Token 已生成并保存" if persist else "CloudMail Token 已生成，请点击顶部“保存”",
             })
         except Exception as exc:
             logger.exception("生成 CloudMail Token 失败")
@@ -2892,7 +2900,6 @@ def create_app() -> Flask:
         data = request.get_json(silent=True) or {}
         try:
             from core.cloudmail_client import fetch_domains
-            from config.env_loader import write_env_values
 
             updates = {}
             api_base = (data.get("api_base") or "").strip()
@@ -2907,24 +2914,37 @@ def create_app() -> Flask:
                 updates["CLOUDMAIL_PASSWORD"] = password
             if token:
                 updates["CLOUDMAIL_AUTH_TOKEN"] = token
-            if updates:
+            persist = data.get("persist", True) is not False
+            if persist and updates:
+                from config.env_loader import write_env_values
+
                 write_env_values(updates)
                 import config as _config_pkg
                 _config_pkg.reload_all()
 
-            domains = fetch_domains(force=True)
-            written = write_env_values({"CLOUDMAIL_DOMAINS": "\n".join(domains)})
-            try:
-                import config as _config_pkg
-                _config_pkg.reload_all()
-            except Exception:
-                logger.exception("CloudMail 域名写入后热加载失败")
+            domains = fetch_domains(
+                force=True,
+                base_url=api_base or None,
+                admin_email=admin_email or None,
+                password=password or None,
+                token=token or None,
+            )
+            written = []
+            if persist:
+                from config.env_loader import write_env_values
+
+                written = write_env_values({"CLOUDMAIL_DOMAINS": "\n".join(domains)})
+                try:
+                    import config as _config_pkg
+                    _config_pkg.reload_all()
+                except Exception:
+                    logger.exception("CloudMail 域名写入后热加载失败")
             return jsonify({
                 "ok": True,
                 "domains": domains,
                 "count": len(domains),
                 "written": written,
-                "message": f"已获取 {len(domains)} 个 CloudMail 可用域名并保存",
+                "message": f"已获取 {len(domains)} 个 CloudMail 可用域名并保存" if persist else f"已获取 {len(domains)} 个 CloudMail 可用域名，请点击顶部“保存”",
             })
         except Exception as exc:
             logger.exception("获取 CloudMail 域名失败")

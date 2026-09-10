@@ -159,8 +159,15 @@ def _request(path: str, body: dict | None = None):
     return payload.get("data")
 
 
-def _request_raw(method: str, path: str, *, body: dict | None = None, token: str | None = None):
-    url = _base_url() + path
+def _request_raw(
+    method: str,
+    path: str,
+    *,
+    body: dict | None = None,
+    token: str | None = None,
+    base_url: str | None = None,
+):
+    url = _base_url(base_url) + path
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = token
@@ -228,39 +235,62 @@ def _extract_domains(payload) -> list[str]:
     return []
 
 
-def _login_token() -> str:
-    email = str(getattr(_email_cfg, "CLOUDMAIL_ADMIN_EMAIL", "") or "").strip()
-    password = str(getattr(_email_cfg, "CLOUDMAIL_PASSWORD", "") or "").strip()
+def _login_token(
+    *,
+    email: str | None = None,
+    password: str | None = None,
+    base_url: str | None = None,
+) -> str:
+    email = str(email if email is not None else getattr(_email_cfg, "CLOUDMAIL_ADMIN_EMAIL", "") or "").strip()
+    password = str(password if password is not None else getattr(_email_cfg, "CLOUDMAIL_PASSWORD", "") or "").strip()
     if not email or not password:
         raise CloudMailError("CloudMail 管理员邮箱或密码为空，无法登录获取域名列表")
-    payload = _request_raw("POST", "/api/login", body={"email": email, "password": password})
+    payload = _request_raw(
+        "POST",
+        "/api/login",
+        body={"email": email, "password": password},
+        base_url=base_url,
+    )
     token = _extract_token(payload)
     logger.info("[CloudMail] 管理员登录成功，可用于获取隐藏域名列表")
     return token
 
 
-def fetch_domains(force: bool = False) -> list[str]:
+def fetch_domains(
+    force: bool = False,
+    *,
+    base_url: str | None = None,
+    admin_email: str | None = None,
+    password: str | None = None,
+    token: str | None = None,
+) -> list[str]:
     """从 CloudMail 平台获取可用邮箱域名列表。
 
     优先读取公开网站配置 `/api/setting/websiteConfig`；如果站点开启了登录页隐藏域名，
     再用管理员账号登录并读取 `/api/setting/query`。
     """
     global _DOMAIN_CACHE
+    has_overrides = any(value is not None for value in (base_url, admin_email, password, token))
     now = time.monotonic()
-    if not force and _DOMAIN_CACHE and now - _DOMAIN_CACHE[0] < DOMAIN_CACHE_TTL:
+    if not force and not has_overrides and _DOMAIN_CACHE and now - _DOMAIN_CACHE[0] < DOMAIN_CACHE_TTL:
         return list(_DOMAIN_CACHE[1])
 
     errors: list[str] = []
-    for method, path, token in (
+    for method, path, auth_mode in (
         ("GET", "/api/setting/websiteConfig", None),
         ("GET", "/api/setting/query", "__login__"),
     ):
         try:
-            auth = _login_token() if token == "__login__" else token
-            payload = _request_raw(method, path, token=auth)
+            auth = (
+                _login_token(email=admin_email, password=password, base_url=base_url)
+                if auth_mode == "__login__"
+                else token
+            )
+            payload = _request_raw(method, path, token=auth, base_url=base_url)
             domains = _extract_domains(payload)
             if domains:
-                _DOMAIN_CACHE = (now, domains)
+                if not has_overrides:
+                    _DOMAIN_CACHE = (now, domains)
                 logger.info("[CloudMail] 已从平台获取可用域名：%s", ",".join(domains))
                 return list(domains)
             errors.append(f"{path}: 响应中没有 domainList")

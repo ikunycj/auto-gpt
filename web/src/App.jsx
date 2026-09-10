@@ -66,6 +66,7 @@ export default function App() {
     return normalizeActiveTab(stored);
   });
   const [settingsGroup, setSettingsGroup] = useState('');
+  const [settingsDirty, setSettingsDirty] = useState(false);
   const [registrationRequested, setRegistrationRequested] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
   const [summary, setSummary] = useState(null);
@@ -95,19 +96,31 @@ export default function App() {
   }, [loadSummary]);
   const { refresh: refreshSummary, running: refreshing } = usePolling(pollSummary, 5000, true);
 
+  const confirmSettingsExit = useCallback(() => {
+    if (!settingsDirty) return true;
+    return window.confirm('设置有未保存修改，确定离开吗？');
+  }, [settingsDirty]);
   const changePage = useCallback((pageId) => {
+    if (pageId === active) return;
+    if (active === 'settings' && pageId !== 'settings' && !confirmSettingsExit()) return;
     setSettingsGroup('');
+    if (active === 'settings') setSettingsDirty(false);
     setActive(pageId);
-  }, []);
+  }, [active, confirmSettingsExit]);
   const openSettings = useCallback((group = '') => {
-    setSettingsGroup(group);
+    const nextGroup = group || '';
+    if (active === 'settings' && nextGroup !== settingsGroup && settingsDirty && !confirmSettingsExit()) return;
+    if (active === 'settings' && nextGroup === settingsGroup) return;
+    setSettingsGroup(nextGroup);
     setActive('settings');
-  }, []);
+  }, [active, confirmSettingsExit, settingsDirty, settingsGroup]);
   const openGptRegistration = useCallback(() => {
+    if (active === 'settings' && !confirmSettingsExit()) return;
     setSettingsGroup('');
+    if (active === 'settings') setSettingsDirty(false);
     setRegistrationRequested(true);
     setActive('gpt');
-  }, []);
+  }, [active, confirmSettingsExit]);
   const clearRegistrationRequest = useCallback(() => setRegistrationRequested(false), []);
 
   useEffect(() => { localStorage.setItem('gpt_console_active_tab', active); }, [active]);
@@ -122,8 +135,8 @@ export default function App() {
     const common = { notify, summary, onSummaryRefresh: refreshSummary };
     if (active === 'email') return <EmailPage {...common} onOpenSettings={openSettings} />;
     if (active === 'phones') return <RelayPage {...common} mode="phones" />;
-    if (active === 'settings') return <ConfigPage {...common} initialGroup={settingsGroup} onOpenEmail={() => changePage('email')} onOpenGptRegistration={openGptRegistration} />;
-    return <GptAccountsPage {...common} onOpenSettings={openSettings} registrationRequested={registrationRequested} onRegistrationRequestHandled={clearRegistrationRequest} />;
+    if (active === 'settings') return <ConfigPage {...common} initialGroup={settingsGroup} onOpenEmail={() => changePage('email')} onOpenGptRegistration={openGptRegistration} onDirtyChange={setSettingsDirty} />;
+    return <GptAccountsPage {...common} onOpenSettings={openSettings} onOpenEmail={() => changePage('email')} registrationRequested={registrationRequested} onRegistrationRequestHandled={clearRegistrationRequest} />;
   }, [active, changePage, clearRegistrationRequest, notify, openGptRegistration, openSettings, refreshSummary, registrationRequested, settingsGroup, summary]);
 
   if (!ready) return <LoadingView />;

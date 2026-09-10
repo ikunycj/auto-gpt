@@ -376,15 +376,15 @@ EDITABLE_FIELDS = [
     # ---- 邮箱 / OTP ----
     {
         "key": "USE_EMAIL_SERVICE", "file": "email.py", "type": "bool", "group": "邮箱 / OTP",
-        "label": "使用自动邮箱渠道", "help": "开启后从你勾选的渠道获取邮箱并自动收取验证码；关闭后使用下方的手动邮箱",
+        "label": "自动取邮箱", "help": "关闭后使用手动注册邮箱",
     },
     {
         "key": "REGISTER_EMAIL", "file": "register.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "手动注册邮箱", "help": "关闭自动邮箱渠道时使用。填写你能正常收信的邮箱，收到验证码后回到 GPT账号页面提交",
+        "label": "手动注册邮箱", "help": "关闭自动取邮箱时使用；验证码在 GPT 账号页提交",
     },
     {
         "key": "REGISTER_PASSWORD", "file": "register.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "注册密码", "help": "建议留空：注册优先使用邮箱 OTP；仅在 OpenAI 没有 OTP 入口且强制创建密码时使用，留空则为当前账号生成独立随机密码。纯协议注册始终使用邮箱 OTP",
+        "label": "注册密码", "help": "留空时优先使用邮箱 OTP，需要密码时自动生成",
         "storage": "env", "secret": True,
     },
     {
@@ -393,23 +393,23 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "OTP_MAX_WAIT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
-        "label": "验证码最长等待时间（秒）", "help": "超过这个时间仍未收到验证码，本次注册会标记为失败",
+        "label": "验证码最长等待（秒）", "help": "超时后本次注册失败",
     },
     {
         "key": "OTP_POLL_INTERVAL", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
-        "label": "检查新邮件间隔（秒）", "help": "系统每隔多少秒检查一次新验证码邮件",
+        "label": "查邮件间隔（秒）", "help": "检查新验证码的间隔",
     },
     {
         "key": "OTP_SETTLE_SECONDS", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
-        "label": "重复邮件等待时间（秒）", "help": "收到第一封邮件后短暂等待，避免误用较早的验证码；一般保持默认",
+        "label": "重复邮件等待（秒）", "help": "收到首封邮件后再等待一段时间",
     },
     {
         "key": "EMAIL_SOURCE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "默认邮箱渠道", "help": "勾选要默认使用的渠道，并在页面上调整优先顺序",
+        "label": "默认邮箱来源", "help": "选择默认来源并调整顺序；注册时可临时更换",
     },
     {
         "key": "EMAIL_IMPORT_SEPARATORS", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "导入分隔符", "help": "导入账号或邮箱时用于分开各项内容。多个分隔符用逗号隔开，默认支持 ---、----、| 和 ====",
+        "label": "导入分隔符", "help": "多个分隔符用逗号隔开",
     },
     {
         "key": "GPTMAIL_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",

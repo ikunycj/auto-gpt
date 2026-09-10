@@ -23,9 +23,9 @@ export function StatusPill({ value, children }) {
   return <span className={`status-pill status-${key}`}>{children || formatStatus(value)}</span>;
 }
 
-export function Button({ children, icon: Icon, variant = 'ghost', size = 'md', loading = false, ...props }) {
+export function Button({ children, icon: Icon, variant = 'ghost', size = 'md', loading = false, className = '', disabled = false, ...props }) {
   return (
-    <button className={`button button-${variant} button-${size}`} disabled={loading || props.disabled} {...props}>
+    <button {...props} className={`button button-${variant} button-${size}${className ? ` ${className}` : ''}`} disabled={loading || disabled}>
       {loading ? <LoaderCircle className="spin" size={15} /> : Icon ? <Icon size={15} strokeWidth={2} /> : null}
       {children}
     </button>
@@ -73,8 +73,8 @@ export function SearchField({ value, onChange, placeholder = '搜索…' }) {
   return <label className="search-field"><Search size={16} /><input value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} type="search" /></label>;
 }
 
-export function Select({ label, value, onChange, options, className = '' }) {
-  return <label className={`select-field ${className}`}>{label ? <span>{label}</span> : null}<select value={value} onChange={(event) => onChange(event.target.value)}>{options.map((option) => <option key={option.value ?? option} value={option.value ?? option}>{option.label ?? option}</option>)}</select></label>;
+export function Select({ label, value, onChange, options, className = '', ...props }) {
+  return <label className={`select-field ${className}`}>{label ? <span>{label}</span> : null}<select {...props} value={value} onChange={(event) => onChange(event.target.value)}>{options.map((option) => <option key={option.value ?? option} value={option.value ?? option}>{option.label ?? option}</option>)}</select></label>;
 }
 
 export function NumberField({ label, value, onChange, min = 1, max, step = 1 }) {

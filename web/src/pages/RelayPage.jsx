@@ -24,6 +24,7 @@ const EMAIL_SOURCE_TEXT = {
   outlook: 'Outlook', generic_api: '通用接码 API', cloudflare_domain: 'Cloudflare 域名',
   cloudflare: 'Cloudflare Worker', gptmail: 'GPTMail', mailnest: 'MailNest', cloudmail: 'CloudMail',
 };
+const IMPORTED_EMAIL_SOURCES = new Set(['outlook', 'generic_api']);
 
 function idOf(row) { return String(row?.relay_account_id || row?.id || row?.email || ''); }
 function pretty(value) { return value == null || value === '' ? '—' : String(value); }
@@ -87,7 +88,7 @@ function activeMaintenance(row) {
   return Boolean(job && ACTIVE_JOB_STATUSES.has(String(job.status || '').toLowerCase()));
 }
 
-export default function RelayPage({ notify, summary, mode = 'all', embedded = false, onOpenSettings, onSummaryRefresh, onRegistrationRequestHandled, registrationRequested = false }) {
+export default function RelayPage({ notify, summary, mode = 'all', embedded = false, onOpenSettings, onOpenEmail, onSummaryRefresh, onRegistrationRequestHandled, registrationRequested = false }) {
   const showPhones = mode === 'all' || mode === 'phones';
   const showAccounts = mode === 'all' || mode === 'accounts';
   const [accounts, setAccounts] = useState([]);
@@ -206,11 +207,30 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
   const allRegistrationChannels = Array.isArray(registrationEmail.all_channels) && registrationEmail.all_channels.length
     ? registrationEmail.all_channels
     : registrationChannels;
-  const readyRegistrationSources = new Set(allRegistrationChannels.filter((channel) => channel.ready).map((channel) => channel.id));
+  const importedChannels = allRegistrationChannels.filter((channel) => IMPORTED_EMAIL_SOURCES.has(channel.id));
+  const emailPoolChannel = {
+    id: 'pool',
+    label: '邮箱池',
+    kind: 'pool',
+    requires_import: true,
+    ready: importedChannels.some((channel) => channel.ready),
+    pool_sources: importedChannels.filter((channel) => channel.ready).map((channel) => channel.id),
+    message: importedChannels.some((channel) => channel.ready)
+      ? `已导入 ${importedChannels.reduce((total, channel) => total + Number(channel.available || 0), 0)} 个可用邮箱`
+      : '请先导入 Outlook 或接码 API 邮箱',
+  };
+  const registrationPickerChannels = [
+    emailPoolChannel,
+    ...allRegistrationChannels.filter((channel) => !IMPORTED_EMAIL_SOURCES.has(channel.id)),
+  ];
+  const readyRegistrationSources = new Set(registrationPickerChannels.filter((channel) => channel.ready).map((channel) => channel.id));
   const selectedRegistrationChannels = registrationEmailSources
     .filter((source) => readyRegistrationSources.has(source))
-    .map((source) => allRegistrationChannels.find((channel) => channel.id === source))
+    .map((source) => registrationPickerChannels.find((channel) => channel.id === source))
     .filter(Boolean);
+  const selectedRegistrationSourceIds = selectedRegistrationChannels.flatMap((channel) => (
+    channel.id === 'pool' ? (channel.pool_sources || []) : [channel.id]
+  ));
   const usingManualRegistration = !selectedRegistrationChannels.length && !registrationEmail.automatic && Boolean(registrationEmail.manual_configured);
   const registrationReady = selectedRegistrationChannels.length > 0 || usingManualRegistration;
   const registrationSourceText = selectedRegistrationChannels.map((channel) => channel.label || EMAIL_SOURCE_TEXT[channel.id] || channel.id).join(' → ') || (usingManualRegistration ? '手动邮箱' : '未选择');
@@ -222,7 +242,10 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
     const defaults = registrationEmail.automatic
       ? registrationSources.filter((source) => ready.has(source))
       : [];
-    setRegistrationEmailSources(defaults);
+    const pickerDefaults = defaults.some((source) => IMPORTED_EMAIL_SOURCES.has(source))
+      ? ['pool', ...defaults.filter((source) => !IMPORTED_EMAIL_SOURCES.has(source))]
+      : defaults;
+    setRegistrationEmailSources(pickerDefaults);
     onSummaryRefresh?.();
     // Defaults are intentionally reset only when the dialog opens. Summary
     // polling must not overwrite a user's in-progress selection or ordering.
@@ -273,7 +296,7 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
     setBatchRegistering(true);
     try {
       const payload = { count, workers };
-      if (selectedRegistrationChannels.length) payload.email_sources = selectedRegistrationChannels.map((channel) => channel.id);
+      if (selectedRegistrationSourceIds.length) payload.email_sources = selectedRegistrationSourceIds;
       const response = await post('/api/jobs', payload);
       const submitted = Number(response.submitted || 0);
       setBatchRegisterOpen(false);
@@ -546,7 +569,7 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
   </Card> : null;
 
   return <div className="page-stack">
-    {!embedded ? <div className="page-intro"><div><div className="eyebrow"><Smartphone size={14} /> {mode === 'phones' ? 'PHONE POOL' : 'GPT ACCOUNT WORKSPACE'}</div><h2>{mode === 'phones' ? '手机号池' : 'GPT账号'}</h2>{mode === 'phones' ? null : <p>注册、Codex 授权和手机接码统一显示在账号列表中。</p>}</div></div> : null}
+    {!embedded ? <div className="page-intro"><div><div className="eyebrow"><Smartphone size={14} /> {mode === 'phones' ? '号码资源' : '账号资源'}</div><h2>{mode === 'phones' ? '手机号池' : 'GPT账号'}</h2>{mode === 'phones' ? null : <p>注册、Codex 授权和手机接码统一显示在账号列表中。</p>}</div></div> : null}
     {error ? <ErrorState message={error} onRetry={load} /> : null}
     {showAccounts && manualOtpWaiting.length ? <div className="manual-otp-strip"><div><strong>{manualOtpWaiting.length} 个注册任务正在等待邮箱验证码</strong><small>验证码提交后，注册任务会自动继续。</small></div><div className="manual-otp-actions">{manualOtpWaiting.map((item) => <Button key={`${item.job_id || ''}:${item.email}`} size="sm" variant="primary" onClick={() => submitManualRegistrationOtp(item)}>{emailPreview(item.email)} · 提交验证码</Button>)}</div></div> : null}
     {phonePanel}
@@ -555,7 +578,7 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
     <Modal open={batchRegisterOpen} title="注册新 GPT 账号" wide onClose={() => setBatchRegisterOpen(false)} footer={<><Button onClick={() => setBatchRegisterOpen(false)}>取消</Button><Button icon={Settings2} onClick={() => { setBatchRegisterOpen(false); onOpenSettings?.('email:general'); }}>邮箱渠道设置</Button><Button icon={MailPlus} variant="primary" disabled={!registrationReady} loading={batchRegistering} onClick={registerNewAccounts}>开始注册</Button></>}>
       <div className="registration-channel-picker">
         <div className="registration-picker-heading"><div><strong>选择本次使用的邮箱渠道</strong><p>可以自由勾选；领取失败时按下方顺序尝试下一个渠道。</p></div><span>{selectedRegistrationChannels.length ? `已选 ${selectedRegistrationChannels.length} 个` : usingManualRegistration ? '手动邮箱' : '尚未选择'}</span></div>
-        <div className="source-picker-options registration-source-options">{allRegistrationChannels.map((channel) => { const selected = registrationEmailSources.includes(channel.id) && channel.ready; const imported = Boolean(channel.requires_import); return <label key={channel.id} className={`source-option registration-source-option ${selected ? 'is-selected' : ''} ${channel.ready ? '' : 'is-disabled'}`} title={channel.message || (channel.ready ? '可以使用' : '尚未完成配置')}><input type="checkbox" checked={selected} disabled={!channel.ready} onChange={() => toggleRegistrationSource(channel.id)} /><span><strong>{channel.label || EMAIL_SOURCE_TEXT[channel.id] || channel.id}<em>{imported ? '导入邮箱' : '自动获取'}</em></strong><small>{channel.message || (channel.ready ? '配置完整，可以使用' : '请先到设置页完成配置')}</small></span><b>{channel.ready ? '可用' : '需配置'}</b></label>; })}</div>
+        <div className="source-picker-options registration-source-options">{registrationPickerChannels.map((channel) => { const selected = registrationEmailSources.includes(channel.id) && channel.ready; const imported = Boolean(channel.requires_import); const settingsGroup = channel.id === 'pool' ? 'email:general' : (channel.id === 'cloudflare_domain' ? 'email:domain' : 'email:temporary'); const configure = channel.id === 'pool' ? onOpenEmail : () => onOpenSettings?.(settingsGroup); return <div className="registration-source-row" key={channel.id}><label className={`source-option registration-source-option ${selected ? 'is-selected' : ''} ${channel.ready ? '' : 'is-disabled'}`} title={channel.message || (channel.ready ? '可以使用' : '尚未完成配置')}><input type="checkbox" checked={selected} disabled={!channel.ready} onChange={() => toggleRegistrationSource(channel.id)} /><span><strong>{channel.label || EMAIL_SOURCE_TEXT[channel.id] || channel.id}<em>{imported ? '导入邮箱' : '自动获取'}</em></strong><small>{channel.message || (channel.ready ? '配置完整，可以使用' : '尚未完成配置')}</small></span><b>{channel.ready ? '可用' : '需配置'}</b></label>{!channel.ready ? <Button size="sm" onClick={() => { setBatchRegisterOpen(false); configure?.(); }}>{channel.id === 'pool' ? '去导入' : '去配置'}</Button> : null}</div>; })}</div>
         <div className="source-order registration-source-order"><div className="source-order-heading"><strong>本次优先顺序</strong><span>{selectedRegistrationChannels.length ? '数字越靠前越优先' : '勾选渠道后可调整'}</span></div>{selectedRegistrationChannels.length ? selectedRegistrationChannels.map((channel, index) => <div className="source-order-row" key={channel.id}><span className="source-order-number">{index + 1}</span><span>{channel.label || EMAIL_SOURCE_TEXT[channel.id] || channel.id}</span><span className="source-order-actions"><IconButton label="上移" icon={ArrowUp} size={14} disabled={index === 0} onClick={() => moveRegistrationSource(channel.id, -1)} /><IconButton label="下移" icon={ArrowDown} size={14} disabled={index === selectedRegistrationChannels.length - 1} onClick={() => moveRegistrationSource(channel.id, 1)} /></span></div>) : <span className="source-order-empty">未就绪的渠道会保持灰色；请先导入邮箱或到设置页补全配置。</span>}</div>
         {usingManualRegistration ? <div className="registration-manual-note"><strong>当前使用设置中的手动邮箱</strong><span>本次只能注册 1 个账号，收到验证码后需在 GPT账号页面提交。</span></div> : null}
       </div>
@@ -567,7 +590,7 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
 
     <Modal open={Boolean(importMode)} title={importMode === 'phones' ? '导入手机号' : '导入 ChatGPT 账号'} onClose={() => setImportMode(null)} wide footer={<><Button onClick={() => setImportMode(null)}>取消</Button><Button icon={Upload} variant="primary" onClick={submitImport}>导入</Button></>}>
       <label className="field-label">粘贴素材<textarea rows="12" value={importText} onChange={(event) => setImportText(event.target.value)} placeholder={importMode === 'phones' ? '手机号----取码 URL----可用次数' : '每行一个账号；邮箱、HTTP 接码地址、密码、2FA 顺序不限'} spellCheck="false" /></label>
-      {importMode === 'phones' ? <p className="field-help">每行一个手机号，字段之间使用已配置的分隔符。</p> : <p className="field-help">按内容自动识别邮箱、HTTP 接码地址、2FA 和密码，无需固定字段顺序；<button type="button" className="field-help-link" onClick={() => { setImportMode(null); onOpenSettings?.('邮箱 / OTP'); }}>点击设置分隔符</button></p>}
+      {importMode === 'phones' ? <p className="field-help">每行一个手机号，字段之间使用已配置的分隔符。</p> : <p className="field-help">按内容自动识别邮箱、HTTP 接码地址、2FA 和密码，无需固定字段顺序；<button type="button" className="field-help-link" onClick={() => { setImportMode(null); onOpenSettings?.('email:general'); }}>点击设置分隔符</button></p>}
     </Modal>
 
     <Modal open={Boolean(editAccount)} title={`编辑 ChatGPT 账号 · ${editAccount?.email || ''}`} onClose={() => setEditAccount(null)} wide footer={<><Button onClick={() => setEditAccount(null)}>取消</Button><Button variant="primary" icon={Check} onClick={saveEditor}>保存账号</Button></>}>

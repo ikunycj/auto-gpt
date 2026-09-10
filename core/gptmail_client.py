@@ -38,7 +38,7 @@ def _headers() -> dict[str, str]:
     api_key = str(getattr(_email_cfg, "GPTMAIL_API_KEY", "") or "").strip()
     if not api_key:
         raise GPTMailError(
-            "GPTMail API Key 未配置，请填写 GPTMail API Key（WebUI「配置 → 邮箱 / OTP」）。"
+            "GPTMail API Key 未配置，请填写 GPTMail API Key（WebUI「设置 → 邮箱设置」）。"
         )
     return {"Accept": "application/json", "X-API-Key": api_key}
 
