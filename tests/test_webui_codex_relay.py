@@ -216,7 +216,7 @@ class CodexRelayWebUiTests(unittest.TestCase):
         self.assertEqual(stored[0]["login_method"], "email_otp")
         self.assertEqual(stored[0].get("chatgpt_password") or "", "")
 
-    def test_unified_authorize_reports_empty_phone_pool_before_starting_jobs(self):
+    def test_unified_authorize_starts_without_phone_pool_precheck(self):
         registered_row = {
             "id": "registered:19",
             "email": "no-phone@example.com",
@@ -234,14 +234,16 @@ class CodexRelayWebUiTests(unittest.TestCase):
         }
 
         with patch.object(gpt_account_service, "list_accounts", return_value=[registered_row]), \
-                patch.object(gpt_account_service, "authorization_material", return_value=material):
+                patch.object(gpt_account_service, "authorization_material", return_value=material), \
+                patch.object(relay, "_run_job", return_value=None):
             response = self.client.post("/api/gpt-accounts/authorize", json={
                 "account_ids": ["registered:19"],
             })
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("手机号池可用资源不足", response.get_json()["error"])
-        self.assertEqual(relay._read(relay._JOBS_PATH), [])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["submitted"], 1)
+        self.assertEqual(len(relay._read(relay._JOBS_PATH)), 1)
+        self.assertEqual(relay._read(relay._PHONES_PATH), [])
 
     def test_verification_requires_matching_wait_state(self):
         relay._write(relay._JOBS_PATH, [{

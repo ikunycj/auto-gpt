@@ -531,7 +531,34 @@ def _login_step_state(driver) -> str:
     return ""
 
 
-def _submit_login_password(driver, password: str, timeout: int = 25) -> str:
+def _has_visible_email_input(driver) -> bool:
+    """Return whether the email entry form is still rendered.
+
+    The OpenAI login page occasionally ignores the first synthetic click while
+    the React form is hydrating.  Keeping this check separate from the
+    password selectors lets the caller retry the email submit only while that
+    form is genuinely present.
+    """
+    try:
+        return bool(driver.execute_script(r"""
+            const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+              && getComputedStyle(el).visibility !== 'hidden'
+              && getComputedStyle(el).display !== 'none'
+              && !el.disabled && !el.readOnly;
+            return [...document.querySelectorAll(
+              'input[type="email"],input[name="email"],input[name="username"],input[autocomplete*="email"]'
+            )].some(visible);
+        """))
+    except Exception:
+        return False
+
+
+def _submit_login_password(
+    driver,
+    password: str,
+    timeout: int = 25,
+    email: str | None = None,
+) -> str:
     """Fill the existing-account password step, or report an already-reached challenge.
 
     Returns ``submitted`` for a password submission, ``email_otp`` when the
@@ -546,12 +573,26 @@ def _submit_login_password(driver, password: str, timeout: int = 25) -> str:
         "input[autocomplete='current-password']",
     ]
     passwordless_retries = 0
+    email_submit_retries = 0
     while time.time() < end:
         try:
             state = _login_step_state(driver)
             if state:
                 logger.info("[Codex][Browser] 密码输入框出现前已进入后续页面：%s", state)
                 return state
+            # A first click can be swallowed while the login page hydrates. If
+            # the email form is still visible, resubmit it once before waiting
+            # for the password field. This avoids looping on /log-in forever
+            # while never disturbing a page that has already advanced.
+            if email_submit_retries < 2 and _has_visible_email_input(driver):
+                email_submit_retries += 1
+                try:
+                    _submit_email_step(driver, email)
+                    logger.info("[Codex][Browser] 密码页未出现，检测到邮箱表单仍在页面，已重试提交（%s/2）", email_submit_retries)
+                    time.sleep(0.8)
+                    continue
+                except Exception as submit_exc:
+                    logger.debug("[Codex][Browser] 重试邮箱提交失败：%s", str(submit_exc)[:160])
             field = _find_any(driver, selectors, timeout=2)
             field.clear()
             field.send_keys(password)
@@ -759,7 +800,7 @@ def _fill_email_and_otp(
     _submit_email_step(driver, email)
     if login_password:
         logger.info("[Codex][Browser] 已提交邮箱，等待已有账号密码页")
-        password_state = _submit_login_password(driver, login_password)
+        password_state = _submit_login_password(driver, login_password, email=email)
         if password_state == "email_otp":
             logger.info("[Codex][Browser] 密码页未出现，当前已进入邮箱 OTP 页面")
         elif password_state == "next":

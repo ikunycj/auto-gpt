@@ -95,15 +95,17 @@ def test_chrome_command_uses_normal_process_and_isolated_profile(tmp_path):
     assert not any(arg in {"--enable-automation", "--disable-blink-features=AutomationControlled"} for arg in command)
 
 
-def test_chrome_command_rejects_authenticated_proxy(tmp_path):
-    with pytest.raises(RuntimeError, match="带账号密码"):
-        chrome_cdp._build_chrome_command(
-            "/path/to/chrome",
-            9333,
-            str(tmp_path),
-            "http://user:password@proxy.example:8080",
-            False,
-        )
+def test_chrome_command_uses_bridge_without_proxy_credentials(tmp_path):
+    command = chrome_cdp._build_chrome_command(
+        "/path/to/chrome",
+        9333,
+        str(tmp_path),
+        "http://127.0.0.1:45678",
+        False,
+    )
+
+    assert "--proxy-server=http://127.0.0.1:45678" in command
+    assert not any(item.startswith("--load-extension=") for item in command)
 
 
 def test_driver_quit_closes_owned_browser_and_removes_profile(tmp_path):

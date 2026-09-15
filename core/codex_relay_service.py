@@ -4203,17 +4203,11 @@ def start_jobs(account_ids: list[str], workers: int = 1, phone_ids: list[str] | 
             raise ValueError("选中的手机号缺少短信取码 URL")
         if selected_phone_ids and any(row.get("invalid") for row in selected_phones):
             raise ValueError("选中的手机号或短信 URL 已被标记为失效，请更换素材")
-        candidate_phones = [
-            row for row in sorted(phones, key=lambda item: int(item.get("seq") or 0))
-            if row.get("phone") and row.get("sms_code_url") and not row.get("invalid")
-        ]
-        if selected_phone_ids:
-            candidate_phones = selected_phones
+        candidate_phones = selected_phones if selected_phone_ids else []
 
-        # A configured SMS platform is a dynamic source rather than a
-        # persisted phone row. It has no static ``available_uses`` value, so
-        # jobs are admitted here and the real provider reports NO_BALANCE or
-        # NO_NUMBERS when the worker actually requests a number.
+        # Phone verification is demand driven.  Do not inspect or reserve
+        # pool capacity while queuing OAuth jobs; the worker acquires a number
+        # only after OpenAI actually presents the phone verification page.
         platform_state = _sms_platform_state()
         platform_candidate = None
         if not selected_phone_ids and platform_state["enabled"] and platform_state["ready"]:
@@ -4228,26 +4222,6 @@ def start_jobs(account_ids: list[str], workers: int = 1, phone_ids: list[str] | 
                 "reserved_job_ids": [],
             }
             candidate_phones = [platform_candidate, *candidate_phones]
-        if platform_state["enabled"] and not platform_state["ready"] and not candidate_phones:
-            raise ValueError("已开启接码平台，但配置未完成：" + "、".join(platform_state["missing"]))
-
-        free_slots: dict[str, int] = {}
-        for phone in candidate_phones:
-            if phone.get("special"):
-                continue
-            reserved, available = _phone_capacity(phone)
-            free_slots[str(phone.get("id") or "")] = max(0, available - reserved)
-        available_capacity = sum(free_slots.values())
-        if platform_candidate is not None:
-            # Dynamic platform capacity is intentionally not guessed from a
-            # balance API that these providers do not expose.
-            free_slots[str(platform_candidate["id"])] = len(ids)
-            available_capacity += len(ids)
-        if available_capacity < len(ids):
-            raise ValueError(
-                f"手机号池可用资源不足：本批授权需要 {len(ids)} 次，当前可预留 {available_capacity} 次；"
-                "请先在手机号池导入号码或增加可用次数"
-            )
 
         rows = _read(_JOBS_PATH)
         for account_id in ids:
@@ -4263,36 +4237,28 @@ def start_jobs(account_ids: list[str], workers: int = 1, phone_ids: list[str] | 
                 "created_at": _now(),
             }
             bound_key = _phone_key(known[account_id].get("phone")) if known[account_id].get("phone_verified_at") else ""
-            eligible = [
-                phone for phone in candidate_phones
-                if free_slots.get(str(phone.get("id") or ""), 0) > 0
-            ]
-            eligible.sort(key=lambda phone: (
-                0 if bound_key and _phone_key(phone.get("phone")) == bound_key else 1,
-                int(phone.get("seq") or 0),
-            ))
-            hint = eligible[0]
-            hint_id = str(hint.get("id") or "")
-            free_slots[hint_id] -= 1
+            # Keep a hint only for an explicitly selected phone or a ready
+            # dynamic provider.  No pool row is reserved at queue time.
+            hint = None
+            if candidate_phones:
+                eligible = list(candidate_phones)
+                eligible.sort(key=lambda phone: (
+                    0 if bound_key and _phone_key(phone.get("phone")) == bound_key else 1,
+                    int(phone.get("seq") or 0),
+                ))
+                hint = eligible[0]
+            hint_id = str((hint or {}).get("id") or "")
             job["phone_override"] = {
                 "phone_ids": selected_phone_ids,
                 "phone_hint_id": hint_id,
                 "phone_id": hint_id,
-                "phone": hint.get("phone") or "",
-                "sms_code_url": hint.get("sms_code_url") or "",
-                "source_type": "platform" if hint.get("special") else "phone_pool",
-                "platform_provider": hint.get("provider") or "",
+                "phone": (hint or {}).get("phone") or "",
+                "sms_code_url": (hint or {}).get("sms_code_url") or "",
+                "source_type": "platform" if (hint or {}).get("special") else "phone_pool",
+                "platform_provider": (hint or {}).get("provider") or "",
             }
-            if not hint.get("special"):
-                reservations = _id_list(hint.get("reserved_job_ids"))
-                reservations.append(job["id"])
-                hint["reserved_job_ids"] = reservations
-                hint.pop("deferred_job_ids", None)
-                hint["updated_at"] = _now()
-            elif hint.get("special"):
-                # Keep dynamic reservations in the job payload only. The
-                # synthetic row is intentionally not persisted in relay_phones.
-                pass
+            # Dynamic provider rows are synthetic and persisted phone rows are
+            # intentionally untouched until a worker actually needs SMS.
             rows.append(job)
             jobs.append(job)
             _active_accounts.add(account_id)

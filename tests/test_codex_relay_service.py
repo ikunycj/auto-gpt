@@ -657,7 +657,7 @@ def test_reused_phone_lists_every_bound_account_email(relay_storage):
     assert public["available_uses"] == 0
 
 
-def test_default_authorization_reserves_distinct_candidates_by_import_order(relay_storage, monkeypatch):
+def test_default_authorization_does_not_reserve_candidates_before_sms(relay_storage, monkeypatch):
     relay.import_accounts("first@example.com----https://mail.example/first\nsecond@example.com----https://mail.example/second")
     relay.import_phones("+14155550111----https://sms.example/one\n+14155550222----https://sms.example/two")
     accounts = {row["email"]: row["id"] for row in relay._read(relay._ACCOUNTS_PATH)}
@@ -666,9 +666,9 @@ def test_default_authorization_reserves_distinct_candidates_by_import_order(rela
     relay.start_jobs([accounts["first@example.com"], accounts["second@example.com"]], workers=2)
 
     jobs = relay._read(relay._JOBS_PATH)
-    assert [job["phone_override"]["phone"] for job in jobs] == ["+14155550111", "+14155550222"]
+    assert [job["phone_override"]["phone"] for job in jobs] == ["", ""]
     phones = relay._read(relay._PHONES_PATH)
-    assert all(len(row.get("reserved_job_ids") or []) == 1 for row in phones)
+    assert all(len(row.get("reserved_job_ids") or []) == 0 for row in phones)
     assert all(not row.get("assigned_account_id") for row in phones)
 
 
@@ -690,7 +690,7 @@ def test_phone_reservation_tracks_capacity_without_consuming_use_count(relay_sto
     assert relay.list_phones(status="available") == []
 
 
-def test_authorization_refuses_to_start_when_phone_pool_is_empty(relay_storage, monkeypatch):
+def test_authorization_starts_without_phone_pool_when_sms_is_not_needed(relay_storage, monkeypatch):
     relay.import_accounts("user@example.com----https://mail.example/code")
     account = relay._read(relay._ACCOUNTS_PATH)[0]
     monkeypatch.setattr(relay, "_run_job", lambda *args: None)
@@ -698,22 +698,21 @@ def test_authorization_refuses_to_start_when_phone_pool_is_empty(relay_storage, 
     monkeypatch.setattr(relay.sms_provider._cfg, "FIXED_SMS_PHONE", "+8613464925132", raising=False)
     monkeypatch.setattr(relay.sms_provider._cfg, "FIXED_SMS_CODE_URL", "https://sms.example/legacy", raising=False)
 
-    with pytest.raises(ValueError, match=r"手机号池可用资源不足.*当前可预留 0 次"):
-        relay.start_jobs([account["id"]], workers=1)
+    result = relay.start_jobs([account["id"]], workers=1)
+    assert result["submitted"] == 1
+    assert len(relay._read(relay._JOBS_PATH)) == 1
+    assert relay._read(relay._PHONES_PATH) == []
 
-    assert relay._read(relay._JOBS_PATH) == []
 
-
-def test_authorization_refuses_batch_when_phone_pool_capacity_is_insufficient(relay_storage, monkeypatch):
+def test_authorization_does_not_reserve_phone_pool_capacity_up_front(relay_storage, monkeypatch):
     relay.import_accounts("one@example.com----https://mail.example/one\ntwo@example.com----https://mail.example/two")
     relay.import_phones("+14155550123----https://sms.example/code----1")
     accounts = [row["id"] for row in relay._read(relay._ACCOUNTS_PATH)]
     monkeypatch.setattr(relay, "_run_job", lambda *args: None)
 
-    with pytest.raises(ValueError, match=r"本批授权需要 2 次，当前可预留 1 次"):
-        relay.start_jobs(accounts, workers=2)
-
-    assert relay._read(relay._JOBS_PATH) == []
+    result = relay.start_jobs(accounts, workers=2)
+    assert result["submitted"] == 2
+    assert len(relay._read(relay._JOBS_PATH)) == 2
     assert relay._read(relay._PHONES_PATH)[0].get("reserved_job_ids") == []
 
 

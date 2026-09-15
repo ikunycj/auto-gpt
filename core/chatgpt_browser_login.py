@@ -114,7 +114,7 @@ def authenticate_chatgpt_with_password(
         _maybe_accept(driver)
         _type_email_address(driver, email, timeout=20)
         _submit_email_step(driver, email)
-        password_state = _submit_login_password(driver, password, timeout=25)
+        password_state = _submit_login_password(driver, password, timeout=25, email=email)
         if password_state == "email_otp":
             raise PasswordLoginUnavailable("OpenAI 当前直接要求邮箱验证码，未提供密码登录页")
         if password_state != "next":

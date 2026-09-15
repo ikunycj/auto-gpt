@@ -11,6 +11,57 @@
 """
 from config.env_loader import apply_env_overrides
 import random
+from urllib.parse import quote, unquote, urlparse
+
+
+def normalize_proxy_url(value: str) -> str:
+    """Normalize common proxy pool formats to a URL accepted by clients.
+
+    Besides regular URLs, accept ``host:port:user:password`` entries commonly
+    exported by proxy providers.  Colons in credentials are preserved when
+    they are percent-encoded by the caller or supplied in URL form.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if "://" in text:
+        scheme, payload = text.split("://", 1)
+        # Some providers prepend a scheme to their four-field export:
+        # ``http://host:port:user:password``.
+        fields = payload.split(":")
+        if len(fields) == 4 and fields[1].isdigit() and fields[2] and fields[3]:
+            host, port, username, password = fields
+            return (
+                f"{scheme.lower()}://{quote(username, safe='')}:{quote(password, safe='')}"
+                f"@{host}:{port}"
+            )
+        parsed = urlparse(text)
+        if not parsed.hostname:
+            raise ValueError("代理地址无效")
+        # Re-emit credentials safely while preserving the selected scheme.
+        scheme = parsed.scheme.lower()
+        auth = ""
+        if parsed.username is not None:
+            auth = quote(unquote(parsed.username), safe="")
+            if parsed.password is not None:
+                auth += ":" + quote(unquote(parsed.password), safe="")
+            auth += "@"
+        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+        try:
+            parsed_port = parsed.port
+        except ValueError as exc:
+            raise ValueError("代理端口无效") from exc
+        port = f":{parsed_port}" if parsed_port is not None else ""
+        return f"{scheme}://{auth}{host}{port}"
+
+    parts = text.split(":")
+    if len(parts) == 4 and parts[1].isdigit():
+        host, port, username, password = parts
+        if host and username and password:
+            return f"http://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}"
+    if len(parts) >= 2 and parts[1].isdigit():
+        return f"http://{text}"
+    raise ValueError("代理地址无效")
 
 
 # 本地代理入口；实际出口地区以代理/分流规则为准。
@@ -49,7 +100,7 @@ PLAN_CHECK_JITTER = 0.3
 
 def pick_proxy() -> str:
     """从代理池中随机抽取一个代理 URL；池为空时返回空串（即不使用代理）。"""
-    return random.choice(PROXY_POOL) if PROXY_POOL else ""
+    return normalize_proxy_url(random.choice(PROXY_POOL)) if PROXY_POOL else ""
 
 
 # 兼容入口：默认每次进程启动随机选一个，作为本次注册全程的固定代理

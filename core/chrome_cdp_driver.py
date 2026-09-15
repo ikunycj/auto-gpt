@@ -11,9 +11,13 @@ import json
 import logging
 import os
 import platform
+import base64
+import select
 import shutil
 import socket
+import ssl
 import subprocess
+import threading
 import tempfile
 import time
 from dataclasses import dataclass
@@ -23,6 +27,7 @@ from urllib.parse import urlsplit
 from urllib.request import urlopen
 
 from config import codex as _cfg
+from config.proxy import normalize_proxy_url
 from core.cloakbrowser_driver import CloakSeleniumDriver
 
 
@@ -74,19 +79,133 @@ def _reserve_local_port() -> int:
 
 
 def _proxy_server_arg(proxy: str | None) -> str:
-    value = str(proxy or "").strip()
+    value = normalize_proxy_url(proxy or "")
     if not value:
         return ""
     if "://" not in value:
         value = f"http://{value}"
     parsed = urlsplit(value.replace("socks5h://", "socks5://", 1))
-    if parsed.username or parsed.password:
-        raise RuntimeError("Chrome CDP 暂不支持带账号密码的代理，避免凭据暴露在进程参数中")
     if not parsed.hostname:
         raise RuntimeError("Chrome CDP 代理地址无效")
     host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
     port = f":{parsed.port}" if parsed.port else ""
     return f"{parsed.scheme or 'http'}://{host}{port}"
+
+
+class _AuthenticatedProxyBridge:
+    """Expose an unauthenticated local proxy endpoint backed by an auth proxy."""
+
+    def __init__(self, proxy: str):
+        parsed = urlsplit(normalize_proxy_url(proxy))
+        if not parsed.hostname or not parsed.port:
+            raise RuntimeError("认证代理地址缺少 host/port")
+        self._scheme = parsed.scheme.lower() or "http"
+        self._host = parsed.hostname
+        self._port = int(parsed.port)
+        user = parsed.username or ""
+        password = parsed.password or ""
+        token = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+        self._auth_header = f"Proxy-Authorization: Basic {token}"
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(16)
+        self._listener.settimeout(0.5)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True, name="chrome-proxy-bridge")
+
+    @property
+    def address(self) -> str:
+        return f"http://127.0.0.1:{self._listener.getsockname()[1]}"
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._listener.close()
+        except Exception:
+            logger.debug("[ChromeCDP] 代理桥接失败", exc_info=True)
+            pass
+        self._thread.join(timeout=2)
+
+    def _connect_upstream(self) -> socket.socket:
+        upstream = socket.create_connection((self._host, self._port), timeout=20)
+        if self._scheme == "https":
+            context = ssl.create_default_context()
+            upstream = context.wrap_socket(upstream, server_hostname=self._host)
+        return upstream
+
+    @staticmethod
+    def _read_headers(sock: socket.socket) -> bytes:
+        data = b""
+        while b"\r\n\r\n" not in data and len(data) < 128 * 1024:
+            chunk = sock.recv(8192)
+            if not chunk:
+                break
+            data += chunk
+        return data
+
+    def _handle(self, client: socket.socket) -> None:
+        upstream = None
+        try:
+            request = self._read_headers(client)
+            if not request:
+                return
+            header_end = request.find(b"\r\n\r\n")
+            head = request[:header_end].decode("latin-1", errors="replace")
+            remainder = request[header_end + 4:]
+            lines = head.split("\r\n")
+            method = lines[0].split(" ", 1)[0].upper() if lines else ""
+            headers = [line for line in lines[1:] if not line.lower().startswith(("proxy-authorization:", "proxy-connection:"))]
+            headers.append(self._auth_header)
+            upstream = self._connect_upstream()
+            upstream_request = ("\r\n".join([lines[0], *headers]) + "\r\n\r\n").encode("latin-1") + remainder
+            upstream.sendall(upstream_request)
+            response = self._read_headers(upstream)
+            client.sendall(response)
+            if method == "CONNECT" and not response.startswith(b"HTTP/"):
+                return
+            if method == "CONNECT" and b" 200 " not in response.split(b"\r\n", 1)[0]:
+                return
+            self._relay(client, upstream)
+        except Exception:
+            try:
+                client.close()
+            except Exception:
+                pass
+        finally:
+            for sock in (upstream, client):
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+
+    @staticmethod
+    def _relay(left: socket.socket, right: socket.socket) -> None:
+        sockets = [left, right]
+        while True:
+            readable, _, exceptional = select.select(sockets, [], sockets, 60)
+            if exceptional:
+                return
+            if not readable:
+                return
+            for source in readable:
+                chunk = source.recv(65536)
+                if not chunk:
+                    return
+                target = right if source is left else left
+                target.sendall(chunk)
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                client, _ = self._listener.accept()
+            except (socket.timeout, OSError):
+                continue
+            threading.Thread(target=self._handle, args=(client,), daemon=True, name="chrome-proxy-bridge-client").start()
 
 
 def _build_chrome_command(executable: str, port: int, profile_dir: str, proxy: str | None, background: bool) -> list[str]:
@@ -95,13 +214,13 @@ def _build_chrome_command(executable: str, port: int, profile_dir: str, proxy: s
         f"--remote-debugging-address=127.0.0.1",
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile_dir}",
-        "--incognito",
         "--no-first-run",
         "--no-default-browser-check",
     ]
     proxy_server = _proxy_server_arg(proxy)
     if proxy_server:
         command.append(f"--proxy-server={proxy_server}")
+    command.append("--incognito")
     if background:
         command.append("--start-minimized")
     command.append("about:blank")
@@ -138,12 +257,14 @@ class ChromeCDPSeleniumDriver(CloakSeleniumDriver):
         playwright: Any,
         process: subprocess.Popen,
         profile_dir: str,
+        proxy_bridge: _AuthenticatedProxyBridge | None = None,
         keep_open: bool = False,
     ):
         super().__init__(browser=browser, context=context, page=page)
         self._playwright = playwright
         self._chrome_process = process
         self._chrome_profile_dir = profile_dir
+        self._proxy_bridge = proxy_bridge
         self._keep_open = bool(keep_open)
         self._closed = False
         self._registration_log_prefix = "[Chrome注册]"
@@ -186,6 +307,8 @@ class ChromeCDPSeleniumDriver(CloakSeleniumDriver):
                     process.kill()
                     process.wait(timeout=5)
         finally:
+            if self._proxy_bridge is not None:
+                self._proxy_bridge.stop()
             shutil.rmtree(profile_dir, ignore_errors=True)
 
 
@@ -195,7 +318,7 @@ def build_chrome_cdp_driver(
     background: bool = False,
     keep_open: bool | None = None,
 ) -> tuple[ChromeCDPSeleniumDriver, ChromeCDPOpenResult]:
-    selected_proxy = proxy
+    selected_proxy = normalize_proxy_url(proxy) if proxy else proxy
     if selected_proxy is None:
         try:
             from config.proxy import pick_proxy
@@ -207,7 +330,13 @@ def build_chrome_cdp_driver(
     executable = _find_chrome_executable()
     port = _reserve_local_port()
     profile_dir = tempfile.mkdtemp(prefix="codex-chrome-cdp-")
-    command = _build_chrome_command(executable, port, profile_dir, selected_proxy, background)
+    proxy_bridge = None
+    command_proxy = selected_proxy
+    if selected_proxy and (urlsplit(selected_proxy).username or urlsplit(selected_proxy).password):
+        proxy_bridge = _AuthenticatedProxyBridge(selected_proxy)
+        proxy_bridge.start()
+        command_proxy = proxy_bridge.address
+    command = _build_chrome_command(executable, port, profile_dir, command_proxy, background)
     logger.info(
         "[ChromeCDP] 启动系统 Chrome：executable=%s port=%s proxy=%s profile=临时目录 background=%s",
         executable,
@@ -244,6 +373,7 @@ def build_chrome_cdp_driver(
             playwright=playwright,
             process=process,
             profile_dir=profile_dir,
+            proxy_bridge=proxy_bridge,
             keep_open=(
                 bool(getattr(_cfg, "CHROME_CDP_KEEP_BROWSER_OPEN", False))
                 if keep_open is None
@@ -294,5 +424,7 @@ def build_chrome_cdp_driver(
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+        if proxy_bridge is not None:
+            proxy_bridge.stop()
         shutil.rmtree(profile_dir, ignore_errors=True)
         raise

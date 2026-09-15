@@ -61,6 +61,21 @@ def test_password_step_accepts_direct_email_otp_page(monkeypatch):
     assert outcome == "email_otp"
 
 
+def test_password_step_retries_email_submit_when_form_still_visible(monkeypatch):
+    """Recover when the first email Continue click is swallowed by SPA hydration."""
+    states = iter(["", "email_otp"])
+    submits = []
+    monkeypatch.setattr(browser_oauth, "_login_step_state", lambda _driver: next(states))
+    monkeypatch.setattr(browser_oauth, "_has_visible_email_input", lambda _driver: True)
+    monkeypatch.setattr(browser_oauth, "_submit_email_step", lambda *_args: submits.append(True))
+    monkeypatch.setattr(browser_oauth.time, "sleep", lambda *_args, **_kwargs: None)
+
+    outcome = browser_oauth._submit_login_password(FakeDriver(), "password", timeout=1)
+
+    assert outcome == "email_otp"
+    assert submits == [True]
+
+
 def test_password_step_accepts_callback_before_password_input(monkeypatch):
     driver = FakeDriver()
     driver.current_url = "http://localhost:1455/auth/callback?code=secret"

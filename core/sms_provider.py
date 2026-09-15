@@ -7,8 +7,8 @@
     2. wait_for_sms_code()    轮询 getStatus 直到拿到短信验证码
     3. complete() / cancel()  setStatus 标记完成(6) / 取消(8)
 
-Relay 任务通过 fixed_sms_context(acquire_provider=...) 使用已预留的手机号池
-资源：只有页面实际要求手机验证且验证成功时才消耗次数；失败/过期由上层
+Relay 任务通过 fixed_sms_context(acquire_provider=...) 使用手机号池资源：
+只有页面实际要求手机验证时才取号，验证成功后才消耗次数；失败/过期由上层
 号码池记录为失效。全局固定号码配置不参与任务取号。
 
 当前支持：
@@ -128,8 +128,9 @@ def fixed_sms_context(
 ):
     """Bind phone-pool material to one job without mutating global config.
 
-    ``acquire_provider`` resolves the slot already reserved when the relay batch
-    started. The pool use count is only consumed by the success hook.
+    ``acquire_provider`` resolves a phone only when the OAuth flow actually
+    reaches SMS verification. The pool use count is only consumed by the
+    success hook.
     """
     token = _FIXED_SMS_OVERRIDE.set({
         "phone": str(phone or "").strip(),

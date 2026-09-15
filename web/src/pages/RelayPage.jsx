@@ -331,7 +331,7 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
   async function authorizeSelected(ids = accountIds) {
     const selectedIds = ids.filter((id) => accounts.some((row) => idOf(row) === id && row.email));
     if (!selectedIds.length) return notify('请先选择 GPT 账号', 'warning');
-    await runAction('/api/gpt-accounts/authorize', { account_ids: selectedIds, workers, phone_ids: [] }, 'Codex 授权任务已启动，手机号池资源已预留');
+    await runAction('/api/gpt-accounts/authorize', { account_ids: selectedIds, workers, phone_ids: [] }, 'Codex 授权任务已启动，仅在需要手机验证时分配号码');
   }
 
   async function softDeleteAccounts(ids = accountIds) {

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Activity, Gauge, Inbox, Menu, Settings2, Smartphone,
+  Activity, Inbox, Menu, Settings2, Smartphone,
   Users, X,
 } from 'lucide-react';
 import { get, post } from './api';
@@ -34,6 +34,13 @@ function normalizeActiveTab(value) {
   return NAV.some((item) => item.id === candidate) ? candidate : 'gpt';
 }
 
+function ChatGPTMark({ size = 19 }) {
+  return <svg width={size} height={size} viewBox="0 0 32 32" fill="none" aria-hidden="true">
+    <path d="M16 3.5a6.05 6.05 0 0 0-5.86 7.55A6.05 6.05 0 0 0 5.2 21.5a6.05 6.05 0 0 0 7.02 6.99A6.05 6.05 0 0 0 22.8 21.5a6.05 6.05 0 0 0 1-11.7A6.05 6.05 0 0 0 16 3.5Z" stroke="currentColor" strokeWidth="2.15" strokeLinejoin="round" />
+    <path d="M16 3.5v13m0 0 11.26 6.5M16 16 4.74 9.5M16 16v13m0-13 11.26-6.5M16 16 4.74 22.5" stroke="currentColor" strokeWidth="2.15" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>;
+}
+
 function useToast() {
   const [toast, setToast] = useState(null);
   const notify = useCallback((message, type = 'info') => setToast({ message, type, id: Date.now() }), []);
@@ -42,7 +49,7 @@ function useToast() {
 
 function Sidebar({ active, onChange, open, onClose, backendOnline }) {
   return <aside className={`sidebar ${open ? 'is-open' : ''}`}>
-    <div className="brand-lockup"><div className="brand-mark"><Gauge size={18} /></div><div><strong>ChatGPT 注册机</strong><span>registration console</span></div><IconButton label="关闭导航" icon={X} className="sidebar-close" onClick={onClose} /></div>
+    <div className="brand-lockup"><div className="brand-mark"><ChatGPTMark /></div><div><strong>ChatGPT 注册机</strong><span>registration console</span></div><IconButton label="关闭导航" icon={X} className="sidebar-close" onClick={onClose} /></div>
     <div className="sidebar-rule" />
     <nav className="nav-list" aria-label="工作区导航">
       <div className="nav-label">工作区</div>
