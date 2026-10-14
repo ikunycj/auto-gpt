@@ -18,7 +18,9 @@ class _SeleniumDriver:
     def __init__(self):
         self.password_input = _PasswordInput()
 
-    def execute_script(self, _script):
+    def execute_script(self, script):
+        if "text.includes('Route Error')" in script:
+            return False
         return {"ok": True, "input": self.password_input, "button": object()}
 
 
@@ -101,7 +103,7 @@ def test_selenium_registration_password_stuck_page_is_not_saved(monkeypatch):
         lambda seconds: clock.__setitem__(0, clock[0] + max(float(seconds), 21.0)),
     )
 
-    with pytest.raises(RuntimeError, match="不能确认密码已设置"):
+    with pytest.raises(selenium_registration.RegistrationPasswordSubmissionError, match="注册密码提交结果不确定"):
         selenium_registration._fill_password_page_if_present(
             _SeleniumDriver(),
             "user@example.com",

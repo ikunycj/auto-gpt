@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 import threading
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import pyotp
 
@@ -25,11 +25,48 @@ from core import sqlite_store
 
 logger = logging.getLogger(__name__)
 
+
+def _check_2fa_response(response, *, stage: str, route: str) -> None:
+    """Log an allowlisted HTTP summary and stop at the first failed 2FA step.
+
+    Redirect/callback URLs and response bodies may contain authorization codes,
+    so no URL, header value, or exception from the HTTP library is logged here.
+    """
+    status = getattr(response, "status_code", None)
+    status = status if type(status) is int else "unknown"
+    try:
+        host = (urlsplit(str(getattr(response, "url", "") or "")).hostname or "").lower()
+    except (TypeError, ValueError):
+        host = ""
+    if host not in ("chatgpt.com", "auth.openai.com"):
+        host = "unknown"
+    headers = getattr(response, "headers", None) or {}
+    def _header(name: str) -> str:
+        try:
+            value = headers.get(name)
+            if value is None:
+                value = headers.get(name.title())
+            if value is None:
+                value = next((v for k, v in headers.items() if str(k).lower() == name), "")
+            return str(value or "")
+        except Exception:
+            return ""
+    content_type = _header("content-type").split(";", 1)[0].strip().lower()
+    if content_type not in ("application/json", "text/html", "text/plain", "application/problem+json"):
+        content_type = "other" if content_type else "unknown"
+    cloudflare_challenge = "chlray" in _header("server-timing").lower()
+    level = logging.WARNING if type(status) is int and status >= 400 else logging.INFO
+    logger.log(
+        level,
+        "[2FA] HTTP stage=%s host=%s route=%s status=%s mime=%s chlray=%s",
+        stage, host, route, status, content_type, cloudflare_challenge,
+    )
+    if type(status) is int and status >= 400:
+        raise RuntimeError(f"2FA {stage} HTTP {status}")
+
 # Stable logical prefix for batch archive keys; content lives in SQLite.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _BATCH_ARCHIVE_KEY_ROOT = _PROJECT_ROOT / "accounts"
-# Compatibility alias retained for callers that pass/inspect the historical key.
-_ACCOUNTS_DIR = _BATCH_ARCHIVE_KEY_ROOT
 _BATCH_ARCHIVE_LOCK = threading.RLock()
 
 
@@ -49,9 +86,8 @@ def create_batch_archive_dir(count: int, workers: int = 1) -> Path:
     """Return a logical SQLite archive prefix for one registration batch."""
     day = datetime.now().strftime("%Y%m%d")
     base_name = f"{day}-{count}个" if workers <= 1 else f"{day}-{count}个-{workers}线程"
-    # Keep a stable source-key prefix for existing archive records; no
-    # compatibility directory is created during normal operation.
-    folder = _ACCOUNTS_DIR / f"{base_name}-{uuid.uuid4().hex[:8]}"
+    # Archive content stays in SQLite, addressed by a logical prefix.
+    folder = _BATCH_ARCHIVE_KEY_ROOT / f"{base_name}-{uuid.uuid4().hex[:8]}"
     for filename, content in (
         ("注册成功的邮箱.txt", ""),
         ("注册成功的token.txt", ""),
@@ -62,8 +98,6 @@ def create_batch_archive_dir(count: int, workers: int = 1) -> Path:
             folder / filename,
             content,
             category="batch_archives",
-            mode=0o600,
-            mirror=False,
         )
     return folder
 
@@ -74,20 +108,17 @@ def _append_line(path: Path, line: str) -> None:
         line + "\n",
         category="batch_archives",
         encoding="utf-8",
-        mode=0o600,
-        mirror=False,
     )
 
 
 def _append_batch_archive(
     *,
-    row_id: int,
+    row_id: str,
     email: str,
     access_token: str,
     totp_secret: str | None,
     email_source: str | None,
-    proxy_used: str | None,
-    extra: dict,
+    proxy: str | None,
     batch_dir: Path | None,
 ) -> Path:
     """把注册成功账号追加到本次批次目录的 TXT/JSON 文件中。"""
@@ -101,14 +132,13 @@ def _append_batch_archive(
         "id": row_id,
         "email": email,
         "email_source": email_source,
-        "proxy_used": proxy_used,
+        "proxy": proxy,
         "access_token": access_token,
         "totp_secret": totp_secret,
         "material_line": material_line,
         "copy_line": copy_line,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
         "row": row,
-        "extra": extra,
     }
 
     with _BATCH_ARCHIVE_LOCK:
@@ -122,8 +152,6 @@ def _append_batch_archive(
             archive,
             collection=f"batch_archives:{json_path.resolve()}",
             category="batch_archives",
-            mode=0o600,
-            mirror=False,
         )
     return folder
 
@@ -155,11 +183,11 @@ def follow_oauth_callback(session: BrowserSession, continue_url: str, referer: s
 
     logger.info(f"[OAuth回调] 跟随 continue_url 完成 OAuth 回调...")
     resp = session.get(continue_url, headers=headers, allow_redirects=True)
-    logger.info(f"[OAuth回调] 完成, 最终落点: {resp.url}")
+    logger.info("[OAuth回调] 完成, status=%s", getattr(resp, "status_code", "unknown"))
     return resp.url
 
 
-def fetch_session(session: BrowserSession) -> dict:
+def fetch_session(session: BrowserSession, *, diagnostic_2fa_stage: str | None = None) -> dict:
     """
     GET https://chatgpt.com/api/auth/session
     注册成功后立刻调用，拿到 accessToken / user / account / expires。
@@ -176,11 +204,14 @@ def fetch_session(session: BrowserSession) -> dict:
 
     logger.info("[Session] 拉取 ChatGPT session 信息...")
     resp = session.get(url, headers=headers)
-    resp.raise_for_status()
+    if diagnostic_2fa_stage:
+        _check_2fa_response(resp, stage=diagnostic_2fa_stage, route="session")
+    else:
+        resp.raise_for_status()
     data = resp.json()
 
     if not data.get("accessToken"):
-        logger.error(f"[Session] 响应中没有 accessToken: {data}")
+        logger.error("[Session] 响应中没有 accessToken, status=%s", getattr(resp, "status_code", "unknown"))
         raise RuntimeError("未拿到 accessToken，登录态可能未建立")
 
     user = data.get("user") or {}
@@ -200,9 +231,9 @@ def _trigger_reauth(session: BrowserSession, email: str) -> str:
     # 重新拿一次 csrf（旧的可能已过期）
     csrf_url = "https://chatgpt.com/api/auth/csrf"
     csrf_resp = session.get(csrf_url, headers=session.get_nextauth_headers(referer="https://chatgpt.com/"))
-    csrf_resp.raise_for_status()
+    _check_2fa_response(csrf_resp, stage="reauth_csrf", route="csrf")
     csrf_token = csrf_resp.json()["csrfToken"]
-    logger.info(f"[2FA] 重认证 CSRF: {csrf_token[:20]}...")
+    logger.info("[2FA] 已获取重认证 CSRF")
 
     # POST /api/auth/signin/openai 带 reauth 参数
     query = {
@@ -226,10 +257,11 @@ def _trigger_reauth(session: BrowserSession, email: str) -> str:
 
     logger.info("[2FA] 发起重认证 signin/openai...")
     resp = session.post(signin_url, headers=headers, data=body)
-    resp.raise_for_status()
+    _check_2fa_response(resp, stage="reauth_signin", route="signin/openai")
     auth_url = resp.json().get("url")
     if not auth_url:
-        raise RuntimeError(f"未拿到 reauth authorize URL: {resp.text}")
+        logger.error("[2FA] reauth 响应缺少 authorize URL, status=%s", getattr(resp, "status_code", "unknown"))
+        raise RuntimeError("未拿到 reauth authorize URL")
     return auth_url
 
 
@@ -241,7 +273,8 @@ def _follow_reauth(session: BrowserSession, auth_url: str) -> None:
     headers = session.get_auth_navigate_headers(referer="https://chatgpt.com/")
     logger.info("[2FA] 跟随 authorize URL，触发 OTP 发送...")
     resp = session.get(auth_url, headers=headers, allow_redirects=True)
-    logger.info(f"[2FA] 落点 URL: {resp.url}")
+    _check_2fa_response(resp, stage="reauth_authorize", route="authorize")
+    logger.info("[2FA] 重认证页面已打开")
 
 
 def _validate_reauth_otp(session: BrowserSession, code: str) -> str:
@@ -253,13 +286,14 @@ def _validate_reauth_otp(session: BrowserSession, code: str) -> str:
     headers = session.get_auth_headers(referer="https://auth.openai.com/email-verification")
     body = json.dumps({"code": code})
 
-    logger.info(f"[2FA] 提交重认证 OTP: {code}")
+    logger.info("[2FA] 提交重认证 OTP")
     resp = session.post(url, headers=headers, data=body)
-    resp.raise_for_status()
+    _check_2fa_response(resp, stage="reauth_otp", route="email-otp/validate")
     data = resp.json()
     continue_url = data.get("continue_url")
     if not continue_url:
-        raise RuntimeError(f"OTP 验证响应缺少 continue_url: {data}")
+        logger.error("[2FA] OTP 验证响应缺少 continue_url, status=%s", getattr(resp, "status_code", "unknown"))
+        raise RuntimeError("OTP 验证响应缺少 continue_url")
     return continue_url
 
 
@@ -270,12 +304,13 @@ def _exchange_new_token(session: BrowserSession, continue_url: str) -> str:
     """
     headers = session.get_auth_navigate_headers(referer="https://auth.openai.com/email-verification")
     logger.info("[2FA] 跟随 continue_url，刷新 session-token cookie...")
-    session.get(continue_url, headers=headers, allow_redirects=True)
+    callback_resp = session.get(continue_url, headers=headers, allow_redirects=True)
+    _check_2fa_response(callback_resp, stage="session_callback", route="authorize/continue")
 
     # 拿新的 accessToken
-    new_session = fetch_session(session)
+    new_session = fetch_session(session, diagnostic_2fa_stage="session_refresh")
     new_token = new_session["accessToken"]
-    logger.info(f"[2FA] 新 accessToken（含新鲜 pwd_auth_time）: {new_token[:40]}...")
+    logger.info("[2FA] 已刷新带新鲜 pwd_auth_time 的登录态")
     return new_token
 
 
@@ -293,15 +328,28 @@ def _enroll_totp(session: BrowserSession, access_token: str) -> tuple[str, str]:
 
     logger.info("[2FA] 注册 TOTP...")
     resp = session.post(url, headers=headers, data=body)
+    _check_2fa_response(resp, stage="totp_enroll", route="mfa/enroll")
     if resp.status_code != 200:
-        logger.error(f"[2FA] enroll 失败 {resp.status_code}: {resp.text}")
-        resp.raise_for_status()
+        raise RuntimeError("2FA totp_enroll 未返回 HTTP 200")
     data = resp.json()
     secret = data.get("secret")
     session_id = data.get("session_id")
-    if not secret or not session_id:
-        raise RuntimeError(f"enroll 响应字段缺失: {data}")
-    logger.info(f"[2FA] TOTP secret 已获取: {secret[:4]}...{secret[-4:]}")
+    missing_fields = [
+        field for field, value in (("secret", secret), ("session_id", session_id))
+        if not isinstance(value, str) or not value.strip()
+    ]
+    if missing_fields:
+        logger.error("[2FA] enroll 响应字段缺失或格式错误: %s", ", ".join(missing_fields))
+        raise RuntimeError(f"enroll 响应字段缺失或格式错误: {', '.join(missing_fields)}")
+    secret = secret.strip()
+    session_id = session_id.strip()
+    try:
+        # Fail before activation if the server returned a secret that cannot
+        # produce a TOTP code. Never include the secret in diagnostics.
+        pyotp.TOTP(secret).now()
+    except Exception:
+        raise RuntimeError("enroll 返回的 TOTP secret 格式无效") from None
+    logger.info("[2FA] TOTP enrollment 信息已获取")
     return secret, session_id
 
 
@@ -327,14 +375,15 @@ def _activate_totp(
         "session_id": session_id,
     })
 
-    logger.info(f"[2FA] 激活 enrollment, code={totp_code}")
+    logger.info("[2FA] 激活 enrollment")
     resp = session.post(url, headers=headers, data=body)
+    _check_2fa_response(resp, stage="totp_activate", route="mfa/activate_enrollment")
     if resp.status_code != 200:
-        logger.error(f"[2FA] activate 失败 {resp.status_code}: {resp.text}")
-        resp.raise_for_status()
+        raise RuntimeError("2FA totp_activate 未返回 HTTP 200")
     data = resp.json()
-    if not data.get("success"):
-        raise RuntimeError(f"激活返回 success=false: {data}")
+    if not isinstance(data, dict) or data.get("success") is not True:
+        logger.error("[2FA] activate 未返回 success=true, status=%s", getattr(resp, "status_code", "unknown"))
+        raise RuntimeError("激活未明确返回 success=true")
     return True
 
 
@@ -382,7 +431,7 @@ def setup_2fa(session: BrowserSession, email: str, otp_code: str | None = None, 
     _activate_totp(session, new_token, secret, session_id)
 
     logger.info("=" * 60)
-    logger.info(f"✅ 2FA 设置完成! Secret: {secret[:4]}...{secret[-4:]}")
+    logger.info("✅ 2FA 设置完成")
     logger.info("=" * 60)
     return secret
 
@@ -391,59 +440,78 @@ def save_account_data(
     email: str,
     access_token: str,
     totp_secret: str | None = None,
-    extra: dict | None = None,
-    output_path: Path | None = None,  # 兼容老接口，已废弃
     email_source: str | None = None,
-    proxy_used: str | None = None,
+    proxy: str | None = None,
+    chatgpt_password: str | None = None,
+    login_method: str | None = None,
+    user_id: str | None = None,
+    user_name: str | None = None,
+    plan_type: str | None = None,
+    expires_at: str | None = None,
+    device_id: str | None = None,
+    email_provider_context: dict | None = None,
+    registration_driver: str | None = None,
+    registration_profile_id: str | None = None,
+    browser_session_id: str | None = None,
+    browser_proxy_country_code: str | None = None,
+    sentinel_sid: str | None = None,
+    browser_profile: dict | None = None,
+    codex_status: str | None = None,
+    codex_error: str | None = None,
     batch_dir: Path | None = None,
     archive: bool = True,
     enqueue_plan: bool = True,
-) -> int:
+    verified_registration: bool = False,
+) -> str:
     """
     将账号信息保存到 SQLite，并把本次批次归档写入 SQLite 文件集合。
     返回新插入/更新的 row id。
     """
+    if verified_registration:
+        from config import twofa as _twofa_cfg
+
+        if not archive:
+            raise ValueError("已验证注册账号必须一次写入并归档")
+        if _twofa_cfg.ENABLE_2FA and not (
+            login_method == "password"
+            and isinstance(chatgpt_password, str) and chatgpt_password.strip()
+            and isinstance(totp_secret, str) and totp_secret.strip()
+        ):
+            raise ValueError("启用 2FA 的注册账号必须含密码和 TOTP secret，并通过独立登录验证")
     from core.db import insert_account
-    extra = dict(extra or {})
+    if verified_registration:
+        from core.account_proxy import registration_proxy
+        proxy = registration_proxy(proxy)
     source = str(email_source or "").strip()
-    if source:
-        extra.setdefault("email_provider", source)
-    password = str(
-        extra.get("registration_password")
-        or extra.get("openai_password")
-        or ""
-    ).strip()
-    extra.setdefault("login_method", "password" if password else "email_otp")
-    if source and not extra.get("email_provider_context"):
+    if source and email_provider_context is None:
         try:
             from core.email_provider import snapshot_email_context
 
             provider_context = snapshot_email_context(email, source=source)
             if provider_context:
-                extra["email_provider_context"] = provider_context
+                email_provider_context = provider_context
         except Exception as exc:
             logger.debug("[Save] 邮箱渠道上下文快照失败（不影响账号保存）: %s", exc)
-    user = extra.get("user") or {}
-    account = extra.get("account") or {}
-    # 从 extra.codex 抽出顶层 codex 状态/错误，方便 WebUI 直接读账号字段
-    codex = extra.get("codex") or {}
-    codex_status = codex.get("status")  # success / failed / skipped
-    codex_error = None
-    if codex_status == "failed":
-        codex_error = codex.get("message")
-
     row_id = insert_account(
         email=email,
         access_token=access_token,
         totp_secret=totp_secret,
-        user_id=user.get("id"),
-        user_name=user.get("name"),
-        plan_type=account.get("planType"),
-        expires_at=extra.get("expires"),
-        device_id=extra.get("device_id"),
-        proxy_used=proxy_used,
+        chatgpt_password=chatgpt_password,
+        login_method=login_method,
+        user_id=user_id,
+        user_name=user_name,
+        plan_type=plan_type,
+        expires_at=expires_at,
+        device_id=device_id,
+        proxy=proxy,
         email_source=email_source,
-        extra=extra,
+        email_provider_context=email_provider_context,
+        registration_driver=registration_driver,
+        registration_profile_id=registration_profile_id,
+        browser_session_id=browser_session_id,
+        browser_proxy_country_code=browser_proxy_country_code,
+        sentinel_sid=sentinel_sid,
+        browser_profile=browser_profile,
         codex_status=codex_status,
         codex_error=codex_error,
     )
@@ -455,8 +523,7 @@ def save_account_data(
             access_token=access_token,
             totp_secret=totp_secret,
             email_source=email_source,
-            proxy_used=proxy_used,
-            extra=extra,
+            proxy=proxy,
             batch_dir=batch_dir,
         )
         logger.info(f"[Save] 批次归档目录: {batch_folder}")
@@ -471,6 +538,7 @@ def save_account_data(
                 email=email,
                 access_token=access_token,
                 trigger="registration_auto",
+                proxy=proxy or "",
             )
             if queued.get("accepted"):
                 logger.info(f"[Plan] 注册后自动查询已入队: id={row_id}, email={email}")

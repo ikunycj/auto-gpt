@@ -1,4 +1,8 @@
+import pytest
+
 from config import email as email_config
+from config import register as register_config
+from config import roxybrowser as roxybrowser_config
 from registration.application import job_service, use_case
 
 
@@ -51,7 +55,7 @@ def test_protocol_registration_persists_as_not_authorized_without_running_codex(
     monkeypatch.setattr(use_case, "setup_2fa", setup_2fa)
     monkeypatch.setattr(use_case._protocol_cfg, "CHATGPT_ANON_BOOTSTRAP_ENABLED", False)
     monkeypatch.setattr(use_case._protocol_cfg, "CHATGPT_AUTH_BOOTSTRAP_ENABLED", False)
-    monkeypatch.setattr(use_case._twofa_cfg, "ENABLE_2FA", True)
+    monkeypatch.setattr(use_case._twofa_cfg, "ENABLE_2FA", False)
     monkeypatch.setattr(email_config, "USE_EMAIL_SERVICE", False)
 
     from core import codex_oauth, email_provider, flow_trigger
@@ -67,7 +71,7 @@ def test_protocol_registration_persists_as_not_authorized_without_running_codex(
     monkeypatch.setattr(use_case, "wait_for_otp", wait_for_otp)
 
     def save(**kwargs):
-        events.append(f"save:{kwargs['extra']['codex']['status']}")
+        events.append(f"save:{kwargs['codex_status']}")
         saves.append(kwargs)
         return 17
 
@@ -91,11 +95,14 @@ def test_protocol_registration_persists_as_not_authorized_without_running_codex(
     assert len(otp_calls) == 1
     assert otp_calls[0][0] == "new@mailnest.test"
     assert result["codex"]["status"] == "not_authorized"
-    assert events == ["save:not_authorized", "save:not_authorized", "save:not_authorized"]
-    assert [item["totp_secret"] for item in saves] == [None, secret, secret]
-    assert [item["archive"] for item in saves] == [False, False, True]
-    assert saves[0]["extra"]["login_method"] == "email_otp"
-    assert saves[0]["extra"]["email_provider"] == "mailnest"
+    assert events == ["save:not_authorized"]
+    assert [item["totp_secret"] for item in saves] == [None]
+    assert [item["archive"] for item in saves] == [True]
+    assert [item["enqueue_plan"] for item in saves] == [True]
+    assert saves[0]["login_method"] == "email_otp"
+    assert saves[0]["email_provider_context"] == {"project_code": "chatgpt001"}
+    assert saves[0]["codex_status"] == "not_authorized"
+    assert "extra" not in saves[0]
 
 
 def test_registration_retry_never_turns_into_codex_authorization(monkeypatch):
@@ -143,3 +150,60 @@ def test_registration_retry_preserves_target_email(monkeypatch):
         "email": "target@example.com",
         "account_id": None,
     }
+
+
+def test_unsupported_registration_driver_is_rejected_before_mailbox_acquisition(monkeypatch):
+    from core import email_provider
+
+    monkeypatch.setattr(use_case._twofa_cfg, "ENABLE_2FA", True)
+    monkeypatch.setattr(roxybrowser_config, "REGISTRATION_DRIVER", "protocol")
+    monkeypatch.setattr(register_config, "REGISTER_EMAIL", "")
+    monkeypatch.setattr(email_config, "USE_EMAIL_SERVICE", True)
+    acquired = []
+
+    def acquire(*_args, **_kwargs):
+        acquired.append(True)
+        raise AssertionError("邮箱不应在不支持的驱动校验前被领取")
+
+    monkeypatch.setattr(email_provider, "acquire_email", acquire)
+
+    with pytest.raises(RuntimeError, match="不能保证完成密码和 TOTP"):
+        job_service._prepare_registration_args(email_sources="mailnest")
+
+    assert acquired == []
+
+
+def test_all_non_password_totp_drivers_are_rejected_when_2fa_is_required(monkeypatch):
+    monkeypatch.setattr(use_case._twofa_cfg, "ENABLE_2FA", True)
+
+    for driver in ("protocol", "browser_use", "skyvern", "cloak"):
+        with pytest.raises(RuntimeError, match="不能保证完成密码和 TOTP"):
+            use_case.require_password_2fa_driver(driver)
+
+
+def test_failed_password_or_2fa_checkpoint_stays_failed_and_cannot_retry_registration(monkeypatch):
+    source = {
+        "id": 12,
+        "status": "failed",
+        "account_id": 44,
+        "email": "created@example.com",
+        "error": "2FA 设置失败：未收到验证码",
+    }
+    account = {
+        "id": 44,
+        "email": "created@example.com",
+        "chatgpt_password": "Generated-Password-42!",
+        "totp_secret": "",
+        "login_method": "password",
+        "codex_status": "not_authorized",
+    }
+    monkeypatch.setattr(job_service.db, "get_successful_retry_for_job", lambda _job_id: None)
+    monkeypatch.setattr(job_service, "_account_for_job", lambda _job: account)
+
+    info = job_service.get_retry_info(source)
+
+    assert info["display_status"] == "failed"
+    assert info["retryable"] is False
+    assert info["retry_action"] is None
+    assert "2FA 设置失败" in info["retry_reason"]
+    assert "不能重试注册" in info["retry_reason"]

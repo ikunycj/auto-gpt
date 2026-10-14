@@ -87,7 +87,6 @@ def _setup_logging(verbose: bool) -> None:
     sqlite_handler = sqlite_store.SQLiteFileHandler(
         _WEBUI_LOG_PATH,
         category=_WEBUI_LOG_CATEGORY,
-        mirror=False,
     )
     sqlite_handler.setLevel(level)
     sqlite_handler.setFormatter(formatter)

@@ -35,9 +35,9 @@ def _append_log(email: str, line: str, *, clear: bool = False) -> None:
     stamp = datetime.now().strftime("%H:%M:%S")
     text = f"{stamp} [INFO] {line}\n"
     if clear:
-        sqlite_store.write_file(p, text, category="liveness_logs", mode=0o600, mirror=False)
+        sqlite_store.write_file(p, text, category="liveness_logs")
     else:
-        sqlite_store.append_file(p, text, category="liveness_logs", mode=0o600, mirror=False)
+        sqlite_store.append_file(p, text, category="liveness_logs")
 
 
 def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: str) -> dict:

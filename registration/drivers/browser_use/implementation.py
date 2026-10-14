@@ -1637,6 +1637,9 @@ def run_browser_use_registration(
     cloud_provider: str = "browser_use",
 ) -> dict:
     """Browser Use / Skyvern 云端浏览器注册入口。proxy 参数保留兼容。"""
+    from registration.application.use_case import require_password_2fa_driver
+
+    require_password_2fa_driver(cloud_provider)
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -1839,7 +1842,7 @@ def run_browser_use_registration(
                         _restart_email_otp_flow("等待验证码超时，避免点击 resend 导致 500/chrome-error")
                         current_otp = None
                         continue
-                logger.info("[BrowserUse][OTP] 收到验证码：%s", current_otp)
+                logger.info("[BrowserUse][OTP] 已收到验证码")
                 _t_otp_submit = _StepTimer("提交邮箱 OTP")
                 _clear_otp_inputs(page)
                 _type_otp(page, current_otp)
@@ -1878,7 +1881,7 @@ def run_browser_use_registration(
             logger.info("[BrowserUse] 已拿到 accessToken：%s", email)
 
             if _twofa_cfg.ENABLE_2FA:
-                logger.warning("[BrowserUse] 当前路径暂不自动设置 2FA，已跳过")
+                raise RuntimeError("Browser Use / Skyvern 注册路径无法完成密码和 2FA 设置；已停止保存账号")
             totp_secret = None
 
             email_source = resolve_email_source(email)
@@ -1887,45 +1890,31 @@ def run_browser_use_registration(
                 "ok": False,
                 "message": "GPT 注册完成，等待在 GPT账号 页面手动发起 Codex 授权",
             }
-            account_extra = {
-                "user": session_info.get("user"),
-                "account": session_info.get("account"),
-                "expires": session_info.get("expires"),
-                provider_prefix: {
-                    "proxy_country_code": session_info_open.proxy_country_code,
-                    "profile_id": session_info_open.profile_id,
-                    "session_id": getattr(session_info_open, "session_id", ""),
-                    "connect": session_info_open.raw,
-                },
-                "registration_password": openai_password,
-                "login_method": "password" if openai_password else "email_otp",
-                "codex": codex_result,
+            account_fields = {
+                "user_id": (session_info.get("user") or {}).get("id"),
+                "user_name": (session_info.get("user") or {}).get("name"),
+                "plan_type": (session_info.get("account") or {}).get("planType"),
+                "expires_at": session_info.get("expires"),
+                "registration_driver": provider_prefix,
+                "registration_profile_id": session_info_open.profile_id,
+                "browser_session_id": getattr(session_info_open, "session_id", ""),
+                "browser_proxy_country_code": session_info_open.proxy_country_code,
+                "codex_status": codex_result["status"],
             }
             account_id = save_account_data(
                 email=email,
                 access_token=access_token,
                 totp_secret=totp_secret,
                 email_source=email_source,
-                proxy_used=proxy or f"{provider_prefix}:{session_info_open.proxy_country_code or 'default'}",
+                chatgpt_password=openai_password,
+                login_method="password" if openai_password else "email_otp",
+                # Cloud providers expose a country, not a reusable proxy endpoint.
+                # open_session() does not consume the compatibility proxy argument.
+                proxy="",
                 batch_dir=batch_dir,
-                extra=account_extra,
-                archive=False,
-                enqueue_plan=True,
-            )
-            if openai_password:
-                logger.info("[%s][检查点] 账号及登录密码已即时写入：%s，账号ID=%s", cloud_label, email, account_id)
-            else:
-                logger.info("[%s][检查点] 账号已即时写入（OTP 登录，未经过密码创建页）：%s，账号ID=%s", cloud_label, email, account_id)
-
-            account_id = save_account_data(
-                email=email,
-                access_token=access_token,
-                totp_secret=totp_secret,
-                email_source=email_source,
-                proxy_used=proxy or f"{provider_prefix}:{session_info_open.proxy_country_code or 'default'}",
-                batch_dir=batch_dir,
-                extra=account_extra,
+                **account_fields,
                 archive=True,
+                verified_registration=True,
                 enqueue_plan=False,
             )
             _t_all.done("success")

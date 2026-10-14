@@ -12,26 +12,16 @@ import RelayPage from './pages/RelayPage';
 import ConfigPage from './pages/ConfigPage';
 
 const NAV = [
-  { id: 'email', label: '邮箱', caption: '注册邮箱', icon: Inbox },
-  { id: 'gpt', label: 'GPT账号', caption: '注册与授权', icon: Users },
-  { id: 'phones', label: '手机号池', caption: '接码号码', icon: Smartphone },
+  { id: 'email', label: '邮箱账号', caption: '待注册邮箱', icon: Inbox },
+  { id: 'gpt', label: 'GPT账号', caption: '已注册与授权', icon: Users },
+  { id: 'phones', label: '手机号', caption: '接码号码', icon: Smartphone },
   { id: 'settings', label: '设置', caption: '运行参数', icon: Settings2 },
 ];
 
 const PAGE_TITLES = Object.fromEntries(NAV.map((item) => [item.id, item.label]));
 
-const LEGACY_ACTIVE_TAB = {
-  register: 'email',
-  accounts: 'gpt',
-  codex: 'gpt',
-  relay: 'gpt',
-  outlook: 'email',
-  config: 'settings',
-};
-
 function normalizeActiveTab(value) {
-  const candidate = LEGACY_ACTIVE_TAB[value] || value;
-  return NAV.some((item) => item.id === candidate) ? candidate : 'gpt';
+  return NAV.some((item) => item.id === value) ? value : 'gpt';
 }
 
 function ChatGPTMark({ size = 19 }) {
@@ -140,7 +130,7 @@ export default function App() {
 
   const page = useMemo(() => {
     const common = { notify, summary, onSummaryRefresh: refreshSummary };
-    if (active === 'email') return <EmailPage {...common} onOpenSettings={openSettings} />;
+    if (active === 'email') return <EmailPage {...common} onOpenSettings={openSettings} onOpenGptRegistration={openGptRegistration} />;
     if (active === 'phones') return <RelayPage {...common} mode="phones" />;
     if (active === 'settings') return <ConfigPage {...common} initialGroup={settingsGroup} onOpenEmail={() => changePage('email')} onOpenGptRegistration={openGptRegistration} onDirtyChange={setSettingsDirty} />;
     return <GptAccountsPage {...common} onOpenSettings={openSettings} onOpenEmail={() => changePage('email')} registrationRequested={registrationRequested} onRegistrationRequestHandled={clearRegistrationRequest} />;

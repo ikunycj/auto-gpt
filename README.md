@@ -46,7 +46,9 @@ dev/preview 将 `/api` 代理到后端。WebUI 仅绑定本机回环地址，不
 
 浏览器驱动通过 `registration/drivers/registry.py` 注册，业务用例不直接依赖某个浏览器实现。这样可以为不同环境切换驱动，也可以在不改动 WebUI 和任务服务的情况下添加新驱动。
 
-浏览器注册驱动优先选择 OpenAI 的“使用一次性验证码”入口，按邮箱 OTP 完成注册。只有 OpenAI 不提供 OTP 入口且强制显示创建密码页时，才会使用设置中的备用密码，或为当前账号生成独立随机密码；确认提交后才会保存。普通 OTP 注册会记录为 `email_otp`，`protocol` 驱动始终是 OTP-only。
+未开启 2FA 的 Roxy 注册保留邮箱 OTP 优先的流程；只有未提供 OTP 入口且必须创建密码时，才会使用设置中的备用密码，或为当前账号生成独立随机密码。普通 OTP 注册记录为 `email_otp`，`protocol` 驱动始终是 OTP-only。
+
+Roxy 开启 `ENABLE_2FA` 后会明确选择密码注册，在当前 Roxy 浏览器内完成 2FA 设置，再清理登录态并执行一次全新的“密码 + TOTP”登录。必须实际提交密码、完成 TOTP 挑战，并取得邮箱匹配且包含 `accessToken` 的新会话，才保存为成功账号；不会为了这一验证另开系统 Chrome，也不会把 OTP 登录或旧会话误记为密码验证成功。此清理会影响该 Profile 的登录态，应使用专用注册 Profile。
 
 ### 2.2 邮箱与验证码
 
@@ -175,7 +177,13 @@ Markdown 链接（`[说明](https://...)`）和聊天复制产生的反斜杠转
 
 ### 3.4 配置代理和 Codex
 
-在 WebUI「设置 → 代理池」中逐行填写代理 URL，并设置套餐查询的网络模式、超时和重试策略。代理包含用户名或密码时也建议只通过配置页保存，系统会将其写入 `.env`。
+注册与授权的网络优先级统一为：**任务/账号显式代理 → 代理池 → 本机网络**。未配置代理时不再默认连接 `127.0.0.1:7897`；显式空字符串表示本机直连，已配置但无效的代理不会静默切换出口。
+
+Roxy 固定 Profile 会在关闭状态下同步本次任务的网络设置（含清除旧代理）；已打开且网络不一致时会提示先关闭，不强制重启用户窗口。浏览器、PKCE 换 Token、2FA 和授权后验活保持同一路由；`ROXY_CREATE_USE_PROXY_POOL` 仅保留兼容，不再影响此策略。
+
+成功授权后会私下保存已核验的网络线路（包含明确直连），后续凭证刷新与 GPT 验活沿用该线路，不依赖临时 Profile 继续存在，也不重新随机抽取代理。该内部字段不会在账号列表接口中返回；更改账号显式代理时会清除旧线路记录。旧账号若只有 Profile 信息而无法读回网络配置，会明确报错，不猜测为直连。
+
+在 WebUI「设置 → 代理池」中逐行填写代理 URL，并设置套餐查询的独立网络模式、超时和重试策略。代理包含用户名或密码时也建议只通过配置页保存，系统会将其写入 `.env`。
 
 在「设置 → Codex」中选择授权地址来源、OAuth 驱动以及 CPA/sub2API 参数。接码配置位于「设置 → 手机接码」区域，进入后通过顶部横向选项切换“总览与开关 / GrizzlySMS / L 接码服务 / H 接码服务”。开启“加入手机号池”后，当前选中的平台会在“手机号池”顶部显示为特殊的动态来源，GPT账号授权遇到手机验证时会自动向该平台取号；关闭后只使用手工导入的手机号。旧的全局固定号码配置不会参与 WebUI 授权。接口语义可参考 [L_API.md](L_API.md)。
 
@@ -239,6 +247,12 @@ Codex 授权要完成 OAuth 登录和回调，至少需要：
 - GPT账号表中的 ChatGPT 密码；如果账号启用了 2FA，还需要 TOTP 密钥；
 - “设置”中的 Codex OAuth/CPA/sub2API、浏览器驱动和代理配置；
 - “手机号池”中的号码与取码地址。授权启动不会预先检查或占用手机号；只有流程实际触发短信验证时，系统才从手机号池分配号码并在验证成功后扣减可用次数。
+
+手机号池支持批量 `+1` / `-1`，也可以直接在表格的“可用次数”列选择精确次数（沿用 `0–3` 次范围，选择后自动保存），或勾选多个号码后“批量设置”。手机号表格不再提供“操作”列；点击“期限”列中的“不过期”或截止时间即可单独维护过期时间。期限默认**不过期**，可以选择“按天设置”，从保存时起计算 `N × 24` 小时，也可重新设为“不过期”。只修改次数时保留原过期时间，只修改期限时保留原可用次数；重复导入号码也不会清除已有期限。表格显示截止时间和向上取整的剩余天数，支持“已过期”筛选。
+
+到期号码不再参与短信分配，剩余次数和已绑定账号记录不会被删除；增加次数不会解除过期或失效状态。任务占用中的号码不能减少次数或修改有效期，避免影响正在接码的任务。动态接码平台由平台管理，不提供固定号码的次数/过期设置。
+
+API：`PATCH /api/phones/settings`，传入 `phone_ids` 数组（单个或多个），以及可选的 `available_uses`、`expiration_days`。省略字段表示不修改；`expiration_days: 0` 表示不过期，正整数表示从保存时起的天数。旧的 `PATCH /api/phones/available-uses` 增减接口保持兼容。
 
 账号表的三个状态筛选分别表示：
 
@@ -304,7 +318,7 @@ uv run --locked python scripts/diagnostics/analyze_har_protocol.py /path/to/capt
 
 ```bash
 sqlite3 data/turb_gpt.sqlite3 '.tables'
-sqlite3 data/turb_gpt.sqlite3 'select id, email, status from v_registered_accounts order by position;'
+sqlite3 data/turb_gpt.sqlite3 "select json_extract(value_json, '$.id'), json_extract(value_json, '$.email') from storage_items where collection='gpt_accounts' order by position;"
 sqlite3 data/turb_gpt.sqlite3 'select collection, count(*) from storage_items group by collection;'
 ```
 
@@ -315,7 +329,9 @@ from core.sqlite_store import connect
 
 with connect() as conn:
     rows = conn.execute(
-        "select id, email, status from v_registered_accounts"
+        "select json_extract(value_json, '$.id') as id, "
+        "json_extract(value_json, '$.email') as email "
+        "from storage_items where collection='gpt_accounts' order by position"
     ).fetchall()
 ```
 
@@ -325,15 +341,19 @@ with connect() as conn:
 
 **配置保存后没有生效？** WebUI 保存的设置会写入 `.env` 并立即热加载；已经运行中的任务会继续使用启动时读取的值，新的任务才会使用新值。直接修改 `config/*.py` 只影响默认值，通常需要重启 CLI 或 WebUI 才能重新读取。
 
-**邮箱页面为什么是空的？** “邮箱”是后续邮箱注册能力的预留入口，当前注册素材和已有账号导入仍通过“设置”和“GPT账号”完成。
+**邮箱页面为什么是空的？** “邮箱”只显示尚未注册 GPT 的邮箱账号。账号完成注册后会从该列表移除，显示在“GPT账号”页面；若未导入邮箱账号，列表也是空的。
 
 **没有手机号池资源能否注册？** 可以。GPT 注册不读取手机号池，也不会自动开始 Codex 授权；注册完成后会显示“未授权”。
 
-**注册后邮箱失效还能登录吗？** 不一定。原注册流程优先使用邮箱 OTP，因此不能假设每个账号都有密码。只有 OpenAI 强制创建密码且没有 OTP 入口时才会设置并保存密码；后续 Codex 授权或查活会优先使用已确认密码，否则仍需要邮箱 OTP。
+**注册后邮箱失效还能登录吗？** 不一定。未开启 2FA 的 Roxy 注册仍优先使用邮箱 OTP，不能假设每个账号都有密码。开启 2FA 的 Roxy 成功账号需要通过同浏览器的全新密码 + TOTP 登录验证；这不保证服务之后不会再次要求邮箱验证。请保留可用的邮箱接码渠道，后续授权或验活仍应以实际页面要求为准。
 
 **GPT账号授权如何准备手机接码？** 可以使用手机号池中的手工号码，也可以在「设置 → 手机接码」顶部的“总览与开关”中开启一个动态平台来源。授权任务启动时不会预留号码；只有实际进入手机验证页面时，系统才取号。动态平台的余额和实时可用号码由平台在实际取号时返回，若平台余额不足或无号，任务会记录失败原因。未实际触发短信验证的手工号码不会扣减次数。
 
 **Codex 失败但注册成功怎么办？** 账号会保留并在 GPT账号表显示“已注册 + 授权失败”，可直接点击该行“授权”重新补跑，或执行上面的 Codex CLI 命令。
+
+**仍然出现代理或 SSL 错误？** 先区分网络连接失败与账号状态：日志会保留 `ERR_TUNNEL_CONNECTION_FAILED` / `ERR_SSL_PROTOCOL_ERROR` 等原始错误码，不把它们归类为账号停用。固定 Profile 若提示网络不一致，请先关闭对应 Roxy 窗口再重试，让程序同步本次任务的代理；不要用关闭 TLS 校验或静默直连掩盖问题。页面、认证响应明确返回删除/停用时，则优先报告账号原因，不再仅以 MFA 页面未跳转判定超时。
+
+**与初版有哪些关键差异？** 参见 [初版对比与 Roxy 修复记录](docs/architecture/roxy-baseline-repair-2026-10-02.md)，其中区分已提交代码、未提交工作树、代码回归测试和真实网络验证。初版 Roxy 会跳过 2FA，不能用其“注册成功”证明 2FA 已完成。
 
 **Roxy 无头模式仍弹出窗口？** 检查 `ROXY_OPEN_HEADLESS = True`，并确认本机 RoxyBrowser 版本支持对应 API 参数。
 
@@ -422,17 +442,17 @@ git diff --check
 3. WebUI 仍只使用前端 `127.0.0.1:5555` 和后端 `127.0.0.1:6666`，没有启动第二组生产实例。
 4. 浏览器驱动能通过统一注册接口调用，未把驱动细节泄漏到 Web/API 层。
 
-### 4.5 SQLite 与迁移约定
+### 4.5 SQLite 数据约定
 
 `core/sqlite_store.py` 提供 JSON 集合和文件内容的统一读写 API：
 
 - `storage_collections` / `storage_items` 保存结构化业务数据。
 - `storage_files` 保存日志、凭证、批次归档等二进制或文本内容。
-- `v_registered_accounts`、`v_outlook_pool`、`v_registration_jobs`、`v_relay_*` 提供常用查询视图。
-- 历史 JSON/TXT 只在集合不存在时执行一次性幂等导入。
-- 生产写入使用 `mirror=False`，兼容文件镜像只允许测试或调用方明确指定的外部导出路径。
+- 业务实体只有 `email_accounts`（尚未注册的邮箱）、`gpt_accounts`（已注册 GPT 账号）和 `phones`（手机号）；邮箱来源和账号授权状态均为实体字段。
+- `registration_jobs`、`relay_jobs`、`relay_sub2_services` 和导出状态是任务及集成记录，不是另一套账号或手机号。
+- 只读写当前 SQLite 集合，不生成旧 JSON/TXT 文件镜像或旧查询视图；导出由显式下载接口处理。
 
-新增业务数据时，优先设计 SQLite 集合/文件类别和迁移逻辑，不要重新引入根目录 JSON、日志目录或静态 HTML 快照。
+新增业务数据时复用这三个实体及现有任务记录，不要重新引入按来源拆分的账号集合、根目录 JSON、日志目录或静态 HTML 快照。
 
 ### 4.6 贡献流程
 
@@ -440,7 +460,7 @@ git diff --check
 2. 只修改与目标相关的模块，并补充测试和文档。
 3. 本地运行测试、前端构建和 `git diff --check`。
 4. 提交信息使用清晰的动词短语，提交前检查 `git status`，确认没有敏感文件。
-5. Pull Request 中说明行为变化、迁移影响、验证命令和已知限制。
+5. Pull Request 中说明行为变化、数据影响、验证命令和已知限制。
 
 ## 5. 开源协议
 

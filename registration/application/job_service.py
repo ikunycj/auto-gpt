@@ -88,7 +88,6 @@ def _append_job_log(job_id: int, message: str) -> None:
             log_file,
             f"{ts} [WARNING] [manual-stop] {message}\n",
             category="registration_logs",
-            mirror=False,
         )
     except Exception:
         pass
@@ -108,8 +107,12 @@ def _prepare_registration_args(
     """复用 CLI 的默认规则，为旧 Web 任务入口补齐注册参数。"""
     # 用模块属性读，支持 WebUI 热加载
     from config import register as _r, email as _e
+    from registration.application.use_case import require_password_2fa_driver
     from core.email_provider import acquire_email
     from core.profile_utils import generate_random_birthday
+
+    # Validate before acquire_email marks a short-lived mailbox as used.
+    require_password_2fa_driver()
 
     target_email = str(email_override or "").strip()
     manual_email = str(getattr(_r, "REGISTER_EMAIL", "") or "").strip()
@@ -180,6 +183,7 @@ def _should_disable_failed_registration_email(error: object) -> bool:
         return False
     return (
         _is_final_session_access_token_timeout(text)
+        or "注册密码提交结果不确定" in text
         or "邮箱提交后进入登录密码页" in text
         or "auth.openai.com/log-in/password" in text
         or "/log-in/password" in text
@@ -275,7 +279,6 @@ class _JobLogContext:
         self.handler = sqlite_store.SQLiteFileHandler(
             self.log_path,
             category="registration_logs",
-            mirror=False,
         )
         self.handler.setLevel(logging.INFO)
         self.handler.setFormatter(logging.Formatter(
@@ -319,11 +322,13 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             # Bind a framework-neutral signal so optional browser drivers do
             # not need to import this Web task service.
             from core.email_provider import bind_email_sources
-            from registration.application.use_case import run_registration
+            from registration.application.use_case import run_registration, require_password_2fa_driver
             log_logger.info(f"[Job {job_id}] 开始注册任务")
             target_email = current.get("email")
             email_sources = current.get("email_source")
             with bind_email_sources(email_sources):
+                # Unsupported drivers must fail before reserving a short-lived mailbox.
+                require_password_2fa_driver()
                 email, name, birthday = _prepare_registration_args(
                     target_email,
                     email_sources,
@@ -467,13 +472,47 @@ def _account_for_job(job: dict) -> dict | None:
     account_id = job.get("account_id")
     if account_id is not None:
         try:
-            account = db.get_account(int(account_id))
+            account = db.get_account(str(account_id))
             if account is not None:
                 return account
         except (TypeError, ValueError):
             pass
     email = str(job.get("email") or "").strip()
     return db.get_account_by_email(email) if email else None
+
+
+def _incomplete_login_setup_reason(job: dict, account: dict) -> str | None:
+    """A saved account checkpoint is not proof that password/TOTP setup finished."""
+    error = str(job.get("error") or "").lower()
+    if any(marker in error for marker in ("2fa", "totp", "双重验证", "两步验证")):
+        return (
+            "GPT 账号已创建，但 2FA 设置失败，尚不能确认密码 + TOTP 登录可用。"
+            "请在临时邮箱有效期内到 GPT账号 页面检查密码并完成开启 2FA；"
+            "此任务不能重试注册，以免重复创建账号。"
+        )
+    if any(marker in error for marker in ("密码", "password", "email_otp", "otp-only")):
+        return (
+            "GPT 账号已创建，但登录密码未成功设置或确认，无法保证邮箱到期后可登录。"
+            "请在临时邮箱有效期内设置密码并完成 2FA；"
+            "此任务不能重试注册，以免重复创建账号。"
+        )
+    from config import twofa as _twofa_cfg
+    from core.account_login_material import registered_account_login_material
+
+    if _twofa_cfg.ENABLE_2FA and str(account.get("codex_status") or "") != "failed":
+        credentials = registered_account_login_material(account)
+        missing = []
+        if credentials["login_method"] != "password" or not credentials["chatgpt_password"]:
+            missing.append("密码")
+        if not credentials["totp_secret"]:
+            missing.append("2FA")
+        if missing:
+            return (
+                f"GPT 账号已创建，但{'和'.join(missing)}尚未完成设置或确认。"
+                "请在临时邮箱有效期内完成密码和 2FA；"
+                "此任务不能重试注册，以免重复创建账号。"
+            )
+    return None
 
 
 def get_retry_info(job: dict) -> dict:
@@ -496,6 +535,11 @@ def get_retry_info(job: dict) -> dict:
         return info
 
     account = _account_for_job(job)
+    if account:
+        incomplete_reason = _incomplete_login_setup_reason(job, account)
+        if incomplete_reason:
+            info["retry_reason"] = incomplete_reason
+            return info
     if account and job.get("account_id") is not None and status in ("failed", "stopped"):
         info["display_status"] = "success"
 

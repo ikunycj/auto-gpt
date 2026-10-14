@@ -14,13 +14,6 @@ _INLINE_MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(\s*(https?://[^)\s]+)\s*\)",
 _ESCAPED_PUNCTUATION_RE = re.compile(r"\\([@&*?=()\[\]{}|#.!_~<>:+-])")
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _TOTP_RE = re.compile(r"^[A-Z2-7]{16,64}$", re.IGNORECASE)
-# Older generic-API imports optionally used ``email | code_url |
-# access_token | totp``.  A third field is otherwise ambiguous with a
-# separator embedded in the URL, so only token shapes with a strong and
-# recognizable signature are treated as that legacy column.
-_JWT_ACCESS_TOKEN_RE = re.compile(r"^eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+){2,}$")
-_BEARER_ACCESS_TOKEN_RE = re.compile(r"^Bearer\s+[A-Za-z0-9._~+/=-]{12,}$", re.IGNORECASE)
-_SK_ACCESS_TOKEN_RE = re.compile(r"^sk[-_][A-Za-z0-9_-]{16,}$")
 
 
 def configured_import_separators() -> tuple[str, ...]:
@@ -148,30 +141,13 @@ def looks_like_totp(value: object) -> bool:
     return text.lower().startswith("otpauth://") or bool(_TOTP_RE.fullmatch(text))
 
 
-def looks_like_access_token(value: object) -> bool:
-    """Recognize strong markers used by the legacy generic-API token column.
-
-    Arbitrary short strings intentionally do not qualify: for a line such as
-    ``email | https://host/path----suffix`` there is no information-theoretic
-    way to tell a password/token from a URL suffix.  Keeping the suffix in
-    the URL is the least surprising behavior unless the value has a known
-    token signature.
-    """
-    text = clean_import_value(value)
-    return bool(
-        _JWT_ACCESS_TOKEN_RE.fullmatch(text)
-        or _BEARER_ACCESS_TOKEN_RE.fullmatch(text)
-        or _SK_ACCESS_TOKEN_RE.fullmatch(text)
-    )
-
-
 def looks_like_phone(value: object) -> bool:
     text = clean_import_value(value)
     digits = "".join(char for char in text if char.isdigit())
     return bool(digits) and len(digits) in range(7, 16) and all(char.isdigit() or char in "+ -()." for char in text)
 
 
-def _looks_like_password_candidate(value: object) -> bool:
+def _looks_like_password_candidate(value: object, *, allow_plain_word: bool = False) -> bool:
     """Return whether an opaque field is plausibly a password.
 
     The configured separator is an explicit field boundary. Passwords commonly
@@ -179,11 +155,20 @@ def _looks_like_password_candidate(value: object) -> bool:
     characters must not make a trailing password look like part of the URL.
     """
     text = clean_import_value(value)
-    if not text or len(text) < 6 or len(text) > 512:
+    if not text or len(text) < 6 or len(text) > 512 or any(char.isspace() for char in text):
         return False
     if is_email(text) or is_http_url(text) or looks_like_totp(text) or looks_like_phone(text):
         return False
-    if "://" in text:
+    if re.search(r"(?:[a-z][a-z0-9+.-]*://|www\.)", text, re.IGNORECASE):
+        return False
+    # A bare word is indistinguishable from an arbitrary note.  Auto-detect
+    # only password-shaped strings; callers with explicit fields can still
+    # accept all-letter passwords without this ambiguity.
+    if not allow_plain_word and (not re.search(r"[A-Za-z]", text) or not re.search(r"[^A-Za-z]", text)):
+        return False
+    # An extra separator makes this an ambiguous multi-field line, not an
+    # opaque password.  URL suffixes are handled separately by the caller.
+    if any(separator in text for separator in configured_import_separators()):
         return False
     return True
 
@@ -214,14 +199,21 @@ def _candidate_material(record_fields: tuple[str, ...]) -> dict | None:
         if len(totps) > 1:
             return None
         if not totps:
-            # Four opaque Outlook fields and an untyped two-field line are
-            # handled by the legacy format fallback in the caller.
-            return None
+            # A two-column email/password line has an explicit boundary;
+            # longer opaque lines without a typed field are ambiguous.
+            if len(record_fields) != 2 or len(non_urls) != 1:
+                return None
+            if not _looks_like_password_candidate(non_urls[0]):
+                return None
+            record["chatgpt_password"] = non_urls[0]
+            return record
         record["totp_secret"] = totps[0]
         non_urls.remove(totps[0])
         if len(non_urls) > 1:
             return None
         if non_urls:
+            if not _looks_like_password_candidate(non_urls[0], allow_plain_word=True):
+                return None
             record["chatgpt_password"] = non_urls[0]
         return record
     if len(urls) == 1:
@@ -250,6 +242,8 @@ def _candidate_material(record_fields: tuple[str, ...]) -> dict | None:
     if len(non_urls) > 1:
         return None
     if non_urls:
+        if not _looks_like_password_candidate(non_urls[0], allow_plain_word=bool(totps)):
+            return None
         record["chatgpt_password"] = non_urls[0]
     return record
 
@@ -325,26 +319,7 @@ def parse_account_material_line(line: object) -> dict | None:
 
 def parse_email_code_url_line(line: object) -> tuple[str, str] | None:
     """Parse the common ``email<separator>code URL`` format."""
-    text = clean_import_value(line)
-    record = parse_account_material_line(text)
-    legacy_parts = split_import_line(text, max_fields=4)
-    if (
-        3 <= len(legacy_parts) <= 4
-        and is_email(legacy_parts[0])
-        and is_http_url(legacy_parts[1])
-        and looks_like_access_token(legacy_parts[2])
-        and (len(legacy_parts) == 3 or looks_like_totp(legacy_parts[3]))
-    ):
-        # Keep compatibility with the old fixed-position shape only when the
-        # optional token has a strong signature.  Otherwise the complete URL
-        # (including any embedded separator) remains authoritative.
-        return clean_import_value(legacy_parts[0]).lower(), clean_import_value(legacy_parts[1])
+    record = parse_account_material_line(line)
     if record and record.get("email_code_url"):
         return record["email"], record["email_code_url"]
-    if (
-        2 <= len(legacy_parts)
-        and is_email(legacy_parts[0])
-        and is_http_url(legacy_parts[1])
-    ):
-        return clean_import_value(legacy_parts[0]).lower(), clean_import_value(legacy_parts[1])
     return None

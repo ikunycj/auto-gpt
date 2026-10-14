@@ -7,14 +7,20 @@ import time
 from pathlib import Path
 
 from config import twofa as _twofa_cfg
-from core.account_export import save_account_data
+from core.account_export import save_account_data, setup_2fa
+from core.chatgpt_browser_login import verify_password_totp_login
 from core.chrome_cdp_driver import build_chrome_cdp_driver
 from core.email_provider import resolve_email_source, wait_for_otp
+from registration.drivers.roxy.implementation import (
+    RegistrationPasswordSubmissionError,
+    _safe_exception_text,
+)
 from core.humanize import delay as human_delay
 from registration.drivers.shared.selenium_steps import (
     _check_manual_stop,
     _clear_otp_inputs,
     _click_continue,
+    _click_continue_with_password_if_present,
     _click_resend_email_otp,
     _complete_profile_page,
     _fetch_chatgpt_session,
@@ -30,6 +36,24 @@ from registration.drivers.shared.selenium_steps import (
 logger = logging.getLogger(__name__)
 
 
+def _setup_2fa_after_registration(
+    driver,
+    email: str,
+    proxy: str,
+) -> str:
+    """Reuse the Chrome login state to re-authenticate and enable TOTP.
+
+    All reauthentication, OTP validation, TOTP enrollment, and activation
+    requests stay inside the same browser profile.  A second HTTP client can
+    lose browser-only cookies or be challenged as a different device, so it is
+    intentionally not used here.
+    """
+    from core.browser_2fa_session import BrowserBacked2FASession
+
+    session = BrowserBacked2FASession(driver)
+    return setup_2fa(session, email, otp_provider=wait_for_otp)
+
+
 def run_chrome_cdp_registration(
     email: str,
     name: str,
@@ -43,6 +67,9 @@ def run_chrome_cdp_registration(
     opened = None
     create_acknowledged = False
     openai_password: str | None = None
+    require_2fa = bool(_twofa_cfg.ENABLE_2FA)
+    # WebUI may reload configuration during a task; keep this requirement
+    # fixed until the account has passed login verification and been saved.
     try:
         driver, opened = build_chrome_cdp_driver(proxy=proxy, background=False)
         logger.info("[Chrome注册] 开始：%s，profile=%s", email, opened.profile_id)
@@ -61,13 +88,31 @@ def run_chrome_cdp_registration(
             create_acknowledged = True
             needs_email_otp = False
         elif next_state == "password":
-            openai_password = _fill_password_page_if_present(driver, email, timeout=25)
+            openai_password = _fill_password_page_if_present(
+                driver, email, timeout=25, allow_passwordless_signup=not require_2fa,
+            )
             if openai_password or _has_access_token(driver):
                 create_acknowledged = True
             needs_email_otp = _is_email_verification_page(driver)
         else:
-            openai_password = None
-            needs_email_otp = True
+            if require_2fa:
+                switch = _click_continue_with_password_if_present(driver)
+                if not switch.get("ok"):
+                    raise RuntimeError(
+                        "已启用 2FA，但仍未设置密码；邮箱验证码页没有打开密码注册入口；"
+                        f"已停止邮箱 OTP 单独登录的注册: {switch.get('reason')}"
+                    )
+                openai_password = _fill_password_page_if_present(
+                    driver, email, timeout=25, allow_passwordless_signup=False,
+                )
+                if openai_password or _has_access_token(driver):
+                    create_acknowledged = True
+                needs_email_otp = _is_email_verification_page(driver)
+            else:
+                openai_password = None
+                needs_email_otp = True
+        if require_2fa and not openai_password:
+            raise RuntimeError("已启用 2FA，但注册流程未设置密码；已停止邮箱 OTP 单独登录的注册")
         _check_manual_stop()
 
         current_otp = otp_code
@@ -90,7 +135,7 @@ def run_chrome_cdp_registration(
                         otp_attempt + 1,
                         max_otp_attempts,
                         type(exc).__name__,
-                        str(exc)[:180],
+                        _safe_exception_text(exc, 180),
                     )
                     otp_after_ts = time.time()
                     _click_resend_email_otp(driver, timeout=25)
@@ -98,7 +143,7 @@ def run_chrome_cdp_registration(
                     current_otp = None
                     continue
 
-            logger.info("[Chrome注册][OTP] 收到验证码：%s", current_otp)
+            logger.info("[Chrome注册][OTP] 已收到邮箱验证码")
             _clear_otp_inputs(driver)
             _type_otp(driver, current_otp)
             human_delay("otp_input")
@@ -107,7 +152,7 @@ def run_chrome_cdp_registration(
             except Exception as exc:
                 logger.info(
                     "[Chrome注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s",
-                    str(exc)[:120],
+                    _safe_exception_text(exc, 120),
                 )
 
             outcome = _wait_after_email_otp_submit(driver, timeout=10)
@@ -133,8 +178,6 @@ def run_chrome_cdp_registration(
         create_acknowledged = True
         logger.info("[Chrome注册] 已拿到 accessToken：%s", email)
 
-        if _twofa_cfg.ENABLE_2FA:
-            logger.warning("[Chrome注册] 当前本机 Chrome 注册路径暂不执行 2FA 设置，已跳过")
         totp_secret = None
 
         email_source = resolve_email_source(email)
@@ -145,52 +188,65 @@ def run_chrome_cdp_registration(
             "ok": False,
             "message": "GPT 注册完成，等待在 GPT账号 页面手动发起 Codex 授权",
         }
-        account_extra = {
-            "user": session_info.get("user"),
-            "account": session_info.get("account"),
-            "expires": session_info.get("expires"),
-            "chrome_cdp": {
-                "profile_id": opened.profile_id,
-                "open_result": opened_raw,
-            },
-            "registration_password": openai_password,
-            "login_method": "password" if openai_password else "email_otp",
-            "codex": codex_result,
+        account_fields = {
+            "user_id": (session_info.get("user") or {}).get("id"),
+            "user_name": (session_info.get("user") or {}).get("name"),
+            "plan_type": (session_info.get("account") or {}).get("planType"),
+            "expires_at": session_info.get("expires"),
+            "registration_driver": "chrome_cdp",
+            "registration_profile_id": opened.profile_id,
+            "codex_status": codex_result["status"],
         }
-        account_id = save_account_data(
-            email=email,
-            access_token=access_token,
-            totp_secret=totp_secret,
-            email_source=email_source,
-            proxy_used=effective_proxy,
-            batch_dir=batch_dir,
-            extra=account_extra,
-            archive=False,
-            enqueue_plan=True,
-        )
-        if openai_password:
-            logger.info(
-                "[Chrome注册][检查点] 账号及登录密码已即时写入：%s，账号ID=%s",
-                email,
-                account_id,
-            )
-        else:
-            logger.info(
-                "[Chrome注册][检查点] 账号已即时写入（OTP 登录，未经过密码创建页）：%s，账号ID=%s",
-                email,
-                account_id,
-            )
+        if require_2fa:
+            logger.info("[Chrome注册] 开始自动设置 2FA：%s", email)
+            try:
+                totp_secret = _setup_2fa_after_registration(
+                    driver,
+                    email,
+                    effective_proxy or "",
+                )
+                if not totp_secret:
+                    raise RuntimeError("2FA 激活后未返回 TOTP secret")
+                logger.info("[Chrome注册] 2FA 设置完成：%s", email)
+            except Exception as exc:
+                logger.error("[Chrome注册] 2FA 设置失败：%s: %s", type(exc).__name__, _safe_exception_text(exc))
+                raise RuntimeError(
+                    f"Chrome 注册已创建密码，但 2FA 设置失败：{type(exc).__name__}: {_safe_exception_text(exc, 180)}"
+                ) from exc
+
+            # The verification helper starts a separate Chrome profile and
+            # requires password submission, TOTP challenge, and accessToken.
+            from registration.drivers.roxy.implementation import _clear_chatgpt_auth_state
+
+            logger.info("[Chrome注册] 清理注册浏览器登录态：%s", email)
+            _clear_chatgpt_auth_state(driver)
+            logger.info("[Chrome注册] 开始密码 + TOTP 重登录验证：%s", email)
+            try:
+                verified_info = verify_password_totp_login(
+                    email, openai_password, totp_secret, proxy=effective_proxy,
+                )
+                access_token = verified_info["accessToken"]
+            except Exception as exc:
+                logger.error("[Chrome注册] 密码 + TOTP 重登录验证失败：%s", type(exc).__name__)
+                raise RuntimeError(
+                    "Chrome 注册已创建密码和 2FA，但独立密码 + TOTP 登录验证失败："
+                    f"{type(exc).__name__}"
+                ) from exc
+            logger.info("[Chrome注册] 密码 + TOTP 重登录验证成功：%s", email)
 
         account_id = save_account_data(
             email=email,
             access_token=access_token,
             totp_secret=totp_secret,
             email_source=email_source,
-            proxy_used=effective_proxy,
+            chatgpt_password=openai_password,
+            login_method="password" if openai_password else "email_otp",
+            proxy=effective_proxy,
             batch_dir=batch_dir,
-            extra=account_extra,
+            **account_fields,
             archive=True,
-            enqueue_plan=False,
+        verified_registration=True,
+            enqueue_plan=True,
         )
         return {
             "success": True,
@@ -202,22 +258,22 @@ def run_chrome_cdp_registration(
             "error": None,
         }
     except Exception as exc:
-        logger.error("[Chrome注册] 失败：%s: %s", type(exc).__name__, exc)
-        logger.debug("[Chrome注册] 失败详情", exc_info=True)
+        logger.error("[Chrome注册] 失败：%s: %s", type(exc).__name__, _safe_exception_text(exc))
         try:
             from core.email_provider import release_email
 
             release_email(
                 email,
-                status="failed" if create_acknowledged else "available",
-                note=f"Chrome注册失败: {str(exc)[:180]}",
+                status=("disabled" if isinstance(exc, RegistrationPasswordSubmissionError)
+                        else "failed" if create_acknowledged else "available"),
+                note=f"Chrome注册失败: {_safe_exception_text(exc, 180)}",
             )
         except Exception:
             pass
         return {
             "success": False,
             "email": email,
-            "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            "error": f"{type(exc).__name__}: {_safe_exception_text(exc, 300)}",
         }
     finally:
         if driver is not None:

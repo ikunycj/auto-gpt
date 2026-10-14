@@ -281,11 +281,19 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "ROXY_CREATE_USE_PROXY_POOL", "file": "roxybrowser.py", "type": "bool", "group": "代理浏览器",
-        "label": "创建环境使用代理池", "help": "创建 Roxy 环境时从配置页「代理池」随机取一个代理，写入 Roxy proxyInfo",
+        "label": "创建环境使用代理池（旧配置）", "help": "仅兼容旧配置；当前注册与授权始终按 显式代理 > 代理池 > 本机网络 选择，此开关不再影响路由",
     },
     {
         "key": "ROXY_PROXY_CHECK_CHANNEL", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "代理检测通道", "help": "写入 Roxy proxyInfo.checkChannel；留空则不传，默认 IPRust.io",
+    },
+    {
+        "key": "ROXY_PROXY_UPDATE_PATH", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
+        "label": "Roxy代理更新接口（可选）", "help": "默认 /browser/mdf；仅在固定 Profile 关闭时同步网络。留空禁用自动修改；线路不一致时停止，不沿用旧代理",
+    },
+    {
+        "key": "ROXY_PROXY_UPDATE_METHOD", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
+        "label": "Roxy代理更新方法", "help": "配合 Roxy代理更新接口使用，默认 POST",
     },
     {
         "key": "ROXY_DELETE_PATH", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
@@ -558,7 +566,7 @@ EDITABLE_FIELDS = [
     # ---- 代理池 ----
     {
         "key": "PROXY_POOL", "file": "proxy.py", "type": "list_str_multiline", "group": "代理池",
-        "label": "代理池(每行一个)", "help": "每行一个代理 URL，留空行会被忽略；为空则不使用代理",
+        "label": "代理池(每行一个)", "help": "注册时优先使用池中代理，留空使用本机网络；注册使用的非本机代理会记录到账号。已有账号仅使用自身记录的代理，无记录则使用本机网络。可先测试再保存；Roxy 已开窗口路由不一致时需先关闭，不会静默切换直连",
     },
     {
         "key": "PLAN_CHECK_PROXY_MODE", "file": "proxy.py", "type": "str", "group": "代理池",

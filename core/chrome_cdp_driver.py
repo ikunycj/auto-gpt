@@ -12,6 +12,7 @@ import logging
 import os
 import platform
 import base64
+import random
 import select
 import shutil
 import socket
@@ -32,6 +33,9 @@ from core.cloakbrowser_driver import CloakSeleniumDriver
 
 
 logger = logging.getLogger(__name__)
+
+_CHATGPT_LOGIN_URL = "https://chatgpt.com/auth/login"
+_PROXY_PREFLIGHT_TIMEOUT = 8.0
 
 
 @dataclass
@@ -90,6 +94,117 @@ def _proxy_server_arg(proxy: str | None) -> str:
     host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
     port = f":{parsed.port}" if parsed.port else ""
     return f"{parsed.scheme or 'http'}://{host}{port}"
+
+
+def _mask_proxy_endpoint(proxy: str | None) -> str:
+    """Return a log-safe proxy endpoint without credentials."""
+    value = str(proxy or "").strip()
+    if not value:
+        return "direct"
+    try:
+        parsed = urlsplit(normalize_proxy_url(value))
+    except Exception:
+        return "invalid-proxy"
+    if not parsed.hostname:
+        return "invalid-proxy"
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme or 'http'}://{host}{port}"
+
+
+def _probe_chatgpt_route(proxy: str | None, timeout: float = _PROXY_PREFLIGHT_TIMEOUT) -> tuple[bool, str]:
+    """Check that the selected route can receive an HTTPS response from ChatGPT.
+
+    A Cloudflare ``403`` is still a useful transport response and therefore
+    counts as reachable. Connection resets, timeouts, proxy-auth failures, and
+    upstream 5xx responses are rejected before Chrome starts.
+    """
+    # Direct routes are explicitly pinned with --no-proxy-server when Chrome
+    # starts; leave their navigation check to the browser.
+    if not str(proxy or "").strip():
+        return True, "local network (browser check)"
+
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError:
+        logger.warning("[ChromeCDP] 未找到 curl_cffi，跳过 ChatGPT 代理预检")
+        return True, "curl_cffi unavailable"
+
+    request_kwargs = {
+        "timeout": max(1.0, float(timeout)),
+        "impersonate": "chrome",
+        "allow_redirects": False,
+    }
+    if proxy:
+        request_kwargs["proxies"] = {"http": proxy, "https": proxy}
+    try:
+        response = curl_requests.get(_CHATGPT_LOGIN_URL, **request_kwargs)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {str(exc)[:160]}"
+
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status == 407:
+        return False, "HTTP 407 proxy authentication required"
+    if 500 <= status <= 599:
+        return False, f"HTTP {status} upstream error"
+    if 100 <= status <= 499:
+        return True, f"HTTP {status}"
+    return False, f"HTTP {status or 'invalid'}"
+
+
+def _proxy_candidates(proxy: str | None) -> list[str]:
+    """Resolve explicit or configured proxy candidates without exposing secrets."""
+    if proxy is not None:
+        return [normalize_proxy_url(proxy)] if str(proxy).strip() else [""]
+
+    try:
+        from config import proxy as proxy_cfg
+
+        configured = list(getattr(proxy_cfg, "PROXY_POOL", []) or [])
+    except Exception:
+        configured = []
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for raw in configured:
+        try:
+            value = normalize_proxy_url(raw)
+        except Exception as exc:
+            logger.warning("[ChromeCDP] 忽略无效代理配置：%s", type(exc).__name__)
+            continue
+        if value and value not in seen:
+            seen.add(value)
+            candidates.append(value)
+    if configured and not candidates:
+        raise RuntimeError(
+            "代理池没有有效代理端点；请填写带端口的 HTTP(S)/SOCKS 代理地址，"
+            "订阅下载链接不能直接作为代理使用"
+        )
+    # Only an explicitly empty pool allows direct/system-proxy access.
+    return candidates or [""]
+
+
+def _select_proxy(proxy: str | None) -> str:
+    """Select the first candidate with a working ChatGPT HTTPS route."""
+    candidates = _proxy_candidates(proxy)
+    if len(candidates) > 1 and proxy is None:
+        random.shuffle(candidates)
+
+    failures: list[str] = []
+    for candidate in candidates:
+        endpoint = _mask_proxy_endpoint(candidate)
+        healthy, detail = _probe_chatgpt_route(candidate)
+        if healthy:
+            logger.info("[ChromeCDP] ChatGPT 代理预检通过：%s (%s)", endpoint, detail)
+            return candidate
+        failures.append(f"{endpoint}: {detail}")
+        logger.warning("[ChromeCDP] ChatGPT 代理预检失败：%s (%s)", endpoint, detail)
+
+    joined = "; ".join(failures[:5])
+    raise RuntimeError(
+        "Chrome CDP 无可用的 ChatGPT 网络路由；请更换能访问 "
+        f"{_CHATGPT_LOGIN_URL} 的代理。预检结果：{joined}"
+    )
 
 
 class _AuthenticatedProxyBridge:
@@ -161,18 +276,29 @@ class _AuthenticatedProxyBridge:
             headers = [line for line in lines[1:] if not line.lower().startswith(("proxy-authorization:", "proxy-connection:"))]
             headers.append(self._auth_header)
             upstream = self._connect_upstream()
+            upstream.settimeout(20)
             upstream_request = ("\r\n".join([lines[0], *headers]) + "\r\n\r\n").encode("latin-1") + remainder
             upstream.sendall(upstream_request)
             response = self._read_headers(upstream)
+            if not response or not response.startswith(b"HTTP/"):
+                raise ConnectionError("上游代理未返回有效 HTTP 响应")
             client.sendall(response)
-            if method == "CONNECT" and not response.startswith(b"HTTP/"):
-                return
             if method == "CONNECT" and b" 200 " not in response.split(b"\r\n", 1)[0]:
                 return
             self._relay(client, upstream)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "[ChromeCDP] 认证代理桥接失败 endpoint=%s error=%s: %s",
+                _mask_proxy_endpoint(f"{self._scheme}://{self._host}:{self._port}"),
+                type(exc).__name__,
+                str(exc)[:180],
+            )
             try:
-                client.close()
+                client.sendall(
+                    b"HTTP/1.1 502 Bad Gateway\r\n"
+                    b"Content-Length: 0\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
             except Exception:
                 pass
         finally:
@@ -220,6 +346,8 @@ def _build_chrome_command(executable: str, port: int, profile_dir: str, proxy: s
     proxy_server = _proxy_server_arg(proxy)
     if proxy_server:
         command.append(f"--proxy-server={proxy_server}")
+    else:
+        command.append("--no-proxy-server")
     command.append("--incognito")
     if background:
         command.append("--start-minimized")
@@ -318,14 +446,7 @@ def build_chrome_cdp_driver(
     background: bool = False,
     keep_open: bool | None = None,
 ) -> tuple[ChromeCDPSeleniumDriver, ChromeCDPOpenResult]:
-    selected_proxy = normalize_proxy_url(proxy) if proxy else proxy
-    if selected_proxy is None:
-        try:
-            from config.proxy import pick_proxy
-
-            selected_proxy = pick_proxy()
-        except Exception:
-            selected_proxy = None
+    selected_proxy = _select_proxy(proxy)
 
     executable = _find_chrome_executable()
     port = _reserve_local_port()

@@ -91,13 +91,16 @@ ROXY_DEFAULT_OS: str = "macOS"
 # 留空则使用 Roxy 对应系统的默认/最大版本；如需固定可填 15.3.2、14.7 等。
 ROXY_DEFAULT_OS_VERSION: str = ""
 
-# 创建 Roxy 环境时是否使用 config/proxy.py 的 PROXY_POOL：
-#   False = 不主动给 Roxy 环境设置代理
-#   True  = 每次创建环境时从 PROXY_POOL 随机取一个代理写入 proxyInfo
+# 兼容旧配置字段；注册/授权现在统一为 显式代理 > PROXY_POOL > 本机网络。
+# 不再用此开关跳过代理池，也不会保留固定 Profile 的过期代理。
 ROXY_CREATE_USE_PROXY_POOL: bool = False
 
 # Roxy 代理检测通道；留空则不传 checkChannel。
 ROXY_PROXY_CHECK_CHANNEL: str = "IPRust.io"
+
+# 固定 Profile 关闭时使用官方修改接口同步网络；留空可禁用自动修改。
+ROXY_PROXY_UPDATE_PATH: str = "/browser/mdf"
+ROXY_PROXY_UPDATE_METHOD: str = "POST"
 
 # 没有 ROXY_PROFILE_ID 时创建环境的最小 payload；按你的 Roxy 版本字段调整。
 # 默认开启 ROXY_RANDOM_PROFILE_NAME_ON_CREATE，因此这里的 name 只是兜底值。
@@ -143,5 +146,7 @@ apply_env_overrides(globals(), {
     'ROXY_PROFILE_NAME_PREFIX': 'str',
     'ROXY_CREATE_USE_PROXY_POOL': 'bool',
     'ROXY_PROXY_CHECK_CHANNEL': 'str',
+    'ROXY_PROXY_UPDATE_PATH': 'str',
+    'ROXY_PROXY_UPDATE_METHOD': 'str',
     'ROXY_CODEX_CALLBACK_TIMEOUT': 'int',
 })

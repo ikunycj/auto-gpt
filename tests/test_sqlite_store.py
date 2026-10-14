@@ -25,7 +25,7 @@ def sqlite_workspace(tmp_path, monkeypatch):
     return tmp_path, database
 
 
-def test_json_round_trip_uses_sqlite_and_materializes_compatibility_copy(
+def test_json_round_trip_uses_sqlite_without_writing_disk_files(
     sqlite_workspace,
 ):
     root, database = sqlite_workspace
@@ -38,7 +38,7 @@ def test_json_round_trip_uses_sqlite_and_materializes_compatibility_copy(
     sqlite_store.write_json(source, value, collection="test-state")
 
     assert sqlite_store.read_json(source, collection="test-state") == value
-    assert json.loads(source.read_text(encoding="utf-8")) == value
+    assert not source.exists()
     assert database.exists()
 
     with sqlite_store.connect(database) as connection:
@@ -51,30 +51,18 @@ def test_json_round_trip_uses_sqlite_and_materializes_compatibility_copy(
     assert row["source_key"] == str(source.resolve())
 
 
-def test_legacy_json_is_imported_once_and_later_mirror_edits_are_ignored(
-    sqlite_workspace,
-):
+def test_read_json_ignores_existing_disk_file(sqlite_workspace):
     root, _database = sqlite_workspace
-    source = root / "legacy.json"
-    original = {"items": ["first", "second"], "enabled": True}
-    source.write_text(json.dumps(original), encoding="utf-8")
+    source = root / "state.json"
+    source.write_text(json.dumps({"from": "disk"}), encoding="utf-8")
 
-    assert sqlite_store.migrate_json_file(
-        source, default={}, collection="legacy-state"
-    ) is True
-    assert sqlite_store.migrate_json_file(
-        source, default={}, collection="legacy-state"
-    ) is False
-    assert sqlite_store.read_json(source, collection="legacy-state") == original
+    assert sqlite_store.read_json(
+        source, default={"from": "default"}, collection="sqlite-only"
+    ) == {"from": "default"}
 
-    # The old file remains a compatibility mirror.  Once imported, changing it
-    # must not change the authoritative SQLite value.
-    source.write_text(
-        json.dumps({"items": ["tampered"], "enabled": False}),
-        encoding="utf-8",
-    )
-    assert sqlite_store.read_json(source, default={}, collection="legacy-state") == original
-
+    sqlite_store.write_json(source, {"from": "sqlite"}, collection="sqlite-only")
+    source.write_text(json.dumps({"from": "tampered"}), encoding="utf-8")
+    assert sqlite_store.read_json(source, collection="sqlite-only") == {"from": "sqlite"}
 
 def test_file_write_read_append_list_and_delete(sqlite_workspace):
     root, database = sqlite_workspace
@@ -194,22 +182,20 @@ def test_update_json_serializes_concurrent_read_modify_write(sqlite_workspace):
     assert sqlite_store.read_json(source, collection="counter")["count"] == 24
 
 
-def test_sqlite_only_writes_do_not_materialize_legacy_mirrors(sqlite_workspace):
+def test_sqlite_writes_do_not_materialize_disk_files(sqlite_workspace):
     root, _database = sqlite_workspace
     source = root / "runtime" / "state.json"
     log_path = root / "runtime" / "task.log"
 
-    sqlite_store.write_json(source, {"ok": True}, collection="sqlite-only", mirror=False)
+    sqlite_store.write_json(source, {"ok": True}, collection="sqlite-only")
     sqlite_store.append_json_item(
         source,
         {"id": "one"},
         collection="sqlite-only-list",
-        mirror=False,
     )
-    sqlite_store.append_file(log_path, "stored\n", category="sqlite-only-logs", mirror=False)
+    sqlite_store.append_file(log_path, "stored\n", category="sqlite-only-logs")
 
     assert not source.exists()
     assert not log_path.exists()
     assert sqlite_store.read_json(source, collection="sqlite-only") == {"ok": True}
     assert sqlite_store.read_file(log_path, category="sqlite-only-logs") == b"stored\n"
-    assert sqlite_store.legacy_mirror_allowed(source) is True

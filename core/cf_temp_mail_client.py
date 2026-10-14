@@ -598,7 +598,7 @@ def fetch_latest_otp(
             messages = list_messages(account.jwt)
         except CFTempMailError as exc:
             last_error = str(exc)
-            logger.warning("[Cloudflare] 拉取邮件失败: %s", exc)
+            logger.warning("[Cloudflare] 拉取邮件失败：%s", type(exc).__name__)
             time.sleep(interval)
             continue
 
@@ -626,30 +626,27 @@ def fetch_latest_otp(
             otp_item = otp_probe
             if not looks_like_openai_email(otp_item):
                 logger.debug(
-                    "[Cloudflare] 跳过非 OpenAI 邮件 id=%s from=%s subject=%s",
+                    "[Cloudflare] 跳过非 OpenAI 邮件 id=%s from=%s",
                     msg_id,
                     str(otp_item.get("from") or "")[:80],
-                    str(otp_item.get("subject") or "")[:80],
                 )
                 continue
 
             ts = _message_timestamp(detail)
             if ts is not None and ts < after:
                 logger.info(
-                    "[Cloudflare] 跳过过旧邮件 id=%s ts=%s after=%s subject=%s",
+                    "[Cloudflare] 跳过过旧邮件 id=%s ts=%s after=%s",
                     msg_id,
                     int(ts),
                     int(after),
-                    str(otp_item.get("subject") or "")[:60],
                 )
                 continue
 
             otp = extract_otp(otp_item)
             if not otp:
                 logger.info(
-                    "[Cloudflare] OpenAI 邮件未能抽取 6 位码 id=%s subject=%s",
+                    "[Cloudflare] OpenAI 邮件未能抽取 6 位码 id=%s",
                     msg_id,
-                    str(otp_item.get("subject") or "")[:80],
                 )
                 continue
 
@@ -659,9 +656,9 @@ def fetch_latest_otp(
                 effective_ts == best_timestamp and message_key != best_message_key and best_otp != otp
             ):
                 if best_otp and best_otp != otp:
-                    logger.info("[Cloudflare] 发现更晚 OTP=%s，替换 %s", otp, best_otp)
+                    logger.info("[Cloudflare] 发现更晚 OTP 候选，替换旧候选")
                 elif not best_otp:
-                    logger.info("[Cloudflare] 锁定 OTP 候选 %s，等待 settle=%ss", otp, settle)
+                    logger.info("[Cloudflare] 锁定 OTP 候选，等待 settle=%ss", settle)
                 best_otp = otp
                 best_timestamp = effective_ts
                 best_message_key = message_key
@@ -672,14 +669,13 @@ def fetch_latest_otp(
 
         now = time.monotonic()
         if best_otp and settle_until is not None and now >= settle_until:
-            logger.info("[Cloudflare] settle 完成，返回 OTP=%s", best_otp)
+            logger.info("[Cloudflare] settle 完成，返回 OTP 候选")
             return best_otp
 
         remaining = max(0, int(deadline - now))
         if best_otp and settle_until is not None:
             logger.info(
-                "[Cloudflare] 已有候选 OTP=%s，settle 剩余 ~%ss，总剩余 %ss",
-                best_otp,
+                "[Cloudflare] 已有 OTP 候选，settle 剩余 ~%ss，总剩余 %ss",
                 max(0, int(settle_until - now)),
                 remaining,
             )
@@ -695,7 +691,7 @@ def fetch_latest_otp(
         time.sleep(min(interval, max(1, remaining)))
 
     if best_otp:
-        logger.warning("[Cloudflare] 总超时但已有候选，返回 OTP=%s", best_otp)
+        logger.warning("[Cloudflare] 总超时但已有 OTP 候选，返回候选")
         return best_otp
 
     raise CFTempMailError(f"等待 Cloudflare 验证码超时: {target}; {last_error}")

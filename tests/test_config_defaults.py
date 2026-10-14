@@ -84,7 +84,7 @@ class ConfigDefaultFallbackTests(unittest.TestCase):
             counts,
             {
                 "general": 1,
-                "roxy": 31,
+                "roxy": 33,
                 "cloak": 12,
                 "browser_use": 14,
                 "skyvern": 10,

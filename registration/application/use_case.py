@@ -8,6 +8,7 @@ through the lazy driver registry.
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from config import twofa as _twofa_cfg
@@ -38,8 +39,44 @@ from registration.application.models import RegistrationRequest, RegistrationRes
 from registration.drivers.registry import get_driver
 
 logger = logging.getLogger(__name__)
+
+_LOG_SECRET_RE = re.compile(
+    r"(?i)(\b(?:password|passwd|token|secret|authorization|cookie|otp|code|access_token|refresh_token)\b\s*[:=]\s*)([^\s,;]+)"
+)
+_LOG_URL_RE = re.compile(r"(?i)\b(?:https?|chrome-error)://[^\s<>\"']+")
+_LOG_LONG_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{32,}\b")
+
+
+def _safe_log_text(value: object, limit: int = 240) -> str:
+    """Keep error class/context while excluding auth URLs and credential values."""
+    text = " ".join(str(value or "").split())
+    if not text:
+        return "-"
+    text = _LOG_URL_RE.sub("[URL已隐藏]", text)
+    text = _LOG_SECRET_RE.sub(lambda match: f"{match.group(1)}[已隐藏]", text)
+    text = _LOG_LONG_TOKEN_RE.sub("[长令牌已隐藏]", text)
+    return text[:limit] + ("…" if len(text) > limit else "")
+
 _FINALIZE_SESSION_MAX_ATTEMPTS = 5
 _FINALIZE_SESSION_BACKOFF_BASE = 2.0
+
+
+def require_password_2fa_driver(driver_mode: str | None = None) -> None:
+    """Reject drivers that cannot leave a temporary mailbox with password + TOTP."""
+    if not _twofa_cfg.ENABLE_2FA:
+        return
+
+    from config import roxybrowser as _roxy_cfg
+    from registration.drivers.registry import normalize_driver_name
+
+    configured = driver_mode if driver_mode is not None else getattr(_roxy_cfg, "REGISTRATION_DRIVER", "protocol")
+    driver = normalize_driver_name(configured)
+    if driver not in {"roxy", "chrome_cdp"}:
+        raise RuntimeError(
+            f"启用 2FA 时，{driver} 注册驱动不能保证完成密码和 TOTP 设置；"
+            "请切换到 roxy 或 chrome_cdp，再领取临时邮箱。"
+        )
+
 
 def _finalize_registration_session(
     session: BrowserSession,
@@ -78,7 +115,7 @@ def _finalize_registration_session(
             backoff = _FINALIZE_SESSION_BACKOFF_BASE ** (attempt - 1)
             logger.warning(
                 f"[登录态] 回调或拉取 Token 失败：{email}，"
-                f"{type(exc).__name__}: {str(exc)[:180]}，{backoff:.1f}s 后重试"
+                f"{type(exc).__name__}: {_safe_log_text(exc)}，{backoff:.1f}s 后重试"
             )
             time.sleep(backoff)
 
@@ -109,6 +146,8 @@ def _run_protocol_registration(
         proxy: 代理地址（不传则从 PROXY_POOL 随机抽）
         otp_code: 邮箱验证码（如果为None，会等待手动输入）
     """
+    require_password_2fa_driver("protocol")
+
     # This helper is called by the protocol adapter only; driver selection is
     # owned by the registry and happens before entering this function.
     # 创建浏览器会话（proxy=None 时自动从 config.PROXY_POOL 随机抽一个）
@@ -208,7 +247,7 @@ def _run_protocol_registration(
             except EmailOtpInvalidError as exc:
                 if otp_attempt >= max_otp_attempts:
                     raise
-                logger.warning(f"[OTP] 验证码错误/过期：{str(exc)[:180]}，准备重新发送并重新获取验证码")
+                logger.warning("[OTP] 验证码错误/过期：%s，准备重新发送并重新获取验证码", _safe_log_text(exc, 180))
                 otp_after_ts = time.time()
                 send_email_otp(session)
                 human_delay("api")
@@ -317,8 +356,8 @@ def _run_protocol_registration(
                 )
             human_delay("post_auth")
 
-        # accessToken 代表 GPT 注册已经真实完成。先落库，再执行可选的 2FA，
-        # 让 WebUI 下一轮轮询即可看到账号、邮箱渠道与真实登录方式。
+        # accessToken 只代表远端注册阶段完成。账号必须等所有启用的安全步骤
+        # 完成后才允许写入 GPT 账号库，避免留下只有邮箱 OTP 登录能力的账号。
         from core.email_provider import resolve_email_source, snapshot_email_context
 
         email_source = resolve_email_source(email)
@@ -328,32 +367,18 @@ def _run_protocol_registration(
             "ok": False,
             "message": "GPT 注册完成，等待在 GPT账号 页面手动发起 Codex 授权",
         }
-        account_extra = {
-            "user": session_info.get("user"),
-            "account": session_info.get("account"),
-            "expires": session_info.get("expires"),
+        account_fields = {
+            "user_id": (session_info.get("user") or {}).get("id"),
+            "user_name": (session_info.get("user") or {}).get("name"),
+            "plan_type": (session_info.get("account") or {}).get("planType"),
+            "expires_at": session_info.get("expires"),
             "device_id": session.device_id,
             "sentinel_sid": getattr(session, "sentinel_sid", None),
             "browser_profile": getattr(session, "browser_profile", None),
-            "registration_password": None,
-            "login_method": "email_otp",
-            "email_provider": email_source,
+            "registration_driver": "protocol",
             "email_provider_context": provider_context,
-            "codex": codex_result,
+            "codex_status": codex_result["status"],
         }
-        account_id = save_account_data(
-            email=email,
-            access_token=access_token,
-            totp_secret=None,
-            email_source=email_source,
-            proxy_used=session.proxy or None,
-            batch_dir=batch_dir,
-            extra=account_extra,
-            archive=False,
-            enqueue_plan=True,
-        )
-        logger.info(f"[检查点] GPT 注册结果已即时写入：{email}，账号ID={account_id}")
-
         # ==================== 阶段7: 设置 2FA（受 config.ENABLE_2FA 控制）====================
         totp_secret = None
         if _twofa_cfg.ENABLE_2FA:
@@ -361,25 +386,13 @@ def _run_protocol_registration(
             try:
                 totp_secret = setup_2fa(session, email, otp_provider=wait_for_otp)
             except Exception as exc:
-                logger.error(f"2FA 设置失败: {exc}")
-                logger.debug("2FA 错误详情:", exc_info=True)
-                logger.warning("将继续保存账号信息（不含 TOTP secret），可后续手动设置")
+                logger.error("2FA 设置失败: %s: %s", type(exc).__name__, _safe_log_text(exc))
+                logger.debug("2FA 错误详情已省略敏感堆栈：%s", type(exc).__name__)
+                raise RuntimeError(
+                    "protocol 注册无法完成密码 + TOTP 独立登录验证；账号不会写入 GPT 账号库"
+                ) from exc
         else:
             logger.debug("已跳过 2FA 设置 (config.ENABLE_2FA=False)")
-
-        if totp_secret:
-            account_id = save_account_data(
-                email=email,
-                access_token=access_token,
-                totp_secret=totp_secret,
-                email_source=email_source,
-                proxy_used=session.proxy or None,
-                batch_dir=batch_dir,
-                extra=account_extra,
-                archive=False,
-                enqueue_plan=False,
-            )
-            logger.info(f"[检查点] 2FA 已即时写入账号列表：{email}")
 
         # ==================== 阶段8: 写批次归档 ====================
         account_id = save_account_data(
@@ -387,14 +400,16 @@ def _run_protocol_registration(
             access_token=access_token,
             totp_secret=totp_secret,
             email_source=email_source,
-            proxy_used=session.proxy or None,
+            proxy=session.proxy or None,
+            login_method="email_otp",
             batch_dir=batch_dir,
-            extra=account_extra,
+            **account_fields,
             archive=True,
-            enqueue_plan=False,
+        verified_registration=True,
+            enqueue_plan=True,
         )
 
-        logger.info(f"[完成] {email}，账号ID={account_id}，Token={access_token[:16]}...")
+        logger.info(f"[完成] {email}，账号ID={account_id}，已获取登录态")
 
         # ==================== 阶段9: 后置自动触发 flow ====================
         # 只有 GPT 注册拿到 token 并保存成功的账号，才会触发 flow。
@@ -419,7 +434,7 @@ def _run_protocol_registration(
                 f"原因={flow_result.get('message')}"
             )
 
-        logger.debug(f"[完成] TOTP Secret: {totp_secret or '(未设置)'}")
+        logger.debug("[完成] TOTP 已设置：%s", bool(totp_secret))
 
         return {"success": True, "email": email, "account_id": account_id,
                 "access_token": access_token, "totp_secret": totp_secret,
@@ -427,8 +442,8 @@ def _run_protocol_registration(
                 "error": None}
 
     except Exception as e:
-        logger.error(f"[失败] {email}: {type(e).__name__}: {e}")
-        logger.debug("详细错误信息:", exc_info=True)
+        logger.error("[失败] %s: %s: %s", email, type(e).__name__, _safe_log_text(e))
+        logger.debug("详细错误信息已省略敏感堆栈：%s", type(e).__name__)
         # 邮箱状态回收策略，三种情况：
         #   1. 账号已废（account_deactivated 等）：邮箱素材本身不可用，标 failed 直接剔除。
         #   2. 创建接口通过后失败：远端已消耗这个邮箱，直接废弃，避免重复注册。
@@ -477,6 +492,7 @@ def run_registration(
     from config import roxybrowser as _roxy_cfg
 
     driver_mode = str(getattr(_roxy_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
+    require_password_2fa_driver(driver_mode)
     try:
         driver = get_driver(driver_mode)
     except ValueError as exc:

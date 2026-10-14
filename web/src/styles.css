@@ -161,7 +161,7 @@ td strong { color: var(--ink); font-weight: 650; }
 .actions-col { width: 240px; }
 .row-actions { gap: 3px; flex-wrap: wrap; }
 .gpt-account-table { min-width: 0; width: 100%; }
-.gpt-account-table table { min-width: 930px; table-layout: fixed; }
+.gpt-account-table table { min-width: 1100px; table-layout: fixed; }
 .gpt-account-table th, .gpt-account-table td { padding-left: 4px; padding-right: 4px; white-space: nowrap; }
 .gpt-account-table th { line-height: 1.2; white-space: normal; }
 .gpt-account-table td { font-size: 10px; }
@@ -171,13 +171,21 @@ td strong { color: var(--ink); font-weight: 650; }
 .gpt-account-table .col-api { width: 10%; }
 .gpt-account-table .col-registration { width: 6.8%; }
 .gpt-account-table .col-codex { width: 7.6%; }
+.gpt-account-table .codex-job-detail { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gpt-account-table .codex-job-detail.is-error { color: var(--red); }
 .gpt-account-table .col-phone-status { width: 6.5%; }
 .gpt-account-table .col-phone { width: 4.7%; }
 .gpt-account-table .col-gpt-status { width: 5%; }
 .gpt-account-table .col-plan { width: 3.5%; }
 .gpt-account-table .col-note { width: 3.5%; }
-.gpt-account-table .col-time { width: 15%; }
-.gpt-account-table .col-actions { width: 15%; }
+.gpt-account-table .col-proxy { width: 10%; }
+.gpt-account-table .col-time { width: 12%; }
+.gpt-account-table .col-actions { width: 8%; }
+.gpt-account-table .proxy-cell small { display: block; overflow: hidden; text-overflow: ellipsis; }
+.gpt-account-table .proxy-cell .button { min-height: 22px; padding: 2px 5px; font-size: 10px; }
+.proxy-test { margin-top: 8px; }
+.proxy-test .config-tool-result { margin-top: 8px; overflow-wrap: anywhere; }
+.proxy-test .config-tool-result p { margin: 5px 0; }
 .gpt-account-table .check-col { width: 3.4%; }
 .gpt-account-table .url-cell, .gpt-account-table .note-cell { max-width: none; }
 .gpt-account-table .cell-nowrap { white-space: nowrap; }
@@ -193,6 +201,7 @@ td strong { color: var(--ink); font-weight: 650; }
 .copy-cell-button:hover { background: var(--surface-soft); color: var(--accent-dark); }
 .copy-cell-button:focus-visible { outline: 2px solid color-mix(in oklch, var(--accent) 55%, transparent); outline-offset: 1px; }
 .copy-cell-empty { color: var(--faint); }
+.gpt-account-auth-hint { margin: 0; padding: 10px 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.6; }
 .gpt-account-toolbar { align-items: center; overflow-x: auto; flex-wrap: nowrap; }
 .gpt-account-toolbar .select-field { flex: 0 0 auto; }
 .gpt-account-panel .table-scroll { border-top: 1px solid var(--line); }
@@ -220,7 +229,7 @@ td strong { color: var(--ink); font-weight: 650; }
 .status-pill { display: inline-flex; align-items: center; min-height: 22px; padding: 0 7px; border-radius: 5px; background: var(--surface-soft); color: var(--muted); font-size: 10px; font-weight: 700; white-space: nowrap; }
 .status-success, .status-completed, .status-available, .status-authorized, .status-alive, .status-bound { background: color-mix(in oklch, var(--green) 12%, var(--surface)); color: color-mix(in oklch, var(--green) 78%, var(--ink)); }
 .status-running, .status-pending, .status-queued, .status-retrying, .status-waiting_email, .status-waiting_sms, .status-waiting_totp, .status-waiting_browser, .status-reserved { background: color-mix(in oklch, var(--amber) 15%, var(--surface)); color: color-mix(in oklch, var(--amber) 78%, var(--ink)); }
-.status-failed, .status-error, .status-dead, .status-deactivated, .status-invalid { background: color-mix(in oklch, var(--red) 12%, var(--surface)); color: color-mix(in oklch, var(--red) 78%, var(--ink)); }
+.status-failed, .status-error, .status-dead, .status-deactivated, .status-invalid, .status-expired { background: color-mix(in oklch, var(--red) 12%, var(--surface)); color: color-mix(in oklch, var(--red) 78%, var(--ink)); }
 .status-stopped, .status-cancelled, .status-disabled, .status-not_authorized, .status-unauthorized, .status-unregistered, .status-unverified, .status-unknown, .status-used { background: color-mix(in oklch, var(--muted) 10%, var(--surface)); color: var(--muted); }
 .status-registering, .status-authorizing, .status-verifying { background: color-mix(in oklch, var(--amber) 15%, var(--surface)); color: color-mix(in oklch, var(--amber) 78%, var(--ink)); }
 .status-registered, .status-verified { background: color-mix(in oklch, var(--green) 12%, var(--surface)); color: color-mix(in oklch, var(--green) 78%, var(--ink)); }
@@ -261,6 +270,11 @@ td strong { color: var(--ink); font-weight: 650; }
 .edit-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
 .edit-grid .field-label input { width: 100%; height: 34px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--ink); }
 .edit-wide { grid-column: 1 / -1; }
+.edit-phone-pool { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+.edit-phone-pool h3 { margin: 0; color: var(--ink); font-size: 12px; }
+.edit-phone-pool .field-help { margin: 6px 0 12px; line-height: 1.5; }
+.edit-verified-phone { margin: 0 0 12px; color: var(--muted); font-size: 12px; }
+.edit-verified-phone strong { color: var(--ink); }
 .sub2-picker { display: flex; align-items: flex-end; gap: 8px; margin-bottom: 16px; }
 .sub2-picker .select-field { flex: 1; }
 
@@ -811,7 +825,7 @@ tbody tr:hover td { background: color-mix(in oklch, var(--blue) 5%, var(--surfac
   border-color: color-mix(in oklch, var(--amber) 28%, var(--line));
   background: color-mix(in oklch, var(--amber) 10%, white);
 }
-.status-failed, .status-error, .status-dead, .status-deactivated, .status-invalid {
+.status-failed, .status-error, .status-dead, .status-deactivated, .status-invalid, .status-expired {
   border-color: color-mix(in oklch, var(--red) 25%, var(--line));
   background: color-mix(in oklch, var(--red) 9%, white);
 }
@@ -1162,7 +1176,7 @@ tbody tr:hover td { background: color-mix(in oklch, var(--accent) 3%, var(--surf
   background: color-mix(in oklch, var(--amber) 10%, white);
   color: color-mix(in oklch, var(--amber) 78%, var(--ink));
 }
-.status-failed, .status-error, .status-dead, .status-deactivated, .status-invalid {
+.status-failed, .status-error, .status-dead, .status-deactivated, .status-invalid, .status-expired {
   border-color: color-mix(in oklch, var(--red) 25%, var(--line));
   background: color-mix(in oklch, var(--red) 9%, white);
   color: color-mix(in oklch, var(--red) 78%, var(--ink));
@@ -1256,3 +1270,16 @@ tbody tr:hover td { background: color-mix(in oklch, var(--accent) 3%, var(--surf
     --config-field-inset: 14px;
   }
 }
+
+/* Phone uses are edited inline; deadlines have their own column and editor. */
+.phone-settings-fields { display: grid; gap: 16px; border: 0; padding: 0; margin: 16px 0; min-width: 0; }
+.phone-settings-fields .select-field, .phone-settings-fields .number-field { display: grid; gap: 8px; }
+.phone-settings-fields select, .phone-settings-fields input { width: 100%; }
+.phone-expiration-cell { white-space: nowrap; }
+.phone-pool-table .phone-expiration-col { width: 238px; }
+.phone-uses-select { min-height: 32px; width: 82px; max-width: 100%; padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--ink); cursor: pointer; }
+.phone-uses-select:disabled { cursor: wait; opacity: .65; }
+.phone-expiration-button { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; min-height: 32px; padding: 2px 0; border: 0; background: transparent; color: var(--accent-dark); text-align: left; cursor: pointer; }
+.phone-expiration-button span { overflow: hidden; text-overflow: ellipsis; }
+.phone-expiration-button svg { flex-shrink: 0; }
+.phone-expiration-button:hover span { text-decoration: underline; text-underline-offset: 3px; }

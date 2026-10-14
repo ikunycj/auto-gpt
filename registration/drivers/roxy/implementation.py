@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import logging
+import json
 import random
+import re
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from config import roxybrowser as _cfg
 from config import twofa as _twofa_cfg
-from core.account_export import save_account_data
+from core.account_export import save_account_data, setup_2fa
+from core.chatgpt_browser_login import verify_password_totp_login
+from core.browser_auth_errors import describe_browser_network_error
 from core.email_provider import wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
 from core.roxybrowser_client import RoxyBrowserClient, RoxyOpenResult
@@ -18,6 +23,206 @@ from registration.application.passwords import generate_registration_password, r
 from registration.ports.stop_signal import check_stop_requested
 
 logger = logging.getLogger(__name__)
+
+
+class RegistrationPasswordSubmissionError(RuntimeError):
+    """Password submission reached the browser; remote creation is uncertain."""
+
+
+class _RegistrationRequestMonitor:
+    """Observe only the registration response metadata in Chrome performance logs.
+
+    Selenium's performance log gives us CDP Network events without inspecting
+    request bodies, response bodies, cookies or authorization headers.  Some
+    remote WebDriver implementations do not expose this log; then page state
+    still governs the normal submission timeout.
+    """
+
+    _REGISTER_PATH = "/api/accounts/user/register"
+    _HOSTS = {"auth.openai.com", "chatgpt.com"}
+
+    def __init__(self, driver):
+        self.driver = driver
+        self.available = callable(getattr(driver, "get_log", None))
+        self._requests: dict[str, str] = {}
+        self.last_response: dict | None = None
+        self._last_resource_id: str | None = None
+        self._resource_baseline: str | None = None
+        self._page = getattr(driver, "page", None)
+        if self._page is not None and callable(getattr(self._page, "on", None)):
+            try:
+                self._page.on("response", self._on_page_response)
+            except Exception:
+                self._page = None
+        if self.available:
+            self.poll()  # Discard events from earlier page loads.
+            self._requests.clear()
+        else:
+            self._resource_timing_response()
+        # Resource Timing retains prior submissions on the current document.
+        # A new attempt must not read the previous 400 as its own response.
+        self._resource_baseline = self._last_resource_id
+        self.last_response = None
+
+    @classmethod
+    def _is_register_url(cls, url: object) -> bool:
+        try:
+            parsed = urlsplit(str(url or ""))
+            return parsed.hostname in cls._HOSTS and parsed.path == cls._REGISTER_PATH
+        except (TypeError, ValueError):
+            return False
+
+    def _on_page_response(self, response) -> None:
+        try:
+            if not self._is_register_url(response.url):
+                return
+            headers = response.headers
+            content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+            if not re.fullmatch(r"[a-z0-9.+-]+/[a-z0-9.+-]+", content_type):
+                content_type = "unknown"
+            method = str(response.request.method or "").upper()
+            self.last_response = {
+                "method": method if method in {"GET", "POST"} else "unknown",
+                "status": int(response.status),
+                "content_type": content_type,
+                "challenge_detected": "chlray" in str(headers.get("server-timing") or ""),
+            }
+        except Exception:
+            pass
+
+    def _resource_timing_response(self) -> dict | None:
+        """Chrome fallback when Selenium does not expose performance events."""
+        try:
+            result = self.driver.execute_script(r"""
+            const entry = performance.getEntriesByType('resource').filter(item => {
+              try {
+                const url = new URL(item.name);
+                return (url.hostname === 'auth.openai.com' || url.hostname === 'chatgpt.com')
+                  && url.pathname === '/api/accounts/user/register';
+              } catch (_) { return false; }
+            }).at(-1);
+            if (!entry) return null;
+            return {
+              resource_id: `${performance.timeOrigin}:${entry.startTime}`,
+              status: entry.responseStatus || 0,
+              content_type: entry.contentType || '',
+              challenge_detected: [...(entry.serverTiming || [])].some(item => item.name === 'chlray')
+            };
+            """)
+        except Exception:
+            return None
+        if not isinstance(result, dict):
+            return None
+        resource_id = str(result.get("resource_id") or "")
+        if resource_id:
+            self._last_resource_id = resource_id
+            if resource_id == self._resource_baseline:
+                return None
+        try:
+            status = int(result.get("status") or 0)
+        except (TypeError, ValueError):
+            return None
+        if status < 100:
+            return None
+        content_type = str(result.get("content_type") or "").split(";", 1)[0].strip().lower()
+        if not re.fullmatch(r"[a-z0-9.+-]+/[a-z0-9.+-]+", content_type):
+            content_type = "unknown"
+        return {
+            "method": "unknown", "status": status,
+            "content_type": content_type,
+            "challenge_detected": result.get("challenge_detected") is True,
+        }
+
+    def poll(self) -> dict | None:
+        if self.available:
+            try:
+                rows = self.driver.get_log("performance")
+            except Exception:
+                self.available = False
+                rows = []
+        else:
+            rows = []
+        for row in rows:
+            try:
+                message = json.loads(row.get("message", "")).get("message", {})
+                event, params = message.get("method"), message.get("params", {})
+                request_id = str(params.get("requestId") or "")
+                if event == "Network.requestWillBeSent":
+                    request = params.get("request") or {}
+                    if self._is_register_url(request.get("url")) and request_id:
+                        method = str(request.get("method") or "").upper()
+                        self._requests[request_id] = method if method in {"GET", "POST"} else "unknown"
+                elif event == "Network.responseReceived":
+                    response = params.get("response") or {}
+                    if not self._is_register_url(response.get("url")):
+                        continue
+                    status = int(response.get("status") or 0)
+                    headers = response.get("headers") or {}
+                    challenge_detected = any(
+                        str(key).lower() == "server-timing" and "chlray" in str(value)
+                        for key, value in headers.items()
+                    )
+                    content_type = next(
+                        (str(value).split(";", 1)[0].strip().lower()
+                         for key, value in headers.items() if str(key).lower() == "content-type"),
+                        str(response.get("mimeType") or "").strip().lower(),
+                    )
+                    # MIME only: no untrusted header values, URLs, bodies or secrets.
+                    if not re.fullmatch(r"[a-z0-9.+-]+/[a-z0-9.+-]+", content_type):
+                        content_type = "unknown"
+                    self.last_response = {
+                        "method": self._requests.get(request_id, "unknown"),
+                        "status": status,
+                        "content_type": content_type,
+                        "challenge_detected": challenge_detected,
+                    }
+            except (AttributeError, TypeError, ValueError):
+                continue
+        if self.last_response is None:
+            self.last_response = self._resource_timing_response()
+        return self.last_response
+
+    def close(self) -> None:
+        if self._page is not None:
+            try:
+                self._page.remove_listener("response", self._on_page_response)
+            except Exception:
+                pass
+
+
+def _password_submission_route_error(driver) -> bool:
+    """Detect the known client-side route error without reading the page text."""
+    try:
+        return bool(driver.execute_script("""
+        const text = document.body ? document.body.innerText : '';
+        return text.includes('Route Error') && text.includes('Invalid content type');
+        """))
+    except Exception:
+        return False
+
+
+def _click_route_error_try_again(driver) -> bool:
+    """Retry only the visible recovery action on the known Route Error page."""
+    try:
+        result = driver.execute_script(r"""
+        const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+          && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
+          && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+        const retry = [...document.querySelectorAll('button, a, input[type="button"], input[type="submit"]')]
+          .find(el => {
+            const label = String(el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase();
+            return visible(el) && /^(try again|retry|重试|再试一次)$/.test(label);
+          });
+        if (!retry) return {ok:false};
+        retry.scrollIntoView({block:'center'});
+        return {ok:true, button:retry};
+        """) or {}
+        if not result.get("ok") or not result.get("button"):
+            return False
+        _human_click(driver, result["button"], label="route_error_retry")
+        return True
+    except Exception:
+        return False
 
 
 def _log_prefix(driver=None) -> str:
@@ -37,6 +242,134 @@ def _log_prefix(driver=None) -> str:
     return "[Roxy注册]"
 
 
+def _diagnostic_route(url: object) -> str:
+    """Give logs a route label without query strings, fragments or opaque path tokens."""
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(str(url or ""))
+        path = (parsed.path or "").lower()
+        for route in (
+            "/create-account/password", "/log-in/password", "/email-verification",
+            "/signup/profile", "/create-account/profile", "/about-you", "/profile",
+            "/add-phone", "/phone-verification", "/authorize", "/consent",
+            "/workspace", "/auth/callback", "/auth/login",
+        ):
+            if path == route or path.startswith(route + "/"):
+                return route
+        if path == "/":
+            return "/"
+    except Exception:
+        pass
+    return "[其他页面]"
+
+
+_DIAGNOSTIC_URL_RE = re.compile(r"(?i)\b(?:https?|chrome-error)://[^\s<>\"']+")
+_DIAGNOSTIC_EMAIL_RE = re.compile(r"(?i)\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
+_DIAGNOSTIC_SECRET_RE = re.compile(
+    r"(?i)(\b(?:password|passwd|token|secret|authorization|cookie|otp|code|access_token|refresh_token)\b\s*[:=]\s*)([^\s,;]+)"
+)
+_DIAGNOSTIC_LONG_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{32,}\b")
+
+
+def _safe_exception_text(exc: object, limit: int = 240) -> str:
+    """Keep ordinary error labels while removing values from browser/provider errors."""
+    network_error = describe_browser_network_error(exc)
+    if network_error:
+        return network_error[:limit]
+    text = " ".join(str(exc or "").split())
+    if not text:
+        return "-"
+
+    def redact_url(match: re.Match) -> str:
+        return f"route={_diagnostic_route(match.group(0))}"
+
+    text = _DIAGNOSTIC_URL_RE.sub(redact_url, text)
+    text = _DIAGNOSTIC_EMAIL_RE.sub("[邮箱]", text)
+    text = _DIAGNOSTIC_SECRET_RE.sub(lambda match: f"{match.group(1)}[已隐藏]", text)
+    text = _DIAGNOSTIC_LONG_TOKEN_RE.sub("[长令牌已隐藏]", text)
+    text = text.replace("\x00", " ")
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _diagnostic_state(state: object) -> dict:
+    """Summarize untrusted DOM/JS results without any input, body or URL values."""
+    if not isinstance(state, dict):
+        return {"state": "unavailable"}
+    summary = {"route": _diagnostic_route(state.get("url"))}
+    for key in ("inputs", "buttons", "widgets", "forms", "actions", "errors"):
+        if isinstance(state.get(key), list):
+            summary[f"{key}_count"] = len(state[key])
+    invalid = sum(
+        str(item.get("ariaInvalid") or "").lower() == "true"
+        for item in (state.get("inputs") or []) if isinstance(item, dict)
+    )
+    if invalid:
+        summary["invalid_inputs"] = invalid
+    for key in ("ok", "hasForm", "hasSubmit"):
+        if isinstance(state.get(key), bool):
+            summary[key] = state[key]
+    if type(state.get("status")) is int:
+        summary["status"] = state["status"]
+    # Only page-script labels may be included. An arbitrary DOM/exception reason
+    # could itself contain an OTP, password or redirect query parameter.
+    reason = state.get("reason")
+    if isinstance(reason, str) and reason in {
+        "missing_email_input", "email_value_not_ready", "no_safe_submit",
+        "no_safe_global_action", "ambiguous_submit", "primary_submit",
+        "safe_submit", "empty_email", "missing_form", "missing_safe_submit",
+        "stable_async_enter_click", "resubmitted_email_form",
+        "missing_continue_with_password", "clicked_continue_with_password",
+        "continue_with_password_did_not_open_password_page",
+        "missing_password_input", "missing_submit", "password_targets",
+        "missing_passwordless_button", "passwordless_send_otp_target",
+        "clicked_passwordless_send_otp", "empty_result",
+    }:
+        summary["reason"] = reason
+    if state.get("error"):
+        summary["error"] = "页面检查失败"
+    return summary
+
+
+def _webdriver_rejected_performance_logging(exc: object) -> bool:
+    """识别仅由 ``goog:loggingPrefs`` 能力不兼容导致的建连失败。"""
+    text = str(exc or "").lower()
+    markers = (
+        "goog:loggingprefs",
+        "loggingprefs",
+        "unknown capability",
+        "unrecognized capability",
+        "unexpected capability",
+        "invalid capability",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _roxy_options(Options, debugger_address: str | None = None, *, performance_logs: bool = True):
+    options = Options()
+    # 页面里长轮询/风控脚本偶尔会让 driver.get 等到超时；eager 只等 DOMContentLoaded。
+    options.page_load_strategy = "eager"
+    if performance_logs:
+        options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+    if debugger_address:
+        options.add_experimental_option("debuggerAddress", debugger_address)
+    return options
+
+
+def _connect_roxy_webdriver(connect, options_factory):
+    """连接 Roxy WebDriver；性能日志不是 Roxy 的必需能力。"""
+    try:
+        return connect(options_factory(True))
+    except Exception as exc:
+        if not _webdriver_rejected_performance_logging(exc):
+            raise
+        logger.warning(
+            "[Roxy] WebDriver 不支持性能日志能力，改用页面性能计时回退：%s",
+            type(exc).__name__,
+        )
+        return connect(options_factory(False))
+
+
 def _build_driver(opened: RoxyOpenResult):
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
@@ -45,10 +378,6 @@ def _build_driver(opened: RoxyOpenResult):
 
     if opened.debugger_address:
         logger.info("[Roxy] Selenium 连接 debuggerAddress=%s", opened.debugger_address)
-        options = Options()
-        # 页面里长轮询/风控脚本偶尔会让 driver.get 等到超时；eager 只等 DOMContentLoaded。
-        options.page_load_strategy = "eager"
-        options.add_experimental_option("debuggerAddress", opened.debugger_address)
         driver_path = ""
         try:
             raw_data = opened.raw.get("data") if isinstance(opened.raw, dict) else {}
@@ -56,23 +385,83 @@ def _build_driver(opened: RoxyOpenResult):
                 driver_path = str(raw_data.get("driver") or raw_data.get("driverPath") or raw_data.get("driver_path") or "").strip()
         except Exception:
             driver_path = ""
-        if driver_path:
-            logger.info("[Roxy] 使用 Roxy chromedriver=%s", driver_path)
-            driver = webdriver.Chrome(service=Service(executable_path=driver_path), options=options)
-        else:
-            driver = webdriver.Chrome(options=options)
+
+        def connect(options):
+            if driver_path:
+                logger.info("[Roxy] 使用 Roxy chromedriver=%s", driver_path)
+                return webdriver.Chrome(service=Service(executable_path=driver_path), options=options)
+            return webdriver.Chrome(options=options)
+
+        driver = _connect_roxy_webdriver(
+            connect,
+            lambda performance_logs: _roxy_options(
+                Options,
+                opened.debugger_address,
+                performance_logs=performance_logs,
+            ),
+        )
         _apply_browser_automation_mask(driver)
         return driver
 
     if opened.webdriver_url:
-        logger.info("[Roxy] Selenium 连接 webdriver_url=%s", opened.webdriver_url)
-        options = Options()
-        options.page_load_strategy = "eager"
-        driver = RemoteWebDriver(command_executor=opened.webdriver_url, options=options)
+        logger.info("[Roxy] Selenium 已连接远程 WebDriver")
+        driver = _connect_roxy_webdriver(
+            lambda options: RemoteWebDriver(command_executor=opened.webdriver_url, options=options),
+            lambda performance_logs: _roxy_options(Options, performance_logs=performance_logs),
+        )
         _apply_browser_automation_mask(driver)
         return driver
 
     raise RuntimeError("Roxy 未返回可连接的 Selenium 地址")
+
+
+def _clear_chatgpt_auth_state(driver) -> None:
+    """清理 Roxy 注册 Profile 的旧 ChatGPT 登录态。
+
+    固定 Roxy Profile 会在 ``ROXY_KEEP_BROWSER_OPEN=True`` 时复用同一个
+    Chrome 用户目录；如果上一次任务留下了登录 cookie，打开
+    ``/auth/login`` 会被重定向到 ``chatgpt.com/``，注册流程看不到邮箱输入框，
+    也就无法进入密码和 2FA 阶段。注册任务必须从未登录状态开始，因此这里同时
+    清理浏览器 cookie 和 ChatGPT/Auth 两个站点的存储。
+    """
+    cdp = getattr(driver, "execute_cdp_cmd", None)
+    if callable(cdp):
+        try:
+            cdp("Network.clearBrowserCookies", {})
+        except Exception as exc:
+            logger.debug("[Roxy注册] 清理浏览器 cookie 失败，继续使用 Selenium 清理：%s", type(exc).__name__)
+        for origin in ("https://chatgpt.com", "https://auth.openai.com"):
+            try:
+                cdp(
+                    "Storage.clearDataForOrigin",
+                    {"origin": origin, "storageTypes": "all"},
+                )
+            except Exception as exc:
+                logger.debug(
+                    "[Roxy注册] 清理站点存储失败：origin=%s error=%s",
+                    origin,
+                    type(exc).__name__,
+                )
+
+    delete_cookies = getattr(driver, "delete_all_cookies", None)
+    if callable(delete_cookies):
+        try:
+            delete_cookies()
+        except Exception as exc:
+            logger.debug("[Roxy注册] Selenium cookie 清理失败：%s", type(exc).__name__)
+
+    # CDP Storage API 在旧版 Roxy/Chrome 上可能不可用；对当前页面再做一次
+    # best-effort 的 Web Storage 清理，不能让兼容性问题阻断注册。
+    execute_script = getattr(driver, "execute_script", None)
+    if callable(execute_script):
+        try:
+            execute_script(
+                "try { localStorage.clear(); } catch (_) {}"
+                "try { sessionStorage.clear(); } catch (_) {}"
+            )
+        except Exception as exc:
+            logger.debug("[Roxy注册] Web Storage 清理失败：%s", type(exc).__name__)
+    logger.info("[Roxy注册] 已清理 Profile 的 ChatGPT 登录态，开始全新注册")
 
 
 def _center_browser_window(driver) -> None:
@@ -104,7 +493,7 @@ def _center_browser_window(driver) -> None:
         driver.set_window_position(x, y)
         logger.info("[Roxy] 浏览器窗口已居中：x=%s y=%s width=%s height=%s", x, y, width, height)
     except Exception as exc:
-        logger.warning("[Roxy] 浏览器窗口居中失败，继续执行：%s", exc)
+        logger.warning("[Roxy] 浏览器窗口居中失败，继续执行：%s", _safe_exception_text(exc))
 
 
 def _wait(driver, timeout: int | None = None):
@@ -135,8 +524,8 @@ def _safe_get(driver, url: str, *, timeout: int = 45, attempts: int = 2, accept_
         except TimeoutException as exc:
             last_exc = exc
             logger.warning(
-                "%s 页面加载超时，尝试停止加载后检查 DOM：url=%s attempt=%s/%s error=%s",
-                _log_prefix(driver), url, attempt, attempts, str(exc).splitlines()[0] if str(exc) else "TimeoutException",
+                "%s 页面加载超时，尝试停止加载后检查 DOM：route=%s attempt=%s/%s error=%s",
+                _log_prefix(driver), _diagnostic_route(url), attempt, attempts, type(exc).__name__,
             )
             try:
                 driver.execute_script("window.stop();")
@@ -156,8 +545,8 @@ def _safe_get(driver, url: str, *, timeout: int = 45, attempts: int = 2, accept_
             target_ok = any(h in current for h in hosts) if hosts else (url.split("/", 3)[2].lower() in current)
             if target_ok and has_body:
                 logger.info(
-                    "%s 页面加载虽超时但 DOM 可用，继续流程：current=%s readyState=%s",
-                    _log_prefix(driver), current[:180], ready or "-",
+                    "%s 页面加载虽超时但 DOM 可用，继续流程：route=%s readyState=%s",
+                    _log_prefix(driver), _diagnostic_route(current), ready or "-",
                 )
                 return
             if attempt < attempts:
@@ -170,16 +559,25 @@ def _safe_get(driver, url: str, *, timeout: int = 45, attempts: int = 2, accept_
         except WebDriverException as exc:
             last_exc = exc
             if attempt < attempts:
-                logger.warning("%s 页面跳转失败，准备重试：url=%s attempt=%s/%s error=%s", _log_prefix(driver), url, attempt, attempts, exc)
+                logger.warning(
+                    "%s 页面跳转失败，准备重试：route=%s attempt=%s/%s error=%s",
+                    _log_prefix(driver), _diagnostic_route(url), attempt, attempts, type(exc).__name__,
+                )
                 time.sleep(1.5 * attempt)
                 continue
-            raise
+            raise RuntimeError(
+                f"页面跳转失败: route={_diagnostic_route(url)} error={type(exc).__name__}"
+            ) from exc
         finally:
             try:
                 driver.set_page_load_timeout(old_timeout)
             except Exception:
                 pass
-    raise last_exc or RuntimeError(f"页面跳转失败: {url}")
+    if last_exc is not None:
+        raise RuntimeError(
+            f"页面跳转失败: route={_diagnostic_route(url)} error={type(last_exc).__name__}"
+        ) from last_exc
+    raise RuntimeError(f"页面跳转失败: route={_diagnostic_route(url)}")
 
 
 def _visible(el) -> bool:
@@ -203,17 +601,26 @@ def _apply_browser_automation_mask(driver) -> None:
         return
     try:
         script = r"""
-        Object.defineProperty(Navigator.prototype, 'webdriver', {get: () => undefined});
-        if (!window.chrome) window.chrome = {};
-        if (!window.chrome.runtime) window.chrome.runtime = {};
-        const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
-        if (originalQuery) {
-          window.navigator.permissions.query = (parameters) => (
-            parameters && parameters.name === 'notifications'
-              ? Promise.resolve({ state: Notification.permission })
-              : originalQuery(parameters)
-          );
-        }
+        (() => {
+          try {
+            Object.defineProperty(Navigator.prototype, 'webdriver', {
+              configurable: true, get: () => undefined
+            });
+          } catch (_) {}
+          if (!window.chrome) window.chrome = {};
+          if (!window.chrome.runtime) window.chrome.runtime = {};
+          const permissions = window.navigator.permissions;
+          if (permissions && permissions.query && !permissions.query.__autoGptWrapped) {
+            const originalQuery = permissions.query.bind(permissions);
+            const wrappedQuery = parameters => (
+              parameters && parameters.name === 'notifications'
+                ? Promise.resolve({ state: Notification.permission })
+                : originalQuery(parameters)
+            );
+            Object.defineProperty(wrappedQuery, '__autoGptWrapped', {value: true});
+            permissions.query = wrappedQuery;
+          }
+        })();
         """
         if hasattr(driver, "execute_cdp_cmd"):
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": script})
@@ -223,7 +630,7 @@ def _apply_browser_automation_mask(driver) -> None:
             pass
         logger.info("%s 已注入浏览器自动化特征弱化脚本", _log_prefix(driver))
     except Exception as exc:
-        logger.debug("%s 注入自动化特征弱化脚本失败：%s", _log_prefix(driver), exc)
+        logger.debug("%s 注入自动化特征弱化脚本失败：%s", _log_prefix(driver), _safe_exception_text(exc))
 
 
 def _human_scroll_to(driver, el) -> None:
@@ -280,7 +687,7 @@ def _human_click(driver, el, *, label: str = "") -> None:
             el.click();
             """, el)
     except Exception as exc:
-        logger.debug("%s 人工化点击失败，回退 el.click label=%s err=%s", _log_prefix(driver), label, exc)
+        logger.debug("%s 人工化点击失败，回退 el.click label=%s err=%s", _log_prefix(driver), label, _safe_exception_text(exc))
         time.sleep(random.uniform(0.12, 0.45))
         try:
             driver.execute_script("arguments[0].click();", el)
@@ -338,7 +745,7 @@ def _human_type_text(driver, el, value: str, *, clear: bool = True) -> None:
             el,
         )
     except Exception as exc:
-        logger.debug("%s 人工化输入失败，回退 JS setter err=%s", _log_prefix(driver), exc)
+        logger.debug("%s 人工化输入失败，回退 JS setter err=%s", _log_prefix(driver), _safe_exception_text(exc))
         _set_element_value(driver, el, value)
 
 
@@ -373,7 +780,7 @@ def _find_any(driver, selectors: list[str], timeout: int | None = None):
             except Exception as exc:
                 last = exc
         time.sleep(0.4)
-    raise RuntimeError(f"找不到页面元素: {selectors}; last={last}")
+    raise RuntimeError(f"找不到页面元素: {selectors}; error={type(last).__name__ if last else 'None'}")
 
 
 def _click_any(driver, selectors: list[str], timeout: int | None = None) -> None:
@@ -473,7 +880,7 @@ def _assert_not_external_idp(driver, label: str = '') -> None:
     except Exception:
         current = ''
     if _is_external_idp_url(current):
-        raise RuntimeError(f"误入第三方账号授权页（{label}）：{current}")
+        raise RuntimeError(f"误入第三方账号授权页（{label}）：route={_diagnostic_route(current)}")
 
 
 def _click_email_entry_option(driver) -> bool:
@@ -531,7 +938,7 @@ def _type_email_address(driver, email: str, timeout: int | None = None) -> None:
             _assert_not_external_idp(driver, "点击邮箱入口后")
             continue
         time.sleep(0.4)
-    raise RuntimeError(f"找不到邮箱输入框/邮箱入口（未使用文字识别），state={last_state}")
+    raise RuntimeError(f"找不到邮箱输入框/邮箱入口（未使用文字识别），state={_diagnostic_state(last_state)}")
 
 
 def _submit_nearest_form_for_active_input(driver) -> bool:
@@ -618,11 +1025,11 @@ def _submit_nearest_form_for_active_input(driver) -> bool:
         else:
             logger.warning("%s 邮箱提交未返回目标元素，回退 requestSubmit", _log_prefix(driver))
             driver.execute_script("document.querySelector('form')?.requestSubmit?.();")
-        logger.info("%s 邮箱表单安全提交：%s", _log_prefix(driver), result)
+        logger.info("%s 邮箱表单安全提交：%s", _log_prefix(driver), _diagnostic_state(result))
         time.sleep(0.8)
         _assert_not_external_idp(driver, "提交邮箱后")
         return True
-    logger.warning("%s 未执行邮箱提交：%s", _log_prefix(driver), result)
+    logger.warning("%s 未执行邮箱提交：%s", _log_prefix(driver), _diagnostic_state(result))
     return False
 
 
@@ -775,19 +1182,19 @@ def _submit_email_step(driver, email: str | None = None) -> None:
     # 实测 UI 首次提交后若停在 /auth/login?email=...，由 _recover_email_submit_if_stuck 补交表单更稳定。
     email_value = str(email or _current_email_input_value(driver) or "").strip()
     stable = _stabilize_email_input_before_submit(driver, email_value)
-    logger.info("%s 邮箱提交前状态稳定：%s", _log_prefix(driver), stable)
+    logger.info("%s 邮箱提交前状态稳定：%s", _log_prefix(driver), _diagnostic_state(stable))
     time.sleep(random.uniform(0.8, 1.8) if _browser_actions_enabled() else 0.4)
 
     stable_submit = _submit_email_form_stable(driver, email_value)
     if stable_submit.get("ok"):
-        logger.info("%s 邮箱稳定表单提交：%s", _log_prefix(driver), stable_submit)
+        logger.info("%s 邮箱稳定表单提交：%s", _log_prefix(driver), _diagnostic_state(stable_submit))
         time.sleep(1.0)
         _assert_not_external_idp(driver, "稳定表单提交邮箱后")
         return
-    logger.warning("%s 邮箱稳定表单提交失败，回退 UI 点击提交：%s", _log_prefix(driver), stable_submit)
+    logger.warning("%s 邮箱稳定表单提交失败，回退 UI 点击提交：%s", _log_prefix(driver), _diagnostic_state(stable_submit))
     if _submit_nearest_form_for_active_input(driver):
         return
-    raise RuntimeError(f"无法提交邮箱步骤（拒绝按页面文字或首个 submit 兜底，避免误点第三方登录），state={_email_entry_state(driver)}")
+    raise RuntimeError(f"无法提交邮箱步骤（拒绝按页面文字或首个 submit 兜底，避免误点第三方登录），state={_diagnostic_state(_email_entry_state(driver))}")
 
 
 def _recover_email_submit_if_stuck(driver, email: str) -> dict:
@@ -832,7 +1239,7 @@ def _submit_email_via_browser_nextauth(driver, email: str) -> dict:
     try:
         current = str(getattr(driver, "current_url", "") or "")
         if "chatgpt.com" not in current:
-            return {"ok": False, "reason": "not_on_chatgpt", "url": current[:180]}
+            return {"ok": False, "reason": "not_on_chatgpt", "route": _diagnostic_route(current)}
     except Exception:
         current = ""
 
@@ -865,7 +1272,7 @@ def _submit_email_via_browser_nextauth(driver, email: str) -> dict:
             try { csrfData = JSON.parse(csrfText); } catch (_) {}
             const csrfToken = csrfData.csrfToken || '';
             if (!csrfResp.ok || !csrfToken) {
-              done({ok:false, stage:'csrf', status:csrfResp.status, body:csrfText.slice(0, 500)});
+              done({ok:false, stage:'csrf', status:csrfResp.status, reason:'csrf_unavailable'});
               return;
             }
 
@@ -898,7 +1305,7 @@ def _submit_email_via_browser_nextauth(driver, email: str) -> dict:
             try { data = JSON.parse(text); } catch (_) {}
             let url = data.url || '';
             if (!resp.ok || !url) {
-              done({ok:false, stage:'signin', status:resp.status, body:text.slice(0, 700)});
+              done({ok:false, stage:'signin', status:resp.status, reason:'signin_redirect_unavailable'});
               return;
             }
 
@@ -911,15 +1318,26 @@ def _submit_email_via_browser_nextauth(driver, email: str) -> dict:
               url = u.toString();
             } catch (_) {}
             window.location.assign(url);
-            done({ok:true, stage:'redirect', url:url.slice(0, 260)});
+            done({ok:true, stage:'redirect'});
           } catch (e) {
-            done({ok:false, stage:'exception', error:String(e && (e.stack || e.message) || e).slice(0, 700)});
+            done({ok:false, stage:'exception', reason:'browser_fetch_failed'});
           }
         })();
         """, email, did, auth_log_id) or {}
-        return result if isinstance(result, dict) else {"ok": False, "reason": "invalid_result", "result": str(result)[:300]}
+        if not isinstance(result, dict):
+            return {"ok": False, "reason": "invalid_result"}
+        stage = result.get("stage")
+        reason = result.get("reason")
+        return {
+            "ok": result.get("ok") is True,
+            "stage": stage if stage in ("csrf", "signin", "redirect", "exception") else "unknown",
+            "reason": reason if reason in (
+                "csrf_unavailable", "signin_redirect_unavailable", "browser_fetch_failed",
+            ) else "unknown",
+            "status": result.get("status") if type(result.get("status")) is int else None,
+        }
     except Exception as exc:
-        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+        return {"ok": False, "reason": "browser_fetch_failed", "error_type": type(exc).__name__}
     finally:
         try:
             driver.set_script_timeout(old_script_timeout)
@@ -990,7 +1408,7 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
                 if now - cleared_last_log_at > 2.0:
                     logger.info(
                         "%s 邮箱提交后检测到输入框短暂清空，继续等待跳转：elapsed=%.1fs debounce=%.1fs url=%s",
-                        _log_prefix(driver), now - cleared_seen_at, debounce, url[:180],
+                        _log_prefix(driver), now - cleared_seen_at, debounce, _diagnostic_route(url),
                     )
                     cleared_last_log_at = now
                 if (
@@ -1001,14 +1419,14 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
                 ):
                     recover = _recover_email_submit_if_stuck(driver, email)
                     cleared_recover_done = True
-                    logger.info("%s 邮箱提交后仍停留在 login?email，中途补交一次表单：%s", _log_prefix(driver), recover)
+                    logger.info("%s 邮箱提交后仍停留在 login?email，中途补交一次表单：%s", _log_prefix(driver), _diagnostic_state(recover))
                 if now - cleared_seen_at >= debounce:
                     return "email_cleared"
             else:
                 cleared_seen_at = None
             # 仍是当前邮箱页，继续短等。
         time.sleep(0.8)
-    logger.info("%s 邮箱提交后等待下一步超时，最后邮箱页状态=%s", _log_prefix(driver), last)
+    logger.info("%s 邮箱提交后等待下一步超时，最后邮箱页状态=%s", _log_prefix(driver), _diagnostic_state(last))
     return "email_page" if _is_email_login_page_still_present(driver) else "unknown"
 
 
@@ -1021,7 +1439,7 @@ def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
         last_state = state
         values = [str(i.get("value") or "") for i in (state.get("inputs") or [])]
         if not any(v.strip().lower() == email.strip().lower() for v in values):
-            logger.warning("%s 邮箱写入校验失败，准备重试：attempt=%s/%s state=%s", _log_prefix(driver), attempt, attempts, state)
+            logger.warning("%s 邮箱写入校验失败，准备重试：attempt=%s/%s state=%s", _log_prefix(driver), attempt, attempts, _diagnostic_state(state))
             time.sleep(0.8)
             continue
         logger.info("%s 已填写邮箱并校验通过：%s", _log_prefix(driver), email)
@@ -1030,13 +1448,13 @@ def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
         logger.info("%s 已提交邮箱，等待进入密码页或验证码页（%s/%s）", _log_prefix(driver), attempt, attempts)
         state_name = _wait_email_submit_next_state(driver, email, timeout=20)
         if state_name == "login_password":
-            raise RuntimeError(f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url={getattr(driver, 'current_url', '') or 'https://auth.openai.com/log-in/password'}")
+            raise RuntimeError(f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: route={_diagnostic_route(getattr(driver, 'current_url', ''))}")
         if state_name in ("password", "otp", "logged_in"):
             logger.info("%s 邮箱提交后已进入下一步：%s", _log_prefix(driver), state_name)
             return state_name
-        logger.warning("%s 邮箱提交后仍未进入下一步：%s，准备重填重试 state=%s", _log_prefix(driver), state_name, _email_input_value_state(driver))
+        logger.warning("%s 邮箱提交后仍未进入下一步：%s，准备重填重试 state=%s", _log_prefix(driver), state_name, _diagnostic_state(_email_input_value_state(driver)))
         time.sleep(1.0)
-    raise RuntimeError(f"邮箱提交后未进入密码页/验证码页，最后状态={last_state}")
+    raise RuntimeError(f"邮箱提交后未进入密码页/验证码页，最后状态={_diagnostic_state(last_state)}")
 
 
 def _type_otp(driver, code: str) -> None:
@@ -1075,26 +1493,43 @@ def _type_otp(driver, code: str) -> None:
 
 
 def _email_otp_page_state(driver) -> dict:
+    """Return only structural OTP-page diagnostics.
+
+    The page may contain an email OTP, password, redirect code or auth token.
+    Callers only need input attributes and fixed error markers, so values and
+    free-form page text are intentionally discarded in the browser process.
+    """
     try:
         return driver.execute_script(r"""
         const visible = el => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
         const inputs = [...document.querySelectorAll('input')].filter(visible).map(el => ({
           type: el.getAttribute('type') || '', name: el.getAttribute('name') || '', id: el.id || '',
           autocomplete: el.getAttribute('autocomplete') || '', inputmode: el.getAttribute('inputmode') || '',
-          ariaInvalid: el.getAttribute('aria-invalid') || '', value: el.value || ''
-        }));
-        const buttons = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')].filter(visible).map(el => ({
-          tag: el.tagName, type: el.getAttribute('type') || '', value: el.getAttribute('value') || '',
-          action: el.getAttribute('data-dd-action-name') || '', aria: el.getAttribute('aria-label') || '',
-          disabled: !!el.disabled || String(el.getAttribute('aria-disabled') || '').toLowerCase() === 'true',
-          text: (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120)
-        }));
-        const errors = [...document.querySelectorAll('.react-aria-FieldError,[slot="errorMessage"],[id$="-error"],[aria-invalid="true"] + *,[class*="error"]')]
+          ariaInvalid: el.getAttribute('aria-invalid') || ''
+        })).slice(0, 30);
+        const buttons = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')]
+          .filter(visible).map(el => ({
+            tag: el.tagName, type: el.getAttribute('type') || '',
+            action: el.getAttribute('data-dd-action-name') || '', aria: el.getAttribute('aria-label') || '',
+            disabled: !!el.disabled || String(el.getAttribute('aria-disabled') || '').toLowerCase() === 'true'
+          })).slice(0, 30);
+        const rawErrors = [...document.querySelectorAll('.react-aria-FieldError,[slot="errorMessage"],[id$="-error"],[aria-invalid="true"] + *,[class*="error"]')]
           .filter(visible).map(el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
-        return {url: location.href, title: document.title, inputs, buttons, errors, text: (document.body?.innerText || '').slice(0, 1200)};
+        const body = (document.body?.innerText || '').replace(/\s+/g, ' ').toLowerCase();
+        const errorText = (rawErrors.join(' ') + ' ' + body).toLowerCase();
+        const errors = [];
+        const add = marker => { if (!errors.includes(marker)) errors.push(marker); };
+        if (/invalid code|incorrect code|wrong code|验证码错误|验证码无效|コードが正しく|無効/.test(errorText)) add('otp_invalid');
+        if (/expired|验证码已过期|期限/.test(errorText)) add('otp_expired');
+        if (rawErrors.length && !errors.length) add('page_error');
+        return {url: location.pathname || '/', inputs, buttons, errors};
         """) or {}
     except Exception as exc:
-        return {"url": getattr(driver, 'current_url', ''), "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "url": _diagnostic_route(getattr(driver, 'current_url', '')),
+            "error": "页面检查失败",
+            "error_type": type(exc).__name__,
+        }
 
 
 def _is_email_verification_page(driver) -> bool:
@@ -1162,7 +1597,7 @@ def _click_resend_email_otp(driver, timeout: int = 20) -> dict:
         except Exception as exc:
             last = exc
         time.sleep(0.5)
-    raise RuntimeError(f"找不到可点击的重新发送验证码按钮: last={last}, state={_email_otp_page_state(driver)}")
+    raise RuntimeError(f"找不到可点击的重新发送验证码按钮: last={type(last).__name__}, state={_diagnostic_state(_email_otp_page_state(driver))}")
 
 
 def _wait_after_email_otp_submit(driver, timeout: int = 10) -> str:
@@ -1178,7 +1613,7 @@ def _wait_after_email_otp_submit(driver, timeout: int = 10) -> str:
         if invalid or (last.get('errors') or []):
             return 'invalid'
     if _is_email_verification_page(driver):
-        logger.warning("%s[OTP] 提交后仍停留验证码页，按验证码无效/过期处理 snapshot=%s", _log_prefix(driver), _email_otp_page_state(driver))
+        logger.warning("%s[OTP] 提交后仍停留验证码页，按验证码无效/过期处理 snapshot=%s", _log_prefix(driver), _diagnostic_state(_email_otp_page_state(driver)))
         return 'invalid'
     return 'accepted'
 
@@ -1213,28 +1648,32 @@ def _maybe_accept(driver) -> None:
 
 
 def _page_snapshot(driver) -> dict:
+    """Return structural profile-page diagnostics without field values or body text."""
     try:
         return driver.execute_script(r"""
+        const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
         const inputs = [...document.querySelectorAll('input,select,textarea')].map(el => ({
           tag: el.tagName, type: el.getAttribute('type') || '', name: el.getAttribute('name') || '',
           id: el.id || '', placeholder: el.getAttribute('placeholder') || '',
           autocomplete: el.getAttribute('autocomplete') || '', aria: el.getAttribute('aria-label') || '',
-          value: el.value || '', visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+          visible: visible(el)
         })).filter(x => x.visible).slice(0, 30);
         const buttons = [...document.querySelectorAll('button,a[role=button],input[type=submit]')].map(el => ({
-          text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim(),
-          type: el.getAttribute('type') || '', visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length),
-          disabled: !!el.disabled
+          type: el.getAttribute('type') || '', aria: el.getAttribute('aria-label') || '',
+          visible: visible(el), disabled: !!el.disabled
         })).filter(x => x.visible).slice(0, 30);
         const widgets = [...document.querySelectorAll('[role=spinbutton], .react-aria-Select, [data-testid="hidden-select-container"] select')].map(el => ({
           tag: el.tagName, role: el.getAttribute('role') || '', dataType: el.getAttribute('data-type') || '',
-          aria: el.getAttribute('aria-label') || '', text: (el.innerText || el.textContent || '').trim().slice(0, 80),
-          visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-        })).slice(0, 30);
-        return {url: location.href, title: document.title, text: (document.body?.innerText || '').slice(0, 2000), inputs, buttons, widgets};
+          aria: el.getAttribute('aria-label') || '', visible: visible(el)
+        })).filter(x => x.visible).slice(0, 30);
+        return {url: location.pathname || '/', inputs, buttons, widgets};
         """) or {}
     except Exception as exc:
-        return {"error": f"{type(exc).__name__}: {exc}", "url": getattr(driver, 'current_url', '')}
+        return {
+            "url": _diagnostic_route(getattr(driver, 'current_url', '')),
+            "error": "页面检查失败",
+            "error_type": type(exc).__name__,
+        }
 
 
 def _has_access_token(driver) -> bool:
@@ -1341,7 +1780,7 @@ def _select_or_type(driver, selectors: list[str], value: str, timeout: int = 3) 
             _human_type_text(driver, el, str(value), clear=True)
         return True
     except Exception as exc:
-        logger.debug('%s 填写字段失败 selectors=%s value=%s err=%s', _log_prefix(driver), selectors, value, exc)
+        logger.debug('%s 填写字段失败 selectors=%s error=%s', _log_prefix(driver), selectors, type(exc).__name__)
         return False
 
 
@@ -1483,7 +1922,7 @@ def _fill_birthday_or_age(driver, birthday: str, age: int) -> str | None:
         """, birthday)
         return 'spinbutton'
     except Exception as exc:
-        logger.debug('%s spinbutton 生日填写失败：%s', _log_prefix(driver), exc)
+        logger.debug('%s spinbutton 生日填写失败：%s', _log_prefix(driver), _safe_exception_text(exc))
         return None
 
 
@@ -1496,6 +1935,7 @@ def _registration_password() -> str:
 
 
 def _password_page_state(driver) -> dict:
+    """Return structural password-page diagnostics without password/form values."""
     try:
         return driver.execute_script(r"""
         const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
@@ -1503,17 +1943,21 @@ def _password_page_state(driver) -> dict:
           && !el.disabled && !el.readOnly;
         const inputs = [...document.querySelectorAll('input')].map(el => ({
           type: el.getAttribute('type') || '', name: el.getAttribute('name') || '', id: el.id || '',
-          autocomplete: el.getAttribute('autocomplete') || '', visible: visible(el), value: el.type === 'password' ? '<password>' : (el.value || '')
-        })).slice(0, 30);
-        const forms = [...document.querySelectorAll('form')].map(f => ({action: f.getAttribute('action') || ''}));
+          autocomplete: el.getAttribute('autocomplete') || '', visible: visible(el)
+        })).filter(x => x.visible).slice(0, 30);
+        const forms = [...document.querySelectorAll('form')].map(() => ({}));
         const buttons = [...document.querySelectorAll('button,input[type="submit"]')].map(el => ({
           type: el.getAttribute('type') || '', name: el.getAttribute('name') || '', id: el.id || '',
           disabled: !!el.disabled, visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-        })).slice(0, 30);
-        return {url: location.href, inputs, forms, buttons};
+        })).filter(x => x.visible).slice(0, 30);
+        return {url: location.pathname || '/', inputs, forms, buttons};
         """) or {}
     except Exception as exc:
-        return {"url": getattr(driver, "current_url", ""), "error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "url": _diagnostic_route(getattr(driver, "current_url", "")),
+            "error": "页面检查失败",
+            "error_type": type(exc).__name__,
+        }
 
 
 def _is_signup_password_page(driver) -> bool:
@@ -1544,6 +1988,62 @@ def _is_login_password_page(driver) -> bool:
     state = _password_page_state(driver)
     url = str(state.get('url') or '').lower()
     return '/log-in/password' in url
+
+
+def _click_continue_with_password_if_present(driver, timeout: int = 20) -> dict:
+    """在邮箱验证码页切换到密码注册流程。
+
+    ChatGPT 新版注册页会先显示邮箱验证码，并提供
+    ``Continue with password`` 链接；只有点击该链接后才会出现
+    ``/create-account/password``。启用 2FA 时必须走这条分支，避免把
+    一次性邮箱验证码误当成最终登录方式。
+    """
+    try:
+        result = driver.execute_script(r"""
+        const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+          && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
+          && !el.disabled && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
+        const norm = value => String(value || '').replace(/\s+/g, '').toLowerCase();
+        const candidates = [...document.querySelectorAll('a,button,[role="button"],[role="link"]')]
+          .filter(visible);
+        const target = candidates.find(el => {
+          const href = String(el.getAttribute('href') || '').toLowerCase();
+          const text = norm(el.textContent || el.getAttribute('aria-label') || '');
+          const attrs = [el.id, el.getAttribute('name'), el.getAttribute('data-testid'),
+            el.getAttribute('data-dd-action-name'), el.getAttribute('aria-label'), el.getAttribute('title'),
+            el.className, el.textContent].join(' ').toLowerCase();
+          if (href.includes('/create-account/password')) return true;
+          return text.includes('continuewithpassword')
+            || attrs.includes('continue with password')
+            || attrs.includes('continuewithpassword');
+        });
+        if (!target) return {ok:false, reason:'missing_continue_with_password'};
+        target.scrollIntoView({block:'center'});
+        return {
+          ok:true,
+          element: target,
+          href: String(target.getAttribute('href') || ''),
+          text: String(target.textContent || target.getAttribute('aria-label') || '').trim().slice(0, 80)
+        };
+        """) or {"ok": False, "reason": "empty_result"}
+        if not result.get("ok") or not result.get("element"):
+            return {"ok": False, "reason": "missing_continue_with_password"}
+        _human_click(driver, result["element"], label="continue_with_password")
+        end = time.time() + max(3, int(timeout))
+        while time.time() < end:
+            if _is_signup_password_page(driver) or _is_login_password_page(driver) or _has_access_token(driver):
+                return {
+                    "ok": True,
+                    "reason": "clicked_continue_with_password",
+                }
+            time.sleep(0.4)
+        return {
+            "ok": False,
+            "reason": "continue_with_password_did_not_open_password_page",
+            "route": _diagnostic_route(getattr(driver, "current_url", "")),
+        }
+    except Exception as exc:
+        return {"ok": False, "reason": "continue_with_password_failed", "error_type": type(exc).__name__}
 
 
 def _click_passwordless_signup_if_present(driver) -> dict:
@@ -1608,33 +2108,45 @@ def _click_passwordless_signup_if_present(driver) -> dict:
         """) or {"ok": False, "reason": "empty_result"}
         if result.get("ok") and result.get("button"):
             _human_click(driver, result.get("button"), label="passwordless_otp")
-            result["reason"] = "clicked_passwordless_send_otp"
-            result.pop("button", None)
-        return result
+            return {"ok": True, "reason": "clicked_passwordless_send_otp"}
+        return {"ok": False, "reason": "missing_passwordless_button"}
     except Exception as exc:
-        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+        return {"ok": False, "reason": "passwordless_click_failed", "error_type": type(exc).__name__}
 
 
-def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str | None:
+def _fill_password_page_if_present(
+    driver, email: str, timeout: int = 25, *, allow_passwordless_signup: bool = True,
+) -> str | None:
     """邮箱提交后兼容 create-account/password。返回本次设置的 OpenAI 账号密码；未遇到密码页返回 None。"""
     end = time.time() + timeout
     last = {}
     while time.time() < end:
+        # In the strict password branch the previous page can remain
+        # ``/email-verification`` for a few seconds after clicking
+        # ``Continue with password``.  Returning here would silently turn
+        # the flow back into OTP-only registration.  Keep waiting for the
+        # password route; the caller will fail closed after ``timeout`` if
+        # the switch never completed.
         if _is_email_verification_page(driver):
-            return None
+            if allow_passwordless_signup:
+                return None
+            time.sleep(0.4)
+            continue
         if _has_access_token(driver):
-            return None
+            if allow_passwordless_signup:
+                return None
+            raise RuntimeError("启用 2FA 时密码页未完成，页面已出现登录态但未确认新密码")
         last = _password_page_state(driver)
         is_signup_password = _is_signup_password_page(driver)
         is_login_password = _is_login_password_page(driver)
         if not (is_signup_password or is_login_password):
             time.sleep(0.5)
             continue
-        passwordless = _click_passwordless_signup_if_present(driver)
+        passwordless = _click_passwordless_signup_if_present(driver) if allow_passwordless_signup else {"ok": False}
         if passwordless.get('ok'):
             logger.info(
-                "%s 检测到密码页，按原注册流程已切换到邮箱一次性验证码：email=%s detail=%s",
-                _log_prefix(driver), email, passwordless,
+                "%s 检测到密码页，按原注册流程已切换到邮箱一次性验证码：email=%s reason=%s",
+                _log_prefix(driver), email, passwordless.get("reason") or "-",
             )
             wait_end = time.time() + 20
             while time.time() < wait_end:
@@ -1648,73 +2160,147 @@ def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str
             logger.info("%s 已点击一次性验证码入口，交给后续 OTP 阶段继续处理", _log_prefix(driver))
             return None
         if is_login_password:
-            logger.info("%s 当前是登录密码页但未找到一次性验证码入口，跳过密码填写并交给 OTP 阶段：state=%s", _log_prefix(driver), last)
+            if not allow_passwordless_signup:
+                raise RuntimeError("注册进入已有账号的登录密码页，无法确认本次设置了新密码")
+            logger.info("%s 当前是登录密码页但未找到一次性验证码入口，跳过密码填写并交给 OTP 阶段：state=%s", _log_prefix(driver), _diagnostic_state(last))
             return None
         password = _registration_password()
         logger.info("%s 检测到 create-account/password，准备设置密码（%s 位）：email=%s", _log_prefix(driver), len(password), email)
-        result = driver.execute_script(r"""
-        const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-          && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
-          && !el.disabled && !el.readOnly;
-        const input = [...document.querySelectorAll('input[type="password"],input[name*="password" i],input[autocomplete="new-password"]')]
-          .find(visible);
-        if (!input) return {ok:false, reason:'missing_password_input'};
-        const form = input.closest('form');
-        const scope = form || document;
-        const buttons = [...scope.querySelectorAll('button,input[type="submit"]')]
-          .filter(el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length) && !el.disabled && el.getAttribute('aria-disabled') !== 'true')
-          .map((el, idx) => {
-            const r = el.getBoundingClientRect();
-            const ir = input.getBoundingClientRect();
-            return {el, idx, below: r.top >= ir.bottom - 10, dist: Math.max(0, r.top - ir.bottom) + Math.abs((r.left+r.right-ir.left-ir.right)/2)/10};
-          })
-          .filter(x => x.below)
-          .sort((a,b) => a.dist - b.dist || a.idx - b.idx);
-        if (!buttons.length) return {ok:false, reason:'missing_submit'};
-        buttons[0].el.scrollIntoView({block:'center'});
-        return {ok:true, reason:'password_targets', input, button: buttons[0].el};
-        """) or {}
-        if not result.get('ok'):
-            raise RuntimeError(f"密码页处理失败：{result} state={last}")
-        password_input = result.get("input")
-        _human_type_text(driver, password_input, password, clear=True)
-        actual_password = str(password_input.get_attribute("value") or "")
-        if actual_password != password:
-            logger.warning(
-                "%s 密码写入值不一致，使用 React 原生 setter 修正：expected_length=%s actual_length=%s",
-                _log_prefix(driver),
-                len(password),
-                len(actual_password),
-            )
-            _set_element_value(driver, password_input, password)
+        for submission_attempt in range(1, 4):
+            if submission_attempt > 1:
+                # The retry action can advance directly to the next step.
+                if _is_email_verification_page(driver) or _has_access_token(driver) or _is_profile_like(_page_snapshot(driver)):
+                    return password
+                if not _is_signup_password_page(driver):
+                    raise RegistrationPasswordSubmissionError(
+                        "Route Error 重试后没有回到新密码页或下一步；账号状态不确定，请勿重用此邮箱"
+                    )
+            result = driver.execute_script(r"""
+            const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+              && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
+              && !el.disabled && !el.readOnly;
+            const input = [...document.querySelectorAll('input[type="password"],input[name*="password" i],input[autocomplete="new-password"]')]
+              .find(visible);
+            if (!input) return {ok:false, reason:'missing_password_input'};
+            const form = input.closest('form');
+            const scope = form || document;
+            const buttons = [...scope.querySelectorAll('button,input[type="submit"]')]
+              .filter(el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length) && !el.disabled && el.getAttribute('aria-disabled') !== 'true')
+              .map((el, idx) => {
+                const r = el.getBoundingClientRect();
+                const ir = input.getBoundingClientRect();
+                return {el, idx, below: r.top >= ir.bottom - 10, dist: Math.max(0, r.top - ir.bottom) + Math.abs((r.left+r.right-ir.left-ir.right)/2)/10};
+              })
+              .filter(x => x.below)
+              .sort((a,b) => a.dist - b.dist || a.idx - b.idx);
+            if (!buttons.length) return {ok:false, reason:'missing_submit'};
+            buttons[0].el.scrollIntoView({block:'center'});
+            return {ok:true, reason:'password_targets', input, button: buttons[0].el};
+            """) or {}
+            if not result.get('ok'):
+                raise RuntimeError(f"密码页处理失败：{_diagnostic_state(result)} state={_diagnostic_state(last)}")
+            password_input = result.get("input")
+            _human_type_text(driver, password_input, password, clear=True)
             actual_password = str(password_input.get_attribute("value") or "")
-        if actual_password != password:
-            raise RuntimeError(
-                f"密码写入校验失败，已停止提交: "
-                f"expected_length={len(password)} actual_length={len(actual_password)}"
-            )
-        human_delay("form", minimum=0.4, maximum=1.4)
-        _human_click(driver, result.get("button"), label="password_submit")
-        logger.info("%s 已填写并提交密码页", _log_prefix(driver))
-        # 提交密码后通常进入邮箱验证码页，最多等一段时间。
-        wait_end = time.time() + 20
-        while time.time() < wait_end:
-            if _is_email_verification_page(driver):
-                logger.info("%s 密码提交后已进入邮箱验证码页", _log_prefix(driver))
-                return password
-            if _has_access_token(driver):
-                logger.info("%s 密码提交后已检测到登录态", _log_prefix(driver))
-                return password
-            page_state = _page_snapshot(driver)
-            if _is_profile_like(page_state):
-                logger.info("%s 密码提交后已进入资料页", _log_prefix(driver))
-                return password
-            time.sleep(0.5)
+            if actual_password != password:
+                logger.warning(
+                    "%s 密码写入值不一致，使用 React 原生 setter 修正：expected_length=%s actual_length=%s",
+                    _log_prefix(driver),
+                    len(password),
+                    len(actual_password),
+                )
+                _set_element_value(driver, password_input, password)
+                actual_password = str(password_input.get_attribute("value") or "")
+            if actual_password != password:
+                raise RuntimeError(
+                    f"密码写入校验失败，已停止提交: "
+                    f"expected_length={len(password)} actual_length={len(actual_password)}"
+                )
+            human_delay("form", minimum=0.4, maximum=1.4)
+            monitor = _RegistrationRequestMonitor(driver)
+            retry_route_error = False
+            try:
+                try:
+                    _human_click(driver, result.get("button"), label="password_submit")
+                except Exception as exc:
+                    raise RegistrationPasswordSubmissionError(
+                        "注册密码提交结果不确定：点击后浏览器报错；请检查账号状态，勿重用此邮箱"
+                    ) from exc
+                logger.info("%s 已填写并提交密码页（第 %s/3 次）", _log_prefix(driver), submission_attempt)
+                wait_end = time.time() + 20
+                while time.time() < wait_end:
+                    response = monitor.poll()
+                    if response and response["status"] >= 400:
+                        # The known 400 HTML Route Error has a recovery action;
+                        # other 400s, challenges and 403s are terminal.
+                        route_error = False
+                        if response["status"] == 400 and not response.get("challenge_detected"):
+                            route_wait = time.time() + 2
+                            while time.time() < route_wait:
+                                if _password_submission_route_error(driver):
+                                    route_error = True
+                                    break
+                                time.sleep(0.2)
+                        if route_error and submission_attempt < 3:
+                            retry_route_error = True
+                            break
+                        challenge = "Cloudflare challenge；" if response.get("challenge_detected") else ""
+                        raise RegistrationPasswordSubmissionError(
+                            "注册密码提交结果不确定：注册接口 "
+                            f"{response['method']} HTTP {response['status']} "
+                            f"Content-Type={response['content_type']}；{challenge}"
+                            "远端是否创建账号尚未确认，请勿重用此邮箱"
+                        )
+                    if _password_submission_route_error(driver):
+                        if submission_attempt < 3:
+                            retry_route_error = True
+                            break
+                        detail = (
+                            f"注册接口 HTTP {response['status']} Content-Type={response['content_type']}"
+                            if response else "注册接口响应状态未捕获"
+                        )
+                        raise RegistrationPasswordSubmissionError(
+                            f"注册密码提交结果不确定：页面出现 Route Error，{detail}；请勿重用此邮箱"
+                        )
+                    if _is_email_verification_page(driver):
+                        logger.info("%s 密码提交后已进入邮箱验证码页", _log_prefix(driver))
+                        return password
+                    if _has_access_token(driver):
+                        logger.info("%s 密码提交后已检测到登录态", _log_prefix(driver))
+                        return password
+                    if _is_profile_like(_page_snapshot(driver)):
+                        logger.info("%s 密码提交后已进入资料页", _log_prefix(driver))
+                        return password
+                    time.sleep(0.5)
+                if not retry_route_error:
+                    raise RegistrationPasswordSubmissionError(
+                        "注册密码提交结果不确定：页面未进入验证码页、资料页或登录态；"
+                        f"state={_diagnostic_state(_password_page_state(driver))}；请勿重用此邮箱"
+                    )
+            finally:
+                monitor.close()
+            logger.warning("%s 注册密码页出现 HTTP 400 Route Error，尝试页面恢复（%s/2）", _log_prefix(driver), submission_attempt)
+            if not _click_route_error_try_again(driver):
+                raise RegistrationPasswordSubmissionError(
+                    "Route Error 页面没有可用的 Try again 按钮；账号状态不确定，请勿重用此邮箱"
+                )
+            recovery_end = time.time() + 8
+            while time.time() < recovery_end:
+                if not _password_submission_route_error(driver):
+                    if (_is_signup_password_page(driver) or _is_email_verification_page(driver)
+                            or _has_access_token(driver) or _is_profile_like(_page_snapshot(driver))):
+                        break
+                time.sleep(0.3)
+            else:
+                raise RegistrationPasswordSubmissionError(
+                    "Route Error 重试后未回到密码页或下一步；账号状态不确定，请勿重用此邮箱"
+                )
+    if not allow_passwordless_signup:
         raise RuntimeError(
-            f"密码已提交，但页面未进入验证码页、资料页或登录态，不能确认密码已设置: "
-            f"state={_password_page_state(driver)}"
+            "已启用 2FA，但点击密码注册入口后未检测到可填写的密码页；"
+            f"已停止邮箱 OTP 单独登录的注册: state={_diagnostic_state(last)}"
         )
-    logger.info("%s 未检测到密码页，继续后续流程 last=%s", _log_prefix(driver), last)
+    logger.info("%s 未检测到密码页，继续后续流程 last=%s", _log_prefix(driver), _diagnostic_state(last))
     return None
 
 
@@ -1771,7 +2357,7 @@ def _accept_profile_consents(driver) -> int:
             logger.info("%s 已勾选 about-you/profile 同意协议复选框：%s", _log_prefix(driver), result.get('names'))
         return count
     except Exception as exc:
-        logger.debug('%s 勾选 profile consent 失败：%s', _log_prefix(driver), exc)
+        logger.debug('%s 勾选 profile consent 失败：%s', _log_prefix(driver), _safe_exception_text(exc))
         return 0
 
 
@@ -1791,10 +2377,10 @@ def _complete_profile_page(driver, name: str, birthday: str, timeout: int = 45) 
         snap = _page_snapshot(driver)
         last_snapshot = snap
         if not _is_profile_like(snap):
-            logger.info('%s 等待资料页中：url=%s', _log_prefix(driver), snap.get('url'))
+            logger.info('%s 等待资料页中：route=%s', _log_prefix(driver), _diagnostic_route(snap.get('url')))
             continue
 
-        logger.info('%s 检测到资料页，开始填写姓名生日：url=%s inputs=%s', _log_prefix(driver), snap.get('url'), snap.get('inputs'))
+        logger.info('%s 检测到资料页，开始填写姓名生日：state=%s', _log_prefix(driver), _diagnostic_state(snap))
         name_ok = False
         # 常见单姓名字段
         for selectors in [
@@ -1823,7 +2409,7 @@ def _complete_profile_page(driver, name: str, birthday: str, timeout: int = 45) 
                 logger.info("%s 已填写生日字段 mode=%s value=%s", _log_prefix(driver), birth_mode, birthday)
 
         if not name_ok or not birth_ok:
-            logger.warning('%s 资料页字段未填完整 name_ok=%s birth_ok=%s snapshot=%s', _log_prefix(driver), name_ok, birth_ok, snap)
+            logger.warning('%s 资料页字段未填完整 name_ok=%s birth_ok=%s snapshot=%s', _log_prefix(driver), name_ok, birth_ok, _diagnostic_state(snap))
             continue
 
         _accept_profile_consents(driver)
@@ -1833,8 +2419,8 @@ def _complete_profile_page(driver, name: str, birthday: str, timeout: int = 45) 
                 logger.info('%s 已点击资料页提交按钮，等待 OAuth 跳转', _log_prefix(driver))
                 return True
             time.sleep(1)
-        logger.warning('%s 找不到可点击的资料页提交按钮 snapshot=%s', _log_prefix(driver), _page_snapshot(driver))
-    raise RuntimeError(f'等待/填写资料页超时，最后页面：{last_snapshot}')
+        logger.warning('%s 找不到可点击的资料页提交按钮 snapshot=%s', _log_prefix(driver), _diagnostic_state(_page_snapshot(driver)))
+    raise RuntimeError(f'等待/填写资料页超时，最后页面：{_diagnostic_state(last_snapshot)}')
 
 
 def _click_if_enabled_submit(driver) -> bool:
@@ -1974,15 +2560,55 @@ def _check_manual_stop() -> None:
     check_stop_requested()
 
 
+def _profile_proxy_for_2fa(opened: RoxyOpenResult, client: RoxyBrowserClient, proxy: str | None) -> str:
+    """Read the matching Roxy Profile route before exporting its login cookies."""
+    from core.roxy_codex_oauth import _roxy_profile_token_proxy
+
+    return _roxy_profile_token_proxy(opened, proxy, client)
+
+
+def _setup_2fa_after_registration(driver, email: str, opened: RoxyOpenResult, client: RoxyBrowserClient, proxy: str | None) -> tuple[str, str]:
+    """Enroll TOTP in the live Roxy browser profile.
+
+    Roxy's CDP/Selenium browser is the source of truth for cookies, device
+    state, proxy routing, and the Cloudflare challenge.  Moving cookies into a
+    separate HTTP/TLS client can make the reauthentication or MFA endpoints
+    return 403 even when the browser page is valid, so every 2FA request stays
+    in this same browser tab.
+    """
+    # Keep the read-only profile route check as a diagnostic guard. It proves
+    # the profile was opened with a known route before starting the irreversible
+    # reauthentication/enrollment steps; the actual requests use the browser.
+    profile_proxy = _profile_proxy_for_2fa(opened, client, proxy)
+    from core.browser_2fa_session import BrowserBacked2FASession
+
+    session = BrowserBacked2FASession(driver)
+    secret = setup_2fa(session, email, otp_provider=wait_for_otp)
+    return secret, profile_proxy
+
+
 def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = None, otp_code: str = None, batch_dir: Path | None = None) -> dict:
     """Roxy 指纹浏览器自动化注册入口。"""
     client = RoxyBrowserClient()
-    opened = client.open_profile()
+    opened = None
     driver = None
     create_acknowledged = False
     openai_password: str | None = None
+    require_2fa = bool(_twofa_cfg.ENABLE_2FA)
+    # WebUI may reload configuration during a task; keep this requirement
+    # fixed until the account has passed login verification and been saved.
     try:
+        try:
+            opened = client.open_profile(proxy=proxy)
+        except TypeError as exc:
+            if "unexpected keyword argument 'proxy'" not in str(exc):
+                raise
+            opened = client.open_profile()
         driver = _build_driver(opened)
+        # Fixed/kept-open Roxy Profiles may still contain the previous
+        # ChatGPT session. Clear it before opening the registration page so
+        # the task cannot silently land on an already logged-in home page.
+        _clear_chatgpt_auth_state(driver)
         _center_browser_window(driver)
         driver.set_page_load_timeout(int(_cfg.ROXY_SELENIUM_TIMEOUT))
         try:
@@ -2018,13 +2644,31 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
             create_acknowledged = True
             needs_email_otp = False
         elif next_state == "password":
-            openai_password = _fill_password_page_if_present(driver, email, timeout=25)
+            openai_password = _fill_password_page_if_present(
+                driver, email, timeout=25, allow_passwordless_signup=not require_2fa,
+            )
             if openai_password or _has_access_token(driver):
                 create_acknowledged = True
             needs_email_otp = _is_email_verification_page(driver)
         else:
-            openai_password = None
-            needs_email_otp = True
+            if require_2fa:
+                switch = _click_continue_with_password_if_present(driver)
+                if not switch.get("ok"):
+                    raise RuntimeError(
+                        "已启用 2FA，但仍未设置密码；邮箱验证码页没有打开密码注册入口；"
+                        f"已停止邮箱 OTP 单独登录的注册: {switch.get('reason')}"
+                    )
+                openai_password = _fill_password_page_if_present(
+                    driver, email, timeout=25, allow_passwordless_signup=False,
+                )
+                if openai_password or _has_access_token(driver):
+                    create_acknowledged = True
+                needs_email_otp = _is_email_verification_page(driver)
+            else:
+                openai_password = None
+                needs_email_otp = True
+        if require_2fa and not openai_password:
+            raise RuntimeError("已启用 2FA，但注册流程未设置密码；已停止邮箱 OTP 单独登录的注册")
         _check_manual_stop()
 
         current_otp = otp_code
@@ -2049,7 +2693,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                     human_delay("api")
                     current_otp = None
                     continue
-            logger.info("[Roxy注册][OTP] 收到验证码：%s", current_otp)
+            logger.info("[Roxy注册][OTP] 已收到邮箱验证码")
             _clear_otp_inputs(driver)
             _type_otp(driver, current_otp)
             logger.info("[Roxy注册][OTP] 已填写邮箱验证码")
@@ -2059,7 +2703,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                 _click_continue(driver)
                 logger.info("[Roxy注册][OTP] 已提交邮箱验证码，等待资料页或登录态")
             except Exception as exc:
-                logger.info("[Roxy注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s", str(exc)[:120])
+                logger.info("[Roxy注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s", _safe_exception_text(exc, 120))
 
             outcome = _wait_after_email_otp_submit(driver, timeout=10)
             if outcome == 'accepted':
@@ -2090,9 +2734,8 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         logger.info("[Roxy注册] 已拿到 accessToken：%s", email)
         _check_manual_stop()
 
-        if _twofa_cfg.ENABLE_2FA:
-            logger.warning("[Roxy注册] 当前 Roxy 自动化路径暂不执行 2FA 设置，已跳过")
         totp_secret = None
+        effective_proxy = opened.proxy if opened.proxy is not None else proxy
 
         email_source = resolve_email_source(email)
         codex_result = {
@@ -2100,41 +2743,58 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
             "ok": False,
             "message": "GPT 注册完成，等待在 GPT账号 页面手动发起 Codex 授权",
         }
-        account_extra = {
-            "user": session_info.get("user"),
-            "account": session_info.get("account"),
-            "expires": session_info.get("expires"),
-            "roxybrowser": {"profile_id": opened.profile_id, "open_result": opened.raw},
-            "registration_password": openai_password,
-            "login_method": "password" if openai_password else "email_otp",
-            "codex": codex_result,
+        account_fields = {
+            "user_id": (session_info.get("user") or {}).get("id"),
+            "user_name": (session_info.get("user") or {}).get("name"),
+            "plan_type": (session_info.get("account") or {}).get("planType"),
+            "expires_at": session_info.get("expires"),
+            "registration_driver": "roxy",
+            "registration_profile_id": opened.profile_id,
+            "codex_status": codex_result["status"],
         }
-        account_id = save_account_data(
-            email=email,
-            access_token=access_token,
-            totp_secret=totp_secret,
-            email_source=email_source,
-            proxy_used=proxy or None,
-            batch_dir=batch_dir,
-            extra=account_extra,
-            archive=False,
-            enqueue_plan=True,
-        )
-        if openai_password:
-            logger.info("[Roxy注册][检查点] 账号及登录密码已即时写入：%s，账号ID=%s", email, account_id)
-        else:
-            logger.info("[Roxy注册][检查点] 账号已即时写入（OTP 登录，未经过密码创建页）：%s，账号ID=%s", email, account_id)
+        if require_2fa:
+            logger.info("[Roxy注册] 开始自动设置 2FA：%s", email)
+            try:
+                totp_secret, effective_proxy = _setup_2fa_after_registration(
+                    driver, email, opened, client, proxy,
+                )
+                if not totp_secret:
+                    raise RuntimeError("2FA 激活后未返回 TOTP secret")
+            except Exception as exc:
+                logger.error("[Roxy注册] 2FA 设置失败：%s: %s", type(exc).__name__, _safe_exception_text(exc))
+                raise RuntimeError(f"Roxy 注册已创建密码，但 2FA 设置失败：{type(exc).__name__}: {_safe_exception_text(exc, 180)}") from exc
+            logger.info("[Roxy注册] 2FA 设置完成：%s", email)
+
+            # Keep the original single-browser flow. The verifier clears auth
+            # state and proves a fresh login without starting stock Chrome or
+            # transferring cookies to a different HTTP/TLS implementation.
+            logger.info("[Roxy注册] 在当前 Roxy 环境中清理登录态并验证密码 + TOTP：%s", email)
+            try:
+                verified_info = verify_password_totp_login(
+                    email, openai_password, totp_secret, proxy=effective_proxy, driver=driver,
+                )
+                access_token = verified_info["accessToken"]
+            except Exception as exc:
+                logger.error("[Roxy注册] 密码 + TOTP 重登录验证失败：%s", type(exc).__name__)
+                raise RuntimeError(
+                    "Roxy 注册已创建密码和 2FA，但当前环境的密码 + TOTP 登录验证失败："
+                    f"{type(exc).__name__}: {_safe_exception_text(exc, 180)}"
+                ) from exc
+            logger.info("[Roxy注册] 密码 + TOTP 重登录验证成功：%s", email)
 
         account_id = save_account_data(
             email=email,
             access_token=access_token,
             totp_secret=totp_secret,
             email_source=email_source,
-            proxy_used=proxy or None,
+            chatgpt_password=openai_password,
+            login_method="password" if openai_password else "email_otp",
+            proxy=effective_proxy,
             batch_dir=batch_dir,
-            extra=account_extra,
+            **account_fields,
             archive=True,
-            enqueue_plan=False,
+            verified_registration=True,
+            enqueue_plan=True,
         )
         return {
             "success": True,
@@ -2146,17 +2806,22 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
             "error": None,
         }
     except Exception as exc:
-        logger.error("[Roxy注册] 失败：%s: %s", type(exc).__name__, exc)
-        logger.debug("[Roxy注册] 失败详情", exc_info=True)
+        logger.error("[Roxy注册] 失败：%s: %s", type(exc).__name__, _safe_exception_text(exc))
+        logger.debug("[Roxy注册] 失败详情已省略敏感堆栈：%s", type(exc).__name__)
         # 未确认创建前回收邮箱；确认后避免重复使用。
         try:
             from core.email_provider import release_email
-            release_email(email, status="failed" if create_acknowledged else "available", note=f"Roxy注册失败: {str(exc)[:180]}")
+            release_email(
+                email,
+                status=("disabled" if isinstance(exc, RegistrationPasswordSubmissionError)
+                        else "failed" if create_acknowledged else "available"),
+                note=f"Roxy注册失败: {_safe_exception_text(exc, 180)}",
+            )
         except Exception:
             pass
-        return {"success": False, "email": email, "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+        return {"success": False, "email": email, "error": f"{type(exc).__name__}: {_safe_exception_text(exc, 300)}"}
     finally:
-        if driver and not bool(_cfg.ROXY_KEEP_BROWSER_OPEN):
+        if driver and not bool(_cfg.ROXY_KEEP_BROWSER_OPEN) and not getattr(opened, "was_open", False):
             try:
                 driver.quit()
             except Exception:

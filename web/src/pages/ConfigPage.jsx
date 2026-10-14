@@ -5,6 +5,7 @@ import {
   Save, Settings2, ShieldCheck, Smartphone, Terminal, Upload, WandSparkles,
 } from 'lucide-react';
 import { get, post } from '../api';
+import ProxyTest from '../components/ProxyTest';
 import {
   Button, Card, ErrorState, IconButton, InlineNotice, SectionHeader, Select,
 } from '../components/ui';
@@ -574,6 +575,11 @@ export default function ConfigPage({ notify, summary, initialGroup = '', onOpenE
   }
 
   function renderField(field) {
+    if (field.key === 'PROXY_POOL') return <div key={field.key} className="config-field">
+      <ConfigField field={field} value={draft[field.key]} showKey disabled={formBusy} onChange={(value) => update(field.key, value)} />
+      <p className="field-help">测试当前输入，无需先保存；每行一个代理，最多 20 条。留空测试本机网络，测试不修改 Roxy 窗口。</p>
+      <ProxyTest proxies={String(draft[field.key] || '').split('\n').map((value) => value.trim()).filter(Boolean)} disabled={formBusy} label="测试代理 / 本机网络" />
+    </div>;
     return field.key === 'EMAIL_SOURCE'
       ? <EmailSourcePicker key={field.key} value={draft[field.key]} draft={draft} runtime={summary?.registration_email} disabled={formBusy} onChange={(value) => update(field.key, value)} />
       : <ConfigField key={field.key} field={field} value={draft[field.key]} showKey={!activeChannel} disabled={formBusy} onChange={(value) => update(field.key, value)} />;

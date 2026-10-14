@@ -25,6 +25,11 @@ class CodexRetryStopped(Exception):
     """用户手动停止 Codex 补跑。"""
 
 
+def _account_proxy(account: dict | None) -> str:
+    """Return the proxy bound directly to the GPT account, if any."""
+    return str((account or {}).get("proxy") or "").strip()
+
+
 def _thread_alive(thread_id: int | None) -> bool:
     if not thread_id:
         return False
@@ -161,7 +166,6 @@ def request_stop(email: str) -> dict:
             p,
             f"{_dt.now().strftime('%H:%M:%S')} [WARNING] [Codex 补跑] 用户手动停止，已发送停止信号 injected={injected}\n",
             category="codex_retry_logs",
-            mirror=False,
         )
     except Exception:
         logger.exception("写入 Codex 停止日志失败")
@@ -190,10 +194,10 @@ def run_worker(
 
         path = Path(target_log_path) if target_log_path else log_path(email)
         if clear_log:
-            sqlite_store.write_file(path, b"", category="codex_retry_logs", mode=0o600, mirror=False)
+            sqlite_store.write_file(path, b"", category="codex_retry_logs")
 
         thread_name = threading.current_thread().name
-        fh = sqlite_store.SQLiteFileHandler(path, category="codex_retry_logs", mirror=False)
+        fh = sqlite_store.SQLiteFileHandler(path, category="codex_retry_logs")
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter(
             "%(asctime)s [%(levelname)s] %(message)s",
@@ -225,6 +229,7 @@ def run_worker(
         login_material = registered_account_login_material(account)
         login_password = login_material.get("chatgpt_password") or None
         totp_secret = login_material.get("totp_secret") or ""
+        account_proxy = _account_proxy(account)
         totp_provider = None
         if totp_secret:
             import pyotp
@@ -235,6 +240,7 @@ def run_worker(
             force=True,
             login_password=login_password,
             totp_provider=totp_provider,
+            proxy=account_proxy or None,
             require_browser=bool(login_password),
         )
         check_stop_requested(email)

@@ -92,12 +92,10 @@ class BrowserSession:
         # 创建 curl_cffi 会话
         self.session = Session(impersonate=IMPERSONATE)
 
-        # 设置代理
-        if self.proxy:
-            self.session.proxies = {
-                "http": self.proxy,
-                "https": self.proxy,
-            }
+        # Pin the route even when direct. An empty proxy dictionary lets libcurl
+        # inherit HTTP(S)_PROXY/ALL_PROXY; trust_env alone does not disable that.
+        self.session.trust_env = False
+        self.session.proxies = {"all": self.proxy}
 
         # 设置超时
         self.session.timeout = REQUEST_TIMEOUT
@@ -504,8 +502,16 @@ class BrowserSession:
         retry_after = self._parse_retry_after(getattr(resp, "headers", {}).get("retry-after") if getattr(resp, "headers", None) else None)
         cool_down = retry_after if retry_after > 0 else (300 if status == 429 else 900)
         self.blocked_until = max(self.blocked_until, time.time() + min(cool_down, 3600))
-        self.blocked_reason = f"HTTP {status} from {url}"
-        logger.warning("[熔断] 当前会话收到 HTTP %s，进入冷却 %ss，停止后续请求：%s", status, min(cool_down, 3600), url)
+        # URLs in auth flows can carry email, OAuth codes, and device IDs.
+        # The host is enough to identify the blocked route in the circuit log.
+        try:
+            host = (urlparse(str(url)).hostname or "").lower()
+        except (TypeError, ValueError):
+            host = ""
+        if host not in ("chatgpt.com", "auth.openai.com", "sentinel.openai.com"):
+            host = "unknown"
+        self.blocked_reason = f"HTTP {status} from {host}"
+        logger.warning("[熔断] 当前会话收到 HTTP %s，进入冷却 %ss，停止后续请求：host=%s", status, min(cool_down, 3600), host)
         return resp
 
     def get(self, url: str, headers: dict = None, **kwargs):

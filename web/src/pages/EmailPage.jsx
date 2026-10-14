@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Archive, Ban, Check, Database, Inbox, Link2, Plus, Trash2,
+  Ban, Check, Database, Inbox, Link2, Plus, Trash2,
   Upload, XCircle,
 } from 'lucide-react';
 import { copyText, get, post } from '../api';
@@ -15,12 +15,12 @@ const SOURCES = [
   { value: 'all', label: '全部邮箱' },
   { value: 'outlook', label: 'Outlook' },
   { value: 'generic_api', label: '接码 API' },
+  { value: 'cloudflare_domain', label: '域名邮箱' },
 ];
 
 const STATUSES = [
   { value: '', label: '全部状态' },
   { value: 'available', label: '可用' },
-  { value: 'used', label: '已使用' },
   { value: 'failed', label: '失败' },
   { value: 'disabled', label: '已停用' },
 ];
@@ -28,6 +28,7 @@ const STATUSES = [
 const SOURCE_LABELS = {
   outlook: 'Outlook',
   generic_api: '接码 API',
+  cloudflare_domain: '域名邮箱',
 };
 
 function sourceOf(row, fallback = 'outlook') {
@@ -61,7 +62,11 @@ function materialFor(row) {
   if (source === 'outlook') {
     return { value: row.copy_line || '', preview: 'OAuth 凭证' };
   }
-  return { value: '', preview: '邮箱素材' };
+  return { value: '', preview: source === 'cloudflare_domain' ? '域名转发' : '邮箱素材' };
+}
+
+function canRegister(row) {
+  return ['outlook', 'generic_api'].includes(sourceOf(row)) && (row.status || 'available') === 'available';
 }
 
 function CopyValue({ value, preview, label, notify }) {
@@ -78,7 +83,7 @@ function CopyValue({ value, preview, label, notify }) {
   return <button type="button" className="copy-cell-button" title={`点击复制${label}`} onClick={copy}>{preview || text}</button>;
 }
 
-export default function EmailPage({ notify, summary, onOpenSettings, onSummaryRefresh }) {
+export default function EmailPage({ notify, onOpenSettings, onOpenGptRegistration, onSummaryRefresh }) {
   const [rows, setRows] = useState([]);
   const [total, setTotal] = useState(0);
   const [source, setSource] = useState('all');
@@ -93,6 +98,7 @@ export default function EmailPage({ notify, summary, onOpenSettings, onSummaryRe
   const [importSource, setImportSource] = useState('outlook');
   const [importText, setImportText] = useState('');
   const [importing, setImporting] = useState(false);
+  const [registering, setRegistering] = useState(false);
   const debouncedQuery = useDebounced(query);
 
   const load = useCallback(async () => {
@@ -124,9 +130,9 @@ export default function EmailPage({ notify, summary, onOpenSettings, onSummaryRe
   const displayTotal = total;
 
   const selectedKeys = useMemo(() => [...selected], [selected]);
-  const selectedItems = useMemo(() => rows
-    .filter((row) => selected.has(keyFor(row, source)))
-    .map((row) => ({ email: row.email, source: sourceOf(row, source) })), [rows, selected, source]);
+  const selectedRows = useMemo(() => rows.filter((row) => selected.has(keyFor(row, source))), [rows, selected, source]);
+  const selectedItems = useMemo(() => selectedRows.map((row) => ({ email: row.email, source: sourceOf(row, source) })), [selectedRows, source]);
+  const selectedRegistrable = useMemo(() => selectedRows.filter(canRegister), [selectedRows]);
 
   function toggle(key, checked) {
     setSelected((current) => {
@@ -184,6 +190,28 @@ export default function EmailPage({ notify, summary, onOpenSettings, onSummaryRe
     }
   }
 
+
+  async function submitEmailRegistration(...emails) {
+    const addresses = [...new Set(emails.map((email) => String(email || '').trim().toLowerCase()))];
+    if (!addresses.length) return notify('请先选择可用的邮箱账号', 'warning');
+    if (registering) return;
+    setRegistering(true);
+    try {
+      const response = await post('/api/gpt-accounts/register', { emails: addresses, workers: 1 });
+      notify(`已提交 ${response.submitted || addresses.length} 个注册任务`, 'success');
+      await load();
+      await onSummaryRefresh?.();
+    } catch (actionError) {
+      notify(actionError.message || '注册任务提交失败', 'error');
+    } finally {
+      setRegistering(false);
+    }
+  }
+
+  function registerSelected() {
+    return submitEmailRegistration(...selectedRegistrable.map((row) => row.email));
+  }
+
   const allSelected = rows.length > 0 && rows.every((row) => selected.has(keyFor(row, source)));
   const importPlaceholder = importSource === 'outlook'
     ? '邮箱----密码----clientId----refreshToken'
@@ -191,16 +219,16 @@ export default function EmailPage({ notify, summary, onOpenSettings, onSummaryRe
 
   return <div className="page-stack">
     <div className="page-intro">
-      <div><div className="eyebrow"><Inbox size={14} /> 邮箱来源</div><h2>邮箱</h2></div>
+      <div><div className="eyebrow"><Inbox size={14} /> 邮箱来源</div><h2>邮箱账号</h2><p>只显示尚未完成 GPT 注册的邮箱；注册成功后会进入 GPT 账号。</p></div>
       <div className="intro-actions">
         <Button icon={Upload} variant="primary" onClick={() => setImportOpen(true)}>导入邮箱</Button>
       </div>
     </div>
 
     <Card className="table-card email-management-panel">
-      <SectionHeader title="已导入邮箱" actions={<>
+      <SectionHeader title="待注册邮箱账号" actions={<>
+        <Button icon={Check} size="sm" disabled={!selectedRegistrable.length || registering} loading={registering} onClick={registerSelected}>注册选中</Button>
         <Button icon={Check} size="sm" disabled={!selectedKeys.length} onClick={() => updateStatus(selectedItems, 'available')}>标记可用</Button>
-        <Button icon={Archive} size="sm" disabled={!selectedKeys.length} onClick={() => updateStatus(selectedItems, 'used')}>标记已用</Button>
         <Button icon={XCircle} size="sm" disabled={!selectedKeys.length} onClick={() => updateStatus(selectedItems, 'failed')}>标记失败</Button>
         <Button icon={Ban} size="sm" disabled={!selectedKeys.length} onClick={() => updateStatus(selectedItems, 'disabled')}>停用</Button>
         <Button icon={Trash2} variant="danger" size="sm" disabled={!selectedKeys.length} onClick={() => deleteItems(selectedItems)}>删除</Button>
@@ -215,13 +243,13 @@ export default function EmailPage({ notify, summary, onOpenSettings, onSummaryRe
       {error ? <ErrorState message={error} onRetry={load} /> : null}
       <Table className="email-management-table"><colgroup>
         <col className="email-col-check" /><col className="email-col-address" /><col className="email-col-source" />
-        <col className="email-col-material" /><col className="email-col-status" /><col className="email-col-link" />
+        <col className="email-col-material" /><col className="email-col-status" />
         <col className="email-col-note" /><col className="email-col-time" /><col className="email-col-actions" />
       </colgroup><thead><tr>
         <th className="check-col"><Checkbox checked={allSelected} onChange={(checked) => setSelected(checked ? new Set(rows.map((row) => keyFor(row, source))) : new Set())} /></th>
-        <th>邮箱</th><th>来源</th><th>接码凭证</th><th>状态</th><th>GPT账号</th><th>备注</th><th>时间</th><th>操作</th>
+        <th>邮箱</th><th>来源</th><th>接码凭证</th><th>状态</th><th>备注</th><th>时间</th><th>操作</th>
       </tr></thead><tbody>
-        {loading ? <tr><td colSpan="9"><div className="table-loading"><span className="loading-bar" /><span className="loading-bar" /><span className="loading-bar" /></div></td></tr> : displayRows.length === 0 ? <tr><td colSpan="9"><EmptyState title="暂无已导入邮箱" description="这里仅显示手动导入的 Outlook 和接码 API 邮箱。" action={<Button icon={Plus} size="sm" onClick={() => setImportOpen(true)}>导入邮箱</Button>} /></td></tr> : displayRows.map((row) => {
+        {loading ? <tr><td colSpan="8"><div className="table-loading"><span className="loading-bar" /><span className="loading-bar" /><span className="loading-bar" /></div></td></tr> : displayRows.length === 0 ? <tr><td colSpan="8"><EmptyState title="没有待注册邮箱" description="导入邮箱账号后可选择邮箱启动注册。" action={<Button icon={Plus} size="sm" onClick={() => setImportOpen(true)}>导入邮箱</Button>} /></td></tr> : displayRows.map((row) => {
           const rowSource = sourceOf(row, source);
           const rowKey = keyFor(row, source);
           const material = materialFor(row);
@@ -232,11 +260,10 @@ export default function EmailPage({ notify, summary, onOpenSettings, onSummaryRe
             <td><span className="source-tag">{rowSource === 'generic_api' ? <Link2 size={13} /> : <Database size={13} />}{SOURCE_LABELS[rowSource] || rowSource}</span></td>
             <td><CopyValue value={material.value} preview={material.preview} label="邮箱素材" notify={notify} /></td>
             <td><StatusPill value={rowStatus} /></td>
-            <td>{row.registered_account_id ? <StatusPill value="registered">已关联</StatusPill> : <span className="copy-cell-empty">未关联</span>}</td>
             <td className="truncate" title={row.note || ''}>{row.note || '—'}</td>
             <td className="cell-nowrap">{formatDate(row.imported_at || row.created_at || row.used_at)}</td>
             <td><div className="row-actions">
-              {rowStatus !== 'available' ? <Button size="sm" onClick={() => updateStatus([{ email: row.email, source: rowSource }], 'available')}>可用</Button> : null}
+              {canRegister(row) ? <Button size="sm" disabled={registering} onClick={() => submitEmailRegistration(row.email)}>注册</Button> : rowSource === 'cloudflare_domain' && rowStatus === 'available' ? <Button size="sm" title="域名邮箱由渠道自动领取，不能指定此行地址" onClick={onOpenGptRegistration}>渠道注册</Button> : <Button size="sm" onClick={() => updateStatus([{ email: row.email, source: rowSource }], 'available')}>可用</Button>}
               {rowStatus !== 'disabled' ? <Button size="sm" onClick={() => updateStatus([{ email: row.email, source: rowSource }], 'disabled')}>停用</Button> : null}
               <Button variant="danger" size="sm" onClick={() => deleteItems([{ email: row.email, source: rowSource }])}>删除</Button>
             </div></td>

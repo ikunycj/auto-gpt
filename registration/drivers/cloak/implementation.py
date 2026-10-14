@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = None, otp_code: str = None, batch_dir: Path | None = None) -> dict:
     """CloakBrowser 自动化注册入口。"""
+    from registration.application.use_case import require_password_2fa_driver
+
+    require_password_2fa_driver("cloak")
     driver = None
     opened = None
     create_acknowledged = False
@@ -80,7 +83,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
                     human_delay("api")
                     current_otp = None
                     continue
-            logger.info("[Cloak注册][OTP] 收到验证码：%s", current_otp)
+            logger.info("[Cloak注册][OTP] 已收到验证码")
             _clear_otp_inputs(driver)
             _type_otp(driver, current_otp)
             human_delay("otp_input")
@@ -111,7 +114,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
         logger.info("[Cloak注册] 已拿到 accessToken：%s", email)
 
         if _twofa_cfg.ENABLE_2FA:
-            logger.warning("[Cloak注册] 当前 CloakBrowser 自动化路径暂不执行 2FA 设置，已跳过")
+            raise RuntimeError("CloakBrowser 注册路径无法完成密码和 2FA 设置；已停止保存账号")
         totp_secret = None
 
         email_source = resolve_email_source(email)
@@ -120,40 +123,27 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
             "ok": False,
             "message": "GPT 注册完成，等待在 GPT账号 页面手动发起 Codex 授权",
         }
-        account_extra = {
-            "user": session_info.get("user"),
-            "account": session_info.get("account"),
-            "expires": session_info.get("expires"),
-            "cloakbrowser": {"profile_id": opened.profile_id, "open_result": opened.raw},
-            "registration_password": openai_password,
-            "login_method": "password" if openai_password else "email_otp",
-            "codex": codex_result,
+        account_fields = {
+            "user_id": (session_info.get("user") or {}).get("id"),
+            "user_name": (session_info.get("user") or {}).get("name"),
+            "plan_type": (session_info.get("account") or {}).get("planType"),
+            "expires_at": session_info.get("expires"),
+            "registration_driver": "cloak",
+            "registration_profile_id": opened.profile_id,
+            "codex_status": codex_result["status"],
         }
         account_id = save_account_data(
             email=email,
             access_token=access_token,
             totp_secret=totp_secret,
             email_source=email_source,
-            proxy_used=((opened.raw or {}).get("proxy") if opened else None) or proxy or None,
+            chatgpt_password=openai_password,
+            login_method="password" if openai_password else "email_otp",
+            proxy=((opened.raw or {}).get("proxy") if opened else None) or proxy or None,
             batch_dir=batch_dir,
-            extra=account_extra,
-            archive=False,
-            enqueue_plan=True,
-        )
-        if openai_password:
-            logger.info("[Cloak注册][检查点] 账号及登录密码已即时写入：%s，账号ID=%s", email, account_id)
-        else:
-            logger.info("[Cloak注册][检查点] 账号已即时写入（OTP 登录，未经过密码创建页）：%s，账号ID=%s", email, account_id)
-
-        account_id = save_account_data(
-            email=email,
-            access_token=access_token,
-            totp_secret=totp_secret,
-            email_source=email_source,
-            proxy_used=((opened.raw or {}).get("proxy") if opened else None) or proxy or None,
-            batch_dir=batch_dir,
-            extra=account_extra,
+            **account_fields,
             archive=True,
+        verified_registration=True,
             enqueue_plan=False,
         )
         return {"success": True, "email": email, "account_id": account_id, "access_token": access_token, "totp_secret": totp_secret, "codex": codex_result, "error": None}

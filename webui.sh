@@ -465,7 +465,7 @@ category = sys.argv[2]
 seen = ""
 while True:
     try:
-        text = sqlite_store.read_text_file(path, category=category, import_legacy=False)
+        text = sqlite_store.read_text_file(path, category=category)
     except FileNotFoundError:
         text = ""
     if len(text) < len(seen):

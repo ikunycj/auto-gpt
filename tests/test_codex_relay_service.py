@@ -2,10 +2,11 @@ import json
 import stat
 import threading
 import time
+from contextlib import nullcontext
 
 import pytest
 
-from core import codex_relay_service as relay
+from core import account_store, codex_relay_service as relay, sqlite_store
 
 
 @pytest.fixture
@@ -27,13 +28,15 @@ def relay_storage(tmp_path, monkeypatch):
 def test_gpt_liveness_refreshes_saved_rt_without_login_or_otp(relay_storage, monkeypatch):
     relay.import_accounts("rt-live@example.com----https://mail.example/code")
     account = relay._read(relay._ACCOUNTS_PATH)[0]
+    proxy = "http://proxy-user:proxy-pass@proxy.example:3128"
+    relay._update_account(account["id"], proxy=proxy)
     relay._CREDENTIAL_DIR.mkdir(parents=True)
     credential_path = relay._CREDENTIAL_DIR / "codex-rt-live@example.com.json"
-    credential_path.write_text(json.dumps({
+    sqlite_store.write_file(credential_path, json.dumps({
         "email": "rt-live@example.com",
         "refresh_token": "old-refresh-token",
         "access_token": "old-access-token",
-    }), encoding="utf-8")
+    }), category="codex_credentials")
     relay._write(relay._JOBS_PATH, [{
         "id": "job-rt-live", "account_id": account["id"], "email": account["email"],
         "action": "check_gpt_liveness", "status": "queued", "stage": "queued",
@@ -50,21 +53,26 @@ def test_gpt_liveness_refreshes_saved_rt_without_login_or_otp(relay_storage, mon
         "check_account_liveness",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("RT 验活不应重新登录")),
     )
-    monkeypatch.setattr(codex_oauth, "refresh_codex_credential", lambda path, proxy="": {
-        "email": "rt-live@example.com",
-        "account_id": "account-live",
-        "refresh_token": "new-refresh-token",
-        "access_token": "new-access-token",
-    })
-    monkeypatch.setattr(chatgpt_plan, "check_codex_usage", lambda token, account_id="", proxy=None: {
-        "ok": True,
-        "checked_at": "2026-08-09T18:00:00",
-        "plan_type": "plus",
-        "weekly_used_percent": 70,
-        "weekly_reset_at": 1786825935,
-        "monthly_used_percent": 30,
-        "monthly_reset_at": 1789417935,
-    })
+    calls = []
+    monkeypatch.setattr(codex_oauth, "refresh_codex_credential", lambda path, proxy="": (
+        calls.append(("refresh", proxy)) or {
+            "email": "rt-live@example.com",
+            "account_id": "account-live",
+            "refresh_token": "new-refresh-token",
+            "access_token": "new-access-token",
+        }
+    ))
+    monkeypatch.setattr(chatgpt_plan, "check_codex_usage", lambda token, account_id="", proxy=None: (
+        calls.append(("usage", proxy)) or {
+            "ok": True,
+            "checked_at": "2026-08-09T18:00:00",
+            "plan_type": "plus",
+            "weekly_used_percent": 70,
+            "weekly_reset_at": 1786825935,
+            "monthly_used_percent": 30,
+            "monthly_reset_at": 1789417935,
+        }
+    ))
 
     relay._run_maintenance_job("job-rt-live", account["id"], "check_gpt_liveness")
 
@@ -78,27 +86,18 @@ def test_gpt_liveness_refreshes_saved_rt_without_login_or_otp(relay_storage, mon
     assert stored["quota_plan"] == "plus"
     assert stored["quota_weekly_used_percent"] == 70
     assert stored["quota_monthly_used_percent"] == 30
+    assert calls == [("refresh", proxy), ("usage", proxy)]
 
 
-def test_public_job_hides_legacy_login_wording():
-    public = relay._public_job({
-        "id": "legacy-job",
-        "status": "success",
-        "message": "GPT 账号存活，RT 刷新成功（未登录、未接码）",
-    })
-
-    assert public["message"] == "GPT 账号存活，RT 刷新成功"
-
-
-def test_gpt_liveness_stays_alive_when_quota_query_fails(relay_storage, monkeypatch):
+def test_gpt_liveness_fails_when_quota_query_fails(relay_storage, monkeypatch):
     relay.import_accounts("quota-failed@example.com----https://mail.example/code")
     account = relay._read(relay._ACCOUNTS_PATH)[0]
     relay._CREDENTIAL_DIR.mkdir(parents=True)
     credential_path = relay._CREDENTIAL_DIR / "codex-quota-failed@example.com.json"
-    credential_path.write_text(json.dumps({
+    sqlite_store.write_file(credential_path, json.dumps({
         "email": "quota-failed@example.com",
         "refresh_token": "valid-refresh-token",
-    }), encoding="utf-8")
+    }), category="codex_credentials")
     relay._write(relay._JOBS_PATH, [{
         "id": "job-quota-failed", "account_id": account["id"], "email": account["email"],
         "action": "check_gpt_liveness", "status": "queued", "stage": "queued",
@@ -121,11 +120,46 @@ def test_gpt_liveness_stays_alive_when_quota_query_fails(relay_storage, monkeypa
 
     job = relay._read(relay._JOBS_PATH)[0]
     stored = relay._read(relay._ACCOUNTS_PATH)[0]
-    assert job["status"] == "success"
-    assert job["message"] == "GPT 账号存活，套餐与限额查询失败"
-    assert stored["liveness_status"] == "alive"
+    assert job["status"] == "failed"
+    assert job["message"] == "账号维护失败"
+    assert stored["codex_status"] == "failed"
+    assert stored["liveness_status"] == "error"
     assert stored["quota_status"] == "error"
-    assert stored["maintenance_status"] == "success"
+    assert stored["maintenance_status"] == "failed"
+    assert not stored.get("gpt_access_token")
+
+
+@pytest.mark.parametrize("refreshed", [
+    {"email": "partial@example.com", "access_token": "fresh-access-token"},
+    {"email": "wrong@example.com", "access_token": "fresh-access-token", "refresh_token": "fresh-refresh-token"},
+])
+def test_gpt_liveness_rejects_incomplete_or_foreign_credential(relay_storage, monkeypatch, refreshed):
+    relay.import_accounts("partial@example.com----https://mail.example/code")
+    account = relay._read(relay._ACCOUNTS_PATH)[0]
+    credential_path = relay._CREDENTIAL_DIR / "codex-partial@example.com.json"
+    sqlite_store.write_file(credential_path, json.dumps({
+        "email": account["email"], "refresh_token": "old-refresh-token",
+    }), category="codex_credentials")
+    relay._write(relay._JOBS_PATH, [{
+        "id": "job-partial", "account_id": account["id"], "email": account["email"],
+        "action": "check_gpt_liveness", "status": "queued", "stage": "queued",
+    }])
+
+    from core import chatgpt_plan, codex_oauth
+    monkeypatch.setattr(codex_oauth, "refresh_codex_credential", lambda path, proxy="": refreshed)
+    monkeypatch.setattr(chatgpt_plan, "check_codex_usage", lambda *_args, **_kwargs: (
+        _ for _ in ()
+    ).throw(AssertionError("不完整或异账号凭证不能查询用量")))
+
+    relay._run_maintenance_job("job-partial", account["id"], "check_gpt_liveness")
+
+    job = relay._read(relay._JOBS_PATH)[0]
+    stored = relay._read(relay._ACCOUNTS_PATH)[0]
+    assert job["status"] == "failed"
+    assert stored["codex_status"] == "reauthorize"
+    assert stored["liveness_status"] == "error"
+    assert stored["maintenance_status"] == "failed"
+    assert not stored.get("gpt_access_token")
 
 
 def test_gpt_liveness_omits_month_when_usage_has_no_monthly_window(relay_storage, monkeypatch):
@@ -133,9 +167,9 @@ def test_gpt_liveness_omits_month_when_usage_has_no_monthly_window(relay_storage
     account = relay._read(relay._ACCOUNTS_PATH)[0]
     relay._CREDENTIAL_DIR.mkdir(parents=True)
     credential_path = relay._CREDENTIAL_DIR / "codex-weekly-only@example.com.json"
-    credential_path.write_text(json.dumps({
+    sqlite_store.write_file(credential_path, json.dumps({
         "email": "weekly-only@example.com", "refresh_token": "valid-refresh-token",
-    }), encoding="utf-8")
+    }), category="codex_credentials")
     relay._write(relay._JOBS_PATH, [{
         "id": "job-weekly-only", "account_id": account["id"], "email": account["email"],
         "action": "check_gpt_liveness", "status": "queued", "stage": "queued",
@@ -160,9 +194,9 @@ def test_gpt_liveness_marks_revoked_rt_for_reauthorization(relay_storage, monkey
     relay.import_accounts("rt-dead@example.com----https://mail.example/code")
     account = relay._read(relay._ACCOUNTS_PATH)[0]
     relay._CREDENTIAL_DIR.mkdir(parents=True)
-    (relay._CREDENTIAL_DIR / "codex-rt-dead@example.com.json").write_text(json.dumps({
+    sqlite_store.write_file(relay._CREDENTIAL_DIR / "codex-rt-dead@example.com.json", json.dumps({
         "email": "rt-dead@example.com", "refresh_token": "revoked-refresh-token",
-    }), encoding="utf-8")
+    }), category="codex_credentials")
     relay._write(relay._JOBS_PATH, [{
         "id": "job-rt-dead", "account_id": account["id"], "email": account["email"],
         "action": "check_gpt_liveness", "status": "queued", "stage": "queued",
@@ -193,12 +227,12 @@ def test_quota_action_refreshes_expired_at_and_stores_weekly_usage(relay_storage
     account = relay._read(relay._ACCOUNTS_PATH)[0]
     relay._CREDENTIAL_DIR.mkdir(parents=True)
     credential_path = relay._CREDENTIAL_DIR / "codex-quota@example.com.json"
-    credential_path.write_text(json.dumps({
+    sqlite_store.write_file(credential_path, json.dumps({
         "email": "quota@example.com",
         "account_id": "account-old",
         "access_token": "expired-at",
         "refresh_token": "valid-rt",
-    }), encoding="utf-8")
+    }), category="codex_credentials")
     relay._write(relay._JOBS_PATH, [{
         "id": "job-quota", "account_id": account["id"], "email": account["email"],
         "action": "check_quota", "status": "queued", "stage": "queued",
@@ -286,6 +320,13 @@ def test_oauth_records_phone_only_after_sms_code_is_received(relay_storage, monk
         }
 
     monkeypatch.setattr(codex_oauth, "run_codex_oauth", oauth)
+    credential_path = relay._CREDENTIAL_DIR / "codex-sms@example.com.json"
+    sqlite_store.write_file(credential_path, json.dumps({
+        "email": account["email"], "access_token": "test-access-token",
+        "refresh_token": "test-refresh-token",
+    }), category="codex_credentials")
+    from core import chatgpt_plan
+    monkeypatch.setattr(chatgpt_plan, "check_codex_usage", lambda *_args, **_kwargs: {"ok": True})
     phone_row = relay._read(relay._PHONES_PATH)[0]
 
     relay._run_job("job-sms", account["id"], {
@@ -299,8 +340,8 @@ def test_oauth_records_phone_only_after_sms_code_is_received(relay_storage, monk
     assert job["status"] == "success"
     assert "手机接码验证通过" in job["message"]
     assert stored["phone_verified_at"]
-    assert stored["last_sms_phone"] == "+14155550123"
-    assert stored["last_sms_code_url"] == "https://sms.example/code"
+    assert stored["phone"] == "+14155550123"
+    assert stored["sms_code_url"] == "https://sms.example/code"
     assert relay._read(relay._PHONES_PATH)[0]["available_uses"] == 0
 
 
@@ -318,6 +359,13 @@ def test_oauth_does_not_bind_phone_when_sms_acceptance_is_unconfirmed(relay_stor
         "ok": True,
         "file_path": str(relay._CREDENTIAL_DIR / "codex-unconfirmed@example.com.json"),
     })
+    credential_path = relay._CREDENTIAL_DIR / "codex-unconfirmed@example.com.json"
+    sqlite_store.write_file(credential_path, json.dumps({
+        "email": account["email"], "access_token": "test-access-token",
+        "refresh_token": "test-refresh-token",
+    }), category="codex_credentials")
+    from core import chatgpt_plan
+    monkeypatch.setattr(chatgpt_plan, "check_codex_usage", lambda *_args, **_kwargs: {"ok": True})
 
     relay._run_job("job-unconfirmed", account["id"], {
         "phone_id": phone_row["id"],
@@ -330,7 +378,7 @@ def test_oauth_does_not_bind_phone_when_sms_acceptance_is_unconfirmed(relay_stor
     assert relay._read(relay._JOBS_PATH)[0]["status"] == "success"
     assert not stored.get("phone")
     assert not stored.get("phone_verified_at")
-    assert not phone_stored.get("assigned_account_id")
+    assert not relay.list_phones()[0]["assigned"]
     assert phone_stored["available_uses"] == 1
 
 
@@ -358,7 +406,13 @@ def test_import_supports_email_url_and_password_totp_formats(relay_storage):
     assert "https://mail.example/code" in serialized
     phone_serialized = json.dumps(relay.list_phones())
     assert "https://sms.example/totp" in phone_serialized
-    assert stat.S_IMODE(relay._ACCOUNTS_PATH.stat().st_mode) == 0o600
+    docs = account_store.read_gpt_accounts(relay._ACCOUNTS_PATH)
+    assert len(docs) == 2
+    assert {doc["email"] for doc in docs} == set(rows)
+    assert all("registered" not in doc and "relay" not in doc for doc in docs)
+    assert not relay._ACCOUNTS_PATH.exists()
+    db_path = sqlite_store.database_path(relay._ACCOUNTS_PATH)
+    assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
 
 
 def test_import_supports_chatgpt_password_and_email_code_url(relay_storage):
@@ -371,6 +425,200 @@ def test_import_supports_chatgpt_password_and_email_code_url(relay_storage):
     assert stored["chatgpt_password"] == "chatgpt-password"
     assert stored["email_code_url"] == "https://mail.example/latest"
     assert stored.get("totp_secret") == ""
+
+
+def test_import_json_proxy_alias_normalizes_and_hides_proxy_from_public_account(relay_storage):
+    raw_proxy = "proxy.example:8080:proxy-user:proxy-pass"
+    relay.import_accounts(json.dumps({
+        "email": "proxy-import@example.com",
+        "password": "chatgpt-password",
+        "email_code_url": "https://mail.example/code",
+        "proxy_used": raw_proxy,
+    }))
+
+    stored = relay._read(relay._ACCOUNTS_PATH)[0]
+    assert stored["proxy"] == "http://proxy-user:proxy-pass@proxy.example:8080"
+    assert stored["proxy_source"] == "proxy_used"
+
+    public = relay.list_accounts()[0]
+    serialized = json.dumps(public)
+    assert public["has_proxy"] is True
+    assert public["proxy_source"] == "proxy_used"
+    assert "proxy" not in public
+    assert raw_proxy not in serialized
+    assert "proxy-pass" not in serialized
+
+
+def test_ensure_account_material_persists_proxy_and_preserves_existing_relay_value(relay_storage):
+    first = relay.ensure_account_material({
+        "email": "proxy-material@example.com",
+        "chatgpt_password": "chatgpt-password",
+        "proxy_url": "socks5h://proxy-user:proxy-pass@proxy.example:1080",
+    })
+    account_id = first["id"]
+    assert first["has_proxy"] is True
+    assert first["proxy_source"] == "proxy_url"
+
+    relay.ensure_account_material({
+        "email": "proxy-material@example.com",
+        "chatgpt_password": "replacement-password",
+        "proxy": "http://replacement-user:replacement-pass@other.example:3128",
+    })
+
+    stored = relay._get_account(account_id)
+    assert stored["proxy"] == "socks5h://proxy-user:proxy-pass@proxy.example:1080"
+    assert stored["proxy_source"] == "proxy_url"
+
+
+def test_start_jobs_keeps_proxy_in_private_job_record_only(relay_storage, monkeypatch):
+    relay.import_accounts(json.dumps({
+        "email": "proxy-job@example.com",
+        "password": "chatgpt-password",
+        "email_code_url": "https://mail.example/code",
+        "proxy": "http://proxy-user:proxy-pass@proxy.example:3128",
+    }))
+    account = relay._read(relay._ACCOUNTS_PATH)[0]
+    monkeypatch.setattr(relay, "_run_job", lambda *args: None)
+
+    result = relay.start_jobs([account["id"]], workers=1)
+    private_job = relay._read(relay._JOBS_PATH)[0]
+
+    assert private_job["proxy"] == "http://proxy-user:proxy-pass@proxy.example:3128"
+    assert "proxy" not in result["jobs"][0]
+    assert "proxy-pass" not in json.dumps(result)
+    assert "proxy" not in relay.list_jobs()[0]
+
+
+def test_run_job_passes_proxy_to_codex_oauth_and_online_check(relay_storage, monkeypatch, tmp_path):
+    proxy = "http://proxy-user:proxy-pass@proxy.example:3128"
+    relay.import_accounts(json.dumps({
+        "email": "proxy-oauth@example.com",
+        "password": "chatgpt-password",
+        "email_code_url": "https://mail.example/code",
+        "proxy": proxy,
+    }))
+    account = relay._read(relay._ACCOUNTS_PATH)[0]
+    calls = []
+    usage_calls = []
+    credential_path = relay._CREDENTIAL_DIR / "codex-proxy-oauth@example.com.json"
+    sqlite_store.write_file(credential_path, json.dumps({
+        "email": "proxy-oauth@example.com",
+        "account_id": "account-proxy",
+        "access_token": "access-token",
+        "refresh_token": "refresh-token",
+    }), category="codex_credentials")
+
+    monkeypatch.setattr(relay, "_email_provider", lambda *_args: lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(relay, "_totp_provider", lambda *_args: None)
+    monkeypatch.setattr(relay.sms_provider, "fixed_sms_context", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(relay, "_check_stopped", lambda _job_id: None)
+    monkeypatch.setattr(relay, "_append_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(relay, "_update_job", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(relay, "_update_account", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(relay, "_log_path", lambda job_id: tmp_path / f"{job_id}.log")
+
+    from core import chatgpt_plan, codex_oauth
+
+    monkeypatch.setattr(
+        codex_oauth,
+        "run_codex_oauth",
+        lambda email, **kwargs: calls.append({"email": email, **kwargs}) or {
+            "ok": True,
+            "email": email,
+            "phone_verified": False,
+            "file_path": str(credential_path),
+        },
+    )
+    monkeypatch.setattr(
+        chatgpt_plan,
+        "check_codex_usage",
+        lambda token, account_id="", proxy=None: usage_calls.append({
+            "token": token, "account_id": account_id, "proxy": proxy,
+        }) or {"ok": True, "checked_at": "2026-09-30T12:00:00", "plan_type": "plus"},
+    )
+
+    relay._run_job("job-proxy-oauth", account["id"], {}, None, proxy)
+
+    assert calls
+    assert calls[0]["email"] == "proxy-oauth@example.com"
+    assert calls[0]["proxy"] == proxy
+    assert usage_calls == [{
+        "token": "access-token", "account_id": "account-proxy", "proxy": proxy,
+    }]
+
+
+def test_run_job_rejects_oauth_success_without_token_pair(relay_storage, monkeypatch, tmp_path):
+    relay.import_accounts("missing-token@example.com----https://mail.example/code")
+    account = relay._read(relay._ACCOUNTS_PATH)[0]
+    credential_path = relay._CREDENTIAL_DIR / "codex-missing-token@example.com.json"
+    sqlite_store.write_file(credential_path, json.dumps({
+        "email": "missing-token@example.com",
+        "access_token": "access-token",
+    }), category="codex_credentials")
+    updates = []
+    usage_calls = []
+
+    monkeypatch.setattr(relay, "_email_provider", lambda *_args: lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(relay, "_totp_provider", lambda *_args: None)
+    monkeypatch.setattr(relay.sms_provider, "fixed_sms_context", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(relay, "_check_stopped", lambda _job_id: None)
+    monkeypatch.setattr(relay, "_append_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(relay, "_update_job", lambda _job_id, **changes: updates.append(changes))
+    monkeypatch.setattr(relay, "_log_path", lambda job_id: tmp_path / f"{job_id}.log")
+
+    from core import chatgpt_plan, codex_oauth
+    monkeypatch.setattr(codex_oauth, "run_codex_oauth", lambda _email, **_kwargs: {
+        "ok": True, "email": "missing-token@example.com", "file_path": str(credential_path),
+    })
+    monkeypatch.setattr(
+        chatgpt_plan,
+        "check_codex_usage",
+        lambda *_args, **_kwargs: usage_calls.append(True) or {"ok": True},
+    )
+
+    relay._run_job("job-missing-token", account["id"], {}, None, "")
+
+    stored = relay._read(relay._ACCOUNTS_PATH)[0]
+    assert stored["codex_status"] == "failed"
+    assert usage_calls == []
+    assert updates[-1]["status"] == "failed"
+    assert "缺少 refresh_token" in updates[-1]["error"]
+
+
+def test_run_job_rejects_oauth_success_when_online_check_fails(relay_storage, monkeypatch, tmp_path):
+    relay.import_accounts("offline-token@example.com----https://mail.example/code")
+    account = relay._read(relay._ACCOUNTS_PATH)[0]
+    credential_path = relay._CREDENTIAL_DIR / "codex-offline-token@example.com.json"
+    sqlite_store.write_file(credential_path, json.dumps({
+        "email": "offline-token@example.com",
+        "account_id": "account-offline",
+        "access_token": "access-token",
+        "refresh_token": "refresh-token",
+    }), category="codex_credentials")
+    updates = []
+
+    monkeypatch.setattr(relay, "_email_provider", lambda *_args: lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(relay, "_totp_provider", lambda *_args: None)
+    monkeypatch.setattr(relay.sms_provider, "fixed_sms_context", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(relay, "_check_stopped", lambda _job_id: None)
+    monkeypatch.setattr(relay, "_append_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(relay, "_update_job", lambda _job_id, **changes: updates.append(changes))
+    monkeypatch.setattr(relay, "_log_path", lambda job_id: tmp_path / f"{job_id}.log")
+
+    from core import chatgpt_plan, codex_oauth
+    monkeypatch.setattr(codex_oauth, "run_codex_oauth", lambda _email, **_kwargs: {
+        "ok": True, "email": "offline-token@example.com", "file_path": str(credential_path),
+    })
+    monkeypatch.setattr(chatgpt_plan, "check_codex_usage", lambda *_args, **_kwargs: {
+        "ok": False, "http_status": 401, "error": "AT 已过期，需要使用 RT 刷新",
+    })
+
+    relay._run_job("job-online-failed", account["id"], {}, None, "")
+
+    stored = relay._read(relay._ACCOUNTS_PATH)[0]
+    assert stored["codex_status"] == "failed"
+    assert updates[-1]["status"] == "failed"
+    assert "在线验证失败" in updates[-1]["error"]
 
 
 def test_explicit_chatgpt_email_url_format_validates_the_url(relay_storage):
@@ -505,8 +753,9 @@ def test_update_account_records_note_and_password_timestamp(relay_storage):
 
 
 def test_import_rejects_malformed_or_incomplete_material(relay_storage):
+    # A one-character value is too short to be treated as a password.
     with pytest.raises(ValueError, match="邮箱取码 URL"):
-        relay.import_accounts("bad@example.com----only-one-extra")
+        relay.import_accounts("bad@example.com----x")
     with pytest.raises(ValueError, match="必须同时填写或同时留空"):
         relay.import_accounts("bad@example.com----https://mail.example/code----+14155550123----")
 
@@ -578,20 +827,6 @@ def test_adjust_phone_available_uses_supports_single_batch_and_boundaries(relay_
     relay.adjust_phone_available_uses([ids[0]], -1)
     assert relay.list_phones()[0]["available_uses"] == 0
     assert relay.list_phones()[0]["candidate"] is False
-
-
-def test_legacy_max_uses_migrates_to_available_balance(relay_storage):
-    relay._write(relay._PHONES_PATH, [{
-        "id": "legacy-phone", "phone": "+14155550123", "sms_code_url": "https://sms.example/code",
-        "max_uses": 3, "assigned_account_ids": ["used-account"], "reserved_job_ids": [],
-    }])
-
-    public = relay.list_phones()[0]
-
-    stored = relay._read(relay._PHONES_PATH)[0]
-    assert public["available_uses"] == 2
-    assert stored["available_uses"] == 2
-    assert "max_uses" not in stored
 
 
 def test_phone_import_is_idempotent_and_updates_candidate(relay_storage):
@@ -669,7 +904,7 @@ def test_default_authorization_does_not_reserve_candidates_before_sms(relay_stor
     assert [job["phone_override"]["phone"] for job in jobs] == ["", ""]
     phones = relay._read(relay._PHONES_PATH)
     assert all(len(row.get("reserved_job_ids") or []) == 0 for row in phones)
-    assert all(not row.get("assigned_account_id") for row in phones)
+    assert all(not row["assigned"] for row in relay.list_phones())
 
 
 def test_phone_reservation_tracks_capacity_without_consuming_use_count(relay_storage):
@@ -696,7 +931,7 @@ def test_authorization_starts_without_phone_pool_when_sms_is_not_needed(relay_st
     monkeypatch.setattr(relay, "_run_job", lambda *args: None)
     monkeypatch.setattr(relay.sms_provider._cfg, "SMS_PROVIDER", "fixed_url")
     monkeypatch.setattr(relay.sms_provider._cfg, "FIXED_SMS_PHONE", "+8613464925132", raising=False)
-    monkeypatch.setattr(relay.sms_provider._cfg, "FIXED_SMS_CODE_URL", "https://sms.example/legacy", raising=False)
+    monkeypatch.setattr(relay.sms_provider._cfg, "FIXED_SMS_CODE_URL", "https://sms.example/fixed", raising=False)
 
     result = relay.start_jobs([account["id"]], workers=1)
     assert result["submitted"] == 1
@@ -915,9 +1150,8 @@ def test_batch_delete_jobs_removes_terminal_rows_and_skips_active_rows(relay_sto
         "id": "phone-1", "phone": "+14155550123", "sms_code_url": "https://sms.example/code",
         "reserved_job_ids": ["job-success", "job-active"],
     }])
-    relay._LOG_DIR.mkdir(parents=True)
-    relay._log_path("job-success").write_text("done", encoding="utf-8")
-    relay._log_path("job-active").write_text("waiting", encoding="utf-8")
+    sqlite_store.write_file(relay._log_path("job-success"), "done", category="relay_logs")
+    sqlite_store.write_file(relay._log_path("job-active"), "waiting", category="relay_logs")
 
     result = relay.delete_jobs(["job-success", "job-failed", "job-active", "job-missing"])
 
@@ -929,8 +1163,8 @@ def test_batch_delete_jobs_removes_terminal_rows_and_skips_active_rows(relay_sto
     ]
     assert [row["id"] for row in relay._read(relay._JOBS_PATH)] == ["job-active"]
     assert relay._read(relay._PHONES_PATH)[0]["reserved_job_ids"] == ["job-active"]
-    assert not relay._log_path("job-success").exists()
-    assert relay._log_path("job-active").exists()
+    assert not sqlite_store.file_exists(relay._log_path("job-success"), category="relay_logs")
+    assert sqlite_store.file_exists(relay._log_path("job-active"), category="relay_logs")
 
 
 def test_recover_interrupted_jobs(relay_storage):
@@ -950,29 +1184,6 @@ def test_recover_interrupted_jobs(relay_storage):
     assert relay._read(relay._PHONES_PATH)[0]["reserved_job_ids"] == []
 
 
-def test_recover_backfills_terminal_account_status_from_job_history(relay_storage):
-    relay._write(relay._ACCOUNTS_PATH, [
-        {"id": "account-disabled", "email": "disabled@example.com", "codex_status": "failed"},
-        {"id": "account-deleted", "email": "deleted@example.com", "codex_status": "failed"},
-        {"id": "account-legacy", "email": "legacy@example.com", "codex_status": "deleted"},
-    ])
-    relay._write(relay._JOBS_PATH, [
-        {"id": "job-disabled", "account_id": "account-disabled", "status": "failed", "error": "账号已废（account_deactivated）"},
-        {"id": "job-deleted", "account_id": "account-deleted", "status": "failed", "error": "账号已废（account_deleted）"},
-    ])
-
-    assert relay.recover_interrupted_jobs() == 0
-    accounts = {row["id"]: row for row in relay._read(relay._ACCOUNTS_PATH)}
-    assert accounts["account-disabled"]["codex_status"] == "deactivated"
-    assert accounts["account-deleted"]["codex_status"] == "deactivated"
-    assert accounts["account-legacy"]["codex_status"] == "deactivated"
-    assert accounts["account-disabled"]["liveness_status"] == "dead"
-
-
-def test_public_account_normalizes_legacy_deleted_status():
-    assert relay._public_account({"codex_status": "deleted"})["codex_status"] == "deactivated"
-
-
 def test_public_job_collapses_duplicate_runtime_error_prefix():
     public = relay._public_job({
         "id": "job-1",
@@ -982,17 +1193,15 @@ def test_public_job_collapses_duplicate_runtime_error_prefix():
     assert public["error"] == "RuntimeError: 提交密码后页面未推进"
 
 
-def test_start_jobs_skips_terminal_accounts(relay_storage, monkeypatch):
+def test_start_jobs_skips_deactivated_accounts(relay_storage):
     relay._write(relay._ACCOUNTS_PATH, [
         {"id": "account-disabled", "email": "disabled@example.com", "codex_status": "deactivated"},
-        {"id": "account-deleted", "email": "deleted@example.com", "codex_status": "deleted"},
     ])
-    monkeypatch.setattr(relay, "_ensure_assignments_locked", lambda *_args: (0, False))
 
-    result = relay.start_jobs(["account-disabled", "account-deleted"])
+    result = relay.start_jobs(["account-disabled"])
 
     assert result["submitted"] == 0
-    assert [item["reason"] for item in result["skipped"]] == ["账号已禁用", "账号已禁用"]
+    assert [item["reason"] for item in result["skipped"]] == ["账号已禁用"]
     assert relay._read(relay._JOBS_PATH) == []
 
 
@@ -1013,13 +1222,40 @@ def test_fixed_sms_context_is_thread_local(monkeypatch):
     assert seen["b"] == ("8613412345678", "https://sms.example/b")
 
 
-def test_task_logs_redact_phone_numbers(relay_storage, monkeypatch):
+def test_task_logs_keep_phone_numbers_visible(relay_storage, monkeypatch):
     monkeypatch.delenv("CODEX_RELAY_SHOW_FULL_URLS", raising=False)
     relay._append_log("job-phone", "手机号 +14155550123 已提交，URL https://sms.example/code")
     log = relay.read_log("job-phone")
-    assert "14155550123" not in log
+    assert "14155550123" in log
     assert "https://sms.example/code" not in log
-    assert "手机号已隐藏" in log
+    assert "手机号已隐藏" not in log
+
+
+def test_redaction_keeps_phone_and_browser_diagnostics_readable():
+    text = (
+        "phone=+14155550123 chrome=154.0.8037.44 "
+        "debuggerAddress=127.0.0.1:51471 0 chromedriver 0x0000000102ca3884"
+    )
+    redacted = relay._redact(text)
+    assert "+14155550123" in redacted
+    assert "手机号已隐藏" not in redacted
+    assert "154.0.8037.44" in redacted
+    assert "127.0.0.1:51471" in redacted
+    assert "0x0000000102ca3884" in redacted
+
+
+def test_task_logs_redact_otp_values_only_in_explicit_otp_context(relay_storage):
+    otp = "654321"
+    for message in (
+        f"验证码：{otp}",
+        f"邮箱 OTP 收到：{otp}",
+        f"提交手机验证码={otp}",
+        f"code={otp}",
+    ):
+        assert otp not in relay._redact(message)
+
+    # Ordinary numeric diagnostics remain useful to operators.
+    assert otp in relay._redact(f"任务已重试 {otp} 次")
 
 
 def test_browser_assist_wait_defaults_to_five_minutes(monkeypatch):
@@ -1116,3 +1352,47 @@ def test_start_jobs_rejects_direct_selection_of_synthetic_platform_row(relay_sto
 
     with pytest.raises(ValueError, match="特殊来源不能手动选择"):
         relay.start_jobs([account_id], phone_ids=["sms-provider:l"])
+
+
+@pytest.mark.parametrize("pool, requested, account_proxy, actual, expected", [
+    (["http://pool.example:8080"], "", "http://account.example:3128", None, ""),
+    (["http://pool.example:8080"], None, "", None, ""),
+    ([], None, "", None, ""),
+    (["http://pool.example:8080"], None, "http://account.example:3128", None, "http://account.example:3128"),
+    (["http://pool.example:8080"], None, "", "socks5h://user:private@profile.example:1080", ""),
+    (["http://pool.example:8080"], None, "", "", ""),
+])
+def test_oauth_route_is_selected_once_and_saved_privately(relay_storage, monkeypatch, pool, requested, account_proxy, actual, expected):
+    from config import proxy as proxy_cfg
+    from core import codex_oauth
+
+    relay.import_accounts(json.dumps({
+        "email": "routes@example.com", "email_code_url": "https://mail.example/code", "proxy": account_proxy,
+    }))
+    account = relay._read(relay._ACCOUNTS_PATH)[0]
+    relay._write(relay._JOBS_PATH, [{"id": "job-routes", "account_id": account["id"], "status": "pending"}])
+    monkeypatch.setattr(proxy_cfg, "PROXY_POOL", pool)
+    calls = []
+
+    def oauth(email, **kwargs):
+        calls.append(kwargs["proxy"])
+        result = {"ok": True, "_profile_id": "temporary-profile"}
+        if actual is not None:
+            result["_verification_proxy"] = actual
+        return result
+
+    monkeypatch.setattr(codex_oauth, "run_codex_oauth", oauth)
+    monkeypatch.setattr(relay, "_validate_saved_codex_credential", lambda _r, _a, proxy: (
+        calls.append(proxy) or relay_storage / "credential", {}, {"ok": True},
+    ))
+    monkeypatch.setattr(relay, "_email_provider", lambda *_a: None)
+    monkeypatch.setattr(relay, "_totp_provider", lambda *_a: None)
+    relay._run_job("job-routes", account["id"], proxy=requested)
+    route = actual if actual is not None else expected
+    assert calls == [expected, route]
+    stored = relay._get_account(account["id"])
+    assert stored["_codex_verified_proxy"] == route
+    assert stored["codex_profile_id"] == "temporary-profile"
+    assert relay._read(relay._JOBS_PATH)[0]["status"] == "success"
+    assert "_codex_verified_proxy" not in relay._public_account(stored)
+    assert "private" not in json.dumps(relay.list_jobs())

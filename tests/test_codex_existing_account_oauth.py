@@ -6,6 +6,7 @@ from urllib.parse import parse_qs
 import pytest
 
 from core import codex_oauth
+from core import sqlite_store
 from core import browser_use_codex_oauth as browser_use_oauth
 from core import roxy_codex_oauth as browser_oauth
 
@@ -61,6 +62,37 @@ def test_password_step_accepts_direct_email_otp_page(monkeypatch):
     assert outcome == "email_otp"
 
 
+def test_roxy_password_login_rejects_email_otp_without_reading_mail(monkeypatch):
+    monkeypatch.setattr(browser_oauth, "human_delay", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(browser_oauth, "_maybe_accept", lambda _driver: None)
+    monkeypatch.setattr(browser_oauth, "_type_email_address", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(browser_oauth, "_submit_email_step", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(browser_oauth, "_submit_login_password", lambda *_args, **_kwargs: "email_otp")
+
+    with pytest.raises(RuntimeError, match="不能使用临时邮箱登录"):
+        browser_oauth._fill_email_and_otp(
+            FakeDriver(), "user@example.com",
+            lambda *_args, **_kwargs: pytest.fail("expired mailbox must not be read"),
+            "https://auth.openai.com/oauth/authorize", login_password="known-password",
+        )
+
+
+def test_roxy_password_login_rejects_email_otp_after_password_submit(monkeypatch):
+    monkeypatch.setattr(browser_oauth, "human_delay", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(browser_oauth, "_maybe_accept", lambda _driver: None)
+    monkeypatch.setattr(browser_oauth, "_type_email_address", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(browser_oauth, "_submit_email_step", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(browser_oauth, "_submit_login_password", lambda *_args, **_kwargs: "submitted")
+    monkeypatch.setattr(browser_oauth, "_post_password_challenge", lambda *_args, **_kwargs: "email_otp")
+
+    with pytest.raises(RuntimeError, match="不能使用临时邮箱登录"):
+        browser_oauth._fill_email_and_otp(
+            FakeDriver(), "user@example.com",
+            lambda *_args, **_kwargs: pytest.fail("expired mailbox must not be read"),
+            "https://auth.openai.com/oauth/authorize", login_password="known-password",
+        )
+
+
 def test_password_step_retries_email_submit_when_form_still_visible(monkeypatch):
     """Recover when the first email Continue click is swallowed by SPA hydration."""
     states = iter(["", "email_otp"])
@@ -86,22 +118,23 @@ def test_password_step_accepts_callback_before_password_input(monkeypatch):
     assert outcome == "next"
 
 
-def test_password_step_clicks_passwordless_entry_when_password_input_is_missing(monkeypatch):
-    states = iter([False, True])
-    clicked = []
-    monkeypatch.setattr(browser_oauth, "_is_email_verification_page", lambda _driver: next(states, True))
+def test_password_step_never_clicks_passwordless_when_input_is_missing(monkeypatch):
+    monkeypatch.setattr(browser_oauth, "_login_step_state", lambda _driver: "")
+    monkeypatch.setattr(browser_oauth, "_has_visible_email_input", lambda _driver: False)
+    monkeypatch.setattr(browser_oauth, "_page_text", lambda _driver: "")
     monkeypatch.setattr(
         browser_oauth,
         "_find_any",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("password input missing")),
     )
-    monkeypatch.setattr(browser_oauth, "_click_passwordless_signup_if_present", lambda _driver: clicked.append(True) or {"ok": True})
-    monkeypatch.setattr(browser_oauth, "human_delay", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        browser_oauth,
+        "_click_passwordless_signup_if_present",
+        lambda _driver: pytest.fail("saved-password login must not switch to email OTP"),
+    )
 
-    outcome = browser_oauth._submit_login_password(FakeDriver(), "password", timeout=1)
-
-    assert outcome == "email_otp"
-    assert clicked == [True]
+    with pytest.raises(RuntimeError, match="等待或提交密码页超时"):
+        browser_oauth._submit_login_password(FakeDriver(), "password", timeout=1)
 
 
 def test_password_step_marks_explicitly_deleted_account_without_password_input(monkeypatch):
@@ -267,6 +300,37 @@ def test_browser_use_password_flow_accepts_direct_email_otp(monkeypatch):
     assert browser_use_oauth._submit_browser_use_login_password(object(), "password", timeout=1) == "email_otp"
 
 
+def test_browser_use_password_login_never_clicks_passwordless(monkeypatch):
+    monkeypatch.setattr(browser_use_oauth, "_password_error_text", lambda _page: "")
+    monkeypatch.setattr(browser_use_oauth, "_browser_login_step_state", lambda _page: "")
+    monkeypatch.setattr(browser_use_oauth, "_looks_email_otp_page", lambda _page: False)
+    monkeypatch.setattr(browser_use_oauth, "_click_passwordless_signup_if_present", lambda _page: pytest.fail("passwordless entry must not be used"))
+    monkeypatch.setattr(browser_use_oauth.time, "sleep", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="等待登录密码页超时"):
+        browser_use_oauth._submit_browser_use_login_password(object(), "password", timeout=1)
+
+
+def test_browser_use_password_login_rejects_email_otp_without_reading_mail(monkeypatch):
+    monkeypatch.setattr(browser_use_oauth, "_bu_delay", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(browser_use_oauth, "_maybe_accept_cookies", lambda _page: None)
+    monkeypatch.setattr(browser_use_oauth, "_wait_auth_page_ready", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(browser_use_oauth, "_fill_email_for_codex", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(browser_use_oauth, "_submit_browser_use_login_password", lambda *_args, **_kwargs: "email_otp")
+    page = SimpleNamespace(
+        goto=lambda *_args, **_kwargs: None,
+        wait_for_load_state=lambda *_args, **_kwargs: None,
+        url="https://auth.openai.com/email-verification",
+    )
+
+    with pytest.raises(RuntimeError, match="不能使用临时邮箱登录"):
+        browser_use_oauth._fill_email_and_otp(
+            page, "user@example.com",
+            lambda *_args, **_kwargs: pytest.fail("expired mailbox must not be read"),
+            "https://auth.openai.com/oauth/authorize", login_password="known-password",
+        )
+
+
 def test_browser_use_password_error_is_terminal(monkeypatch):
     monkeypatch.setattr(browser_use_oauth, "_password_error_text", lambda _page: "wrong email or password")
 
@@ -400,6 +464,24 @@ def test_totp_page_text_wins_on_ambiguous_authorize_url(monkeypatch):
     assert browser_oauth._is_totp_challenge_page(MfaDriver()) is True
 
 
+def test_roxy_authorize_mfa_takes_precedence_over_email_otp(monkeypatch):
+    driver = FakeDriver()
+    driver.current_url = "https://auth.openai.com/oauth/authorize"
+    monkeypatch.setattr(browser_oauth, "_is_totp_challenge_page", lambda _driver: True)
+    monkeypatch.setattr(browser_oauth, "_is_email_verification_page", lambda _driver: True)
+    monkeypatch.setattr(browser_oauth, "_page_text", lambda _driver: "authenticator app")
+    submitted = []
+    monkeypatch.setattr(
+        browser_oauth,
+        "_handle_totp_challenge_if_present",
+        lambda _driver, provider, **_kwargs: submitted.append(provider()) or True,
+    )
+
+    assert browser_oauth._login_step_state(driver) == "challenge"
+    assert browser_oauth._post_password_challenge(driver, lambda: "generated-locally", timeout=1) == "next"
+    assert submitted == ["generated-locally"]
+
+
 def test_password_challenge_fails_when_page_never_leaves_password_step(monkeypatch):
     monkeypatch.setattr(browser_oauth, "_page_text", lambda _driver: "")
     monkeypatch.setattr(browser_oauth, "_is_email_verification_page", lambda _driver: False)
@@ -430,6 +512,8 @@ def test_password_challenge_marks_explicitly_deleted_account_unusable(monkeypatc
 
 
 def test_codex_credential_is_written_with_owner_only_permissions(tmp_path, monkeypatch):
+    database = tmp_path / "credentials.sqlite3"
+    monkeypatch.setenv("TURB_SQLITE_PATH", str(database))
     monkeypatch.setattr(codex_oauth, "_PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(codex_oauth._cfg, "CODEX_OUTPUT_DIRNAME", "codex_accounts")
 
@@ -439,13 +523,31 @@ def test_codex_credential_is_written_with_owner_only_permissions(tmp_path, monke
         "plus",
     )
 
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert "private-refresh-token" in path.read_text(encoding="utf-8")
+    assert not path.exists()
+    assert sqlite_store.file_exists(path, category="codex_credentials")
+    stored = sqlite_store.read_text_file(path, category="codex_credentials")
+    assert "private-refresh-token" in stored
+
+    with sqlite_store.connect(database) as conn:
+        row = conn.execute(
+            "SELECT category, size FROM storage_files WHERE file_key=?",
+            (str(path.resolve()),),
+        ).fetchone()
+    assert row is not None
+    assert row["category"] == "codex_credentials"
+    assert row["size"] == len(stored.encode("utf-8"))
+    assert stat.S_IMODE(database.stat().st_mode) == 0o600
 
 
 def test_refresh_codex_credential_rotates_tokens_and_preserves_permissions(tmp_path, monkeypatch):
+    database = tmp_path / "credentials.sqlite3"
+    monkeypatch.setenv("TURB_SQLITE_PATH", str(database))
     path = tmp_path / "codex-user@example.com.json"
-    path.write_text('{"email":"user@example.com","refresh_token":"old-rt","access_token":"old-at"}', encoding="utf-8")
+    sqlite_store.write_file(
+        path,
+        '{"email":"user@example.com","refresh_token":"old-rt","access_token":"old-at"}',
+        category="codex_credentials",
+    )
 
     class Response:
         status_code = 200
@@ -476,8 +578,11 @@ def test_refresh_codex_credential_rotates_tokens_and_preserves_permissions(tmp_p
     }
     assert refreshed["access_token"] == "new-at"
     assert refreshed["refresh_token"] == "new-rt"
-    assert json.loads(path.read_text(encoding="utf-8"))["access_token"] == "new-at"
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert not path.exists()
+    stored = json.loads(sqlite_store.read_text_file(path, category="codex_credentials"))
+    assert stored["access_token"] == "new-at"
+    assert stored["refresh_token"] == "new-rt"
+    assert stat.S_IMODE(database.stat().st_mode) == 0o600
 
 
 def test_refresh_codex_token_classifies_invalid_grant_without_leaking_rt(monkeypatch):

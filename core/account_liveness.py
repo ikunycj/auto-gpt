@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""已注册账号查活：重新邮箱 OTP 登录，成功拿到最新 ChatGPT accessToken 即视为正常。"""
+"""已注册账号查活：有密码时用密码及 TOTP 登录，无密码账号使用邮箱 OTP。"""
 import logging
 import threading
 import time
@@ -53,10 +53,10 @@ def _network_preflight_with_retry(email: str, proxy: str | None, max_attempts: i
                 session.session.close()
             except Exception:
                 pass
-        session = BrowserSession(proxy=proxy if proxy else None)
+        session = BrowserSession(proxy=proxy)
         logger.info(
             "[查活] 会话创建完成：proxy=%s device_id=%s（网络预检第 %s/%s 次）",
-            session.proxy or "配置随机/直连", session.device_id, attempt, max_attempts,
+            "已配置代理" if session.proxy else "本机网络", session.device_id, attempt, max_attempts,
         )
         try:
             get_providers(session)
@@ -159,9 +159,13 @@ def authenticate_account_session(
             setattr(session, "authentication_method", "password")
             return session, session_info
         except PasswordLoginUnavailable as exc:
-            logger.info("[查活] 当前页面不提供密码登录，回退邮箱 OTP：%s", str(exc)[:180])
+            logger.warning("[查活] 密码登录流程要求邮箱 OTP，已停止且不会回退邮箱取码：%s", str(exc)[:180])
+            raise PasswordLoginUnavailable(
+                "已保存密码的账号无法完成密码登录：服务端要求邮箱 OTP。"
+                "本次已停止，未读取临时邮箱；请检查账号的密码及登录方式"
+            ) from exc
 
-    logger.info("[查活] 使用邮箱 OTP 登录")
+    logger.info("[查活] 账号未保存密码，使用邮箱 OTP 登录")
     session, authorize_url = _network_preflight_with_retry(email, proxy)
     try:
         otp_after_ts = time.time()
@@ -227,7 +231,7 @@ def check_account_liveness(
     key = email.lower()
     path = log_path(email)
     if clear_log:
-        sqlite_store.write_file(path, b"", category="liveness_logs", mode=0o600, mirror=False)
+        sqlite_store.write_file(path, b"", category="liveness_logs")
 
     fh: sqlite_store.SQLiteFileHandler | None = None
     root_logger = logging.getLogger()
@@ -235,7 +239,7 @@ def check_account_liveness(
     with _RUNNING_LOCK:
         _RUNNING.add(key)
     try:
-        fh = sqlite_store.SQLiteFileHandler(path, category="liveness_logs", mirror=False)
+        fh = sqlite_store.SQLiteFileHandler(path, category="liveness_logs")
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter(
             "%(asctime)s [%(levelname)s] %(message)s",
@@ -246,7 +250,7 @@ def check_account_liveness(
 
         logger.info("[查活] 日志文件：%s", path)
         logger.info("[查活] 开始重新登录：%s", email)
-        logger.info("[查活] 流程：有密码先走浏览器密码登录；无密码/页面仅 OTP 时走邮箱 OTP；最后校验 Session/AT")
+        logger.info("[查活] 流程：有密码用浏览器密码和 TOTP；仅无密码账号使用邮箱 OTP；最后校验 Session/AT")
         session, session_info = authenticate_account_session(
             email,
             proxy=proxy,

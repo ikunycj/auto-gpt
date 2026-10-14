@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """SQLite-backed persistence for the local registration console.
 
-SQLite is authoritative for all repository runtime data. Legacy files are read
-only as one-time migration inputs; compatibility mirrors are allowed only for
-external test/export paths or when a caller explicitly opts in.
+SQLite is the only runtime source of truth.  Paths passed to this module are
+logical keys used to address rows in SQLite; the files themselves are not read
+or materialized by the persistence layer.
 """
 from __future__ import annotations
 
@@ -14,16 +14,62 @@ import logging
 import os
 import sqlite3
 import threading
-from contextlib import closing
+from contextlib import closing, contextmanager, nullcontext
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "turb_gpt.sqlite3"
 _SCHEMA_LOCK = threading.RLock()
+
+
+@dataclass
+class _WriteTransaction:
+    path: Path
+    connection: sqlite3.Connection
+
+
+_ACTIVE_WRITE_TRANSACTION: ContextVar[_WriteTransaction | None] = ContextVar(
+    "sqlite_store_write_transaction", default=None
+)
+
+
+def _transaction_for(source_path: str | Path) -> _WriteTransaction | None:
+    active = _ACTIVE_WRITE_TRANSACTION.get()
+    if active is not None and active.path != database_path(source_path).resolve():
+        raise ValueError("同一事务不能写入不同的 SQLite 数据库")
+    return active
+
+
+@contextmanager
+def write_transaction(source_path: str | Path) -> Iterator[None]:
+    """Commit related collection/file writes together in one SQLite database.
+
+    Collection and generated-file writes issued inside the context share one
+    SQLite connection and commit atomically.  No filesystem side effects are
+    performed before or after the transaction.
+    """
+    if _ACTIVE_WRITE_TRANSACTION.get() is not None:
+        raise RuntimeError("不支持嵌套 SQLite 写入事务")
+    path = database_path(source_path).resolve()
+    with closing(_connect(path)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        state = _WriteTransaction(path, conn)
+        token = _ACTIVE_WRITE_TRANSACTION.set(state)
+        try:
+            yield
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            _ACTIVE_WRITE_TRANSACTION.reset(token)
 
 
 def database_path(source_path: str | Path | None = None) -> Path:
@@ -58,20 +104,6 @@ def _source_key(source_path: str | Path) -> str:
         return source.relative_to(PROJECT_ROOT.resolve()).as_posix()
     except ValueError:
         return str(source)
-
-
-def legacy_mirror_allowed(path: str | Path) -> bool:
-    """Return whether a caller may materialize a legacy file mirror.
-
-    Runtime paths inside this repository are SQLite-only. External paths remain
-    supported for isolated tests and explicit user-requested exports.
-    """
-    target = Path(path).expanduser().resolve()
-    try:
-        target.relative_to(PROJECT_ROOT.resolve())
-    except ValueError:
-        return True
-    return False
 
 
 def _now() -> str:
@@ -111,8 +143,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
                 collection TEXT PRIMARY KEY,
                 source_key TEXT NOT NULL,
                 value_type TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                source_sha256 TEXT
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS storage_items (
@@ -135,11 +166,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_storage_items_status
                 ON storage_items(collection, status);
 
-            CREATE TABLE IF NOT EXISTS storage_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
             CREATE TABLE IF NOT EXISTS storage_files (
                 file_key TEXT PRIMARY KEY,
                 category TEXT NOT NULL,
@@ -152,28 +178,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             CREATE INDEX IF NOT EXISTS idx_storage_files_category
                 ON storage_files(category, file_key);
 
-            INSERT OR IGNORE INTO storage_meta(key, value)
-                VALUES ('schema_version', '2');
-            UPDATE storage_meta SET value='2' WHERE key='schema_version';
-
-            CREATE VIEW IF NOT EXISTS v_registered_accounts AS
-                SELECT position, record_key AS id, email, status, value_json
-                FROM storage_items WHERE collection='registered_accounts';
-            CREATE VIEW IF NOT EXISTS v_outlook_pool AS
-                SELECT position, record_key AS id, email, status, value_json
-                FROM storage_items WHERE collection='outlook_pool';
-            CREATE VIEW IF NOT EXISTS v_registration_jobs AS
-                SELECT position, record_key AS id, email, status, value_json
-                FROM storage_items WHERE collection='registration_jobs';
-            CREATE VIEW IF NOT EXISTS v_relay_accounts AS
-                SELECT position, record_key AS id, email, status, value_json
-                FROM storage_items WHERE collection='relay_accounts';
-            CREATE VIEW IF NOT EXISTS v_relay_phones AS
-                SELECT position, record_key AS id, status, value_json
-                FROM storage_items WHERE collection='relay_phones';
-            CREATE VIEW IF NOT EXISTS v_relay_jobs AS
-                SELECT position, record_key AS id, email, status, value_json
-                FROM storage_items WHERE collection='relay_jobs';
             """
         )
 
@@ -214,17 +218,6 @@ def _record_status(item: Any) -> str | None:
     return None
 
 
-def _read_legacy_file(source: Path, default: Any) -> tuple[bool, Any, str | None]:
-    if not source.exists() or not source.is_file():
-        return False, default, None
-    try:
-        raw = source.read_text(encoding="utf-8")
-        return True, json.loads(raw), hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    except Exception:
-        logger.warning("无法读取旧 JSON 文件 %s，使用默认值", source, exc_info=True)
-        return True, default, None
-
-
 def _decode_collection(conn: sqlite3.Connection, collection: str, value_type: str) -> Any:
     rows = conn.execute(
         "SELECT value_json FROM storage_items WHERE collection=? ORDER BY position",
@@ -246,7 +239,6 @@ def _write_collection(
     collection: str,
     source_key: str,
     data: Any,
-    source_sha256: str | None = None,
     *,
     transaction: bool = True,
 ) -> None:
@@ -257,15 +249,14 @@ def _write_collection(
     try:
         conn.execute(
             """
-            INSERT INTO storage_collections(collection, source_key, value_type, updated_at, source_sha256)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO storage_collections(collection, source_key, value_type, updated_at)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(collection) DO UPDATE SET
                 source_key=excluded.source_key,
                 value_type=excluded.value_type,
-                updated_at=excluded.updated_at,
-                source_sha256=excluded.source_sha256
+                updated_at=excluded.updated_at
             """,
-            (collection, source_key, value_type, now, source_sha256),
+            (collection, source_key, value_type, now),
         )
         conn.execute("DELETE FROM storage_items WHERE collection=?", (collection,))
         items: Iterable[Any] = data if isinstance(data, list) else [data]
@@ -295,37 +286,18 @@ def _write_collection(
         raise
 
 
-def _mirror_json(source: Path, data: Any, mode: int | None = None) -> None:
-    """Write a compatibility JSON export without making it the source of truth."""
-    source.parent.mkdir(parents=True, exist_ok=True)
-    tmp = source.with_suffix(source.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    try:
-        if mode is not None:
-            os.chmod(tmp, mode)
-        tmp.replace(source)
-        if mode is not None:
-            os.chmod(source, mode)
-    except Exception:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        logger.warning("SQLite 已写入，但兼容 JSON 导出失败：%s", source, exc_info=True)
-
-
 def read_json(
     source_path: str | Path,
     default: Any = None,
     *,
     collection: str | None = None,
 ) -> Any:
-    """Read a JSON document from SQLite, importing the legacy file once."""
+    """Read a collection from SQLite, returning ``default`` when absent."""
     source = Path(source_path).expanduser().resolve()
     collection_name = collection or _source_key(source)
     db_path = database_path(source)
-    source_key = _source_key(source)
-    with closing(_connect(db_path)) as conn:
+    active = _transaction_for(source)
+    with closing(_connect(db_path)) if active is None else nullcontext(active.connection) as conn:
         row = conn.execute(
             "SELECT value_type FROM storage_collections WHERE collection=?",
             (collection_name,),
@@ -333,15 +305,7 @@ def read_json(
         if row is not None:
             return _decode_collection(conn, collection_name, row["value_type"])
 
-        exists, data, digest = _read_legacy_file(source, default)
-        if not exists and default is None:
-            return None
-        if isinstance(data, list) or isinstance(data, dict) or data is None:
-            _write_collection(conn, collection_name, source_key, data, digest)
-            return data
-        # JSON scalar values are valid too; preserve them as a one-item record.
-        _write_collection(conn, collection_name, source_key, data, digest)
-        return data
+        return default
 
 
 def write_json(
@@ -349,16 +313,16 @@ def write_json(
     data: Any,
     *,
     collection: str | None = None,
-    mirror: bool = True,
-    mode: int | None = None,
 ) -> None:
-    """Write a JSON document to SQLite and optionally materialize its export."""
+    """Write a JSON document to SQLite."""
     source = Path(source_path).expanduser().resolve()
     collection_name = collection or _source_key(source)
-    with closing(_connect(database_path(source))) as conn:
-        _write_collection(conn, collection_name, _source_key(source), data)
-    if mirror:
-        _mirror_json(source, data, mode=mode)
+    active = _transaction_for(source)
+    with closing(_connect(database_path(source))) if active is None else nullcontext(active.connection) as conn:
+        _write_collection(
+            conn, collection_name, _source_key(source), data,
+            transaction=active is None,
+        )
 
 
 def update_json(
@@ -367,14 +331,14 @@ def update_json(
     default: Any = None,
     *,
     collection: str | None = None,
-    mode: int | None = 0o600,
-    mirror: bool = True,
 ) -> Any:
-    """Atomically transform a JSON collection and optionally refresh its mirror.
+    """Atomically transform a JSON collection.
 
     ``updater`` runs while SQLite holds a write transaction.  This is useful
     for read-modify-write workflows such as deduplicating an exported account
-    without allowing concurrent workers to lose each other's changes.
+    without allowing concurrent workers to lose each other's changes.  Missing
+    collections are initialized from ``default``; no filesystem content is
+    consulted.
     """
     source = Path(source_path).expanduser().resolve()
     name = collection or _source_key(source)
@@ -387,18 +351,15 @@ def update_json(
             if row is not None:
                 current = _decode_collection(conn, name, row["value_type"])
             else:
-                exists, legacy, digest = _read_legacy_file(source, default)
-                current = legacy if exists else default
-                if current is None and default is None:
-                    current = None
+                current = default
                 # Seed the collection before applying the transformation so a
-                # callback can safely treat an absent file as its default type.
+                # callback can safely treat an absent collection as its default
+                # type.
                 _write_collection(
                     conn,
                     name,
                     _source_key(source),
                     current,
-                    digest if exists else None,
                     transaction=False,
                 )
             updated = updater(current)
@@ -413,8 +374,6 @@ def update_json(
         except Exception:
             conn.execute("ROLLBACK")
             raise
-    if mirror:
-        _mirror_json(source, updated, mode=mode)
     return updated
 
 
@@ -422,9 +381,8 @@ def delete_json(
     source_path: str | Path,
     *,
     collection: str | None = None,
-    delete_mirror: bool = False,
 ) -> bool:
-    """Delete a collection; mirrors are retained by default for rollback."""
+    """Delete a collection from SQLite."""
     source = Path(source_path).expanduser().resolve()
     collection_name = collection or _source_key(source)
     deleted = False
@@ -438,29 +396,21 @@ def delete_json(
         except Exception:
             conn.execute("ROLLBACK")
             raise
-    if delete_mirror and source.exists():
-        source.unlink()
     return deleted
 
 
-def migrate_json_file(
-    source_path: str | Path,
-    *,
-    default: Any = None,
-    collection: str | None = None,
-) -> bool:
-    """Import one legacy file if its collection has not been imported yet."""
+
+def ensure_collection(source_path: str | Path, *, collection: str, default: Any = None) -> None:
+    """Create a canonical collection when it does not already exist."""
     source = Path(source_path).expanduser().resolve()
-    name = collection or _source_key(source)
     db_path = database_path(source)
     with closing(_connect(db_path)) as conn:
-        exists = conn.execute(
-            "SELECT 1 FROM storage_collections WHERE collection=?", (name,)
+        row = conn.execute(
+            "SELECT 1 FROM storage_collections WHERE collection=?", (collection,)
         ).fetchone()
-    if exists:
-        return False
-    read_json(source, default, collection=name)
-    return True
+        if row is not None:
+            return
+        _write_collection(conn, collection, _source_key(source), default)
 
 
 def append_json_item(
@@ -469,16 +419,8 @@ def append_json_item(
     *,
     collection: str | None = None,
     category: str | None = None,
-    mode: int | None = 0o600,
-    mirror: bool = True,
 ) -> list[Any]:
-    """Append one item to a JSON list in one SQLite transaction.
-
-    This is used for batch archives where a read-modify-write sequence must
-    remain safe even when more than one worker/process records a result at the
-    same time. The updated list is materialized as a legacy JSON compatibility
-    file only when ``mirror`` is enabled.
-    """
+    """Append one item to a JSON list in one SQLite transaction."""
     source = Path(source_path).expanduser().resolve()
     name = collection or _source_key(source)
     with closing(_connect(database_path(source))) as conn:
@@ -491,14 +433,12 @@ def append_json_item(
                 current = _decode_collection(conn, name, row["value_type"])
                 values = current if isinstance(current, list) else []
             else:
-                exists, legacy, digest = _read_legacy_file(source, [])
-                values = legacy if isinstance(legacy, list) else []
+                values = []
                 _write_collection(
                     conn,
                     name,
                     _source_key(source),
                     values,
-                    digest if exists else None,
                     transaction=False,
                 )
             values = list(values)
@@ -525,8 +465,6 @@ def append_json_item(
         except Exception:
             conn.execute("ROLLBACK")
             raise
-    if mirror:
-        _mirror_json(source, values, mode=mode)
     return values
 
 
@@ -572,40 +510,19 @@ def _write_file_row(
         raise
 
 
-def _mirror_bytes(path: Path, content: bytes, mode: int | None = None) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(content)
-    try:
-        if mode is not None:
-            os.chmod(tmp, mode)
-        tmp.replace(path)
-        if mode is not None:
-            os.chmod(path, mode)
-    except Exception:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        logger.warning("SQLite 文件内容已写入，但兼容文件导出失败：%s", path, exc_info=True)
-
-
 def write_file(
     path: str | Path,
     content: bytes | str,
     *,
     category: str = "files",
     encoding: str = "utf-8",
-    mirror: bool = True,
-    mode: int | None = 0o600,
 ) -> None:
-    """Store a generated file in SQLite and optionally materialize an export."""
+    """Store generated-file content in SQLite by its logical path."""
     target = Path(path).expanduser().resolve()
     raw = content.encode(encoding) if isinstance(content, str) else bytes(content)
-    with closing(_connect(database_path(target))) as conn:
-        _write_file_row(conn, target, raw, category)
-    if mirror:
-        _mirror_bytes(target, raw, mode=mode)
+    active = _transaction_for(target)
+    with closing(_connect(database_path(target))) if active is None else nullcontext(active.connection) as conn:
+        _write_file_row(conn, target, raw, category, transaction=active is None)
 
 
 def append_file(
@@ -614,8 +531,6 @@ def append_file(
     *,
     category: str = "files",
     encoding: str = "utf-8",
-    mode: int | None = 0o600,
-    mirror: bool = True,
 ) -> None:
     """Atomically append to a SQLite-backed file."""
     target = Path(path).expanduser().resolve()
@@ -632,10 +547,6 @@ def append_file(
             ).fetchone()
             if row is not None:
                 previous = bytes(row["content"])
-            elif target.exists() and target.is_file():
-                # Import a legacy mirror while holding the SQLite write lock so
-                # two first writers cannot both base their append on stale data.
-                previous = target.read_bytes()
             else:
                 previous = b""
             combined = previous + raw
@@ -666,12 +577,6 @@ def append_file(
         except Exception:
             conn.execute("ROLLBACK")
             raise
-    # Materialize only after the authoritative transaction commits.  A failed
-    # compatibility export must not make the SQLite append appear to fail.
-    if mirror:
-        _mirror_bytes(target, combined, mode=mode)
-
-
 class SQLiteFileHandler(logging.Handler):
     """Logging handler whose authoritative content is kept in SQLite."""
 
@@ -681,15 +586,11 @@ class SQLiteFileHandler(logging.Handler):
         *,
         category: str = "logs",
         encoding: str = "utf-8",
-        mode: int | None = 0o600,
-        mirror: bool = True,
     ) -> None:
         super().__init__()
         self.path = Path(path)
         self.category = category
         self.encoding = encoding
-        self.mode = mode
-        self.mirror = mirror
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -698,8 +599,6 @@ class SQLiteFileHandler(logging.Handler):
                 self.format(record) + "\n",
                 category=self.category,
                 encoding=self.encoding,
-                mode=self.mode,
-                mirror=self.mirror,
             )
         except Exception:
             self.handleError(record)
@@ -709,9 +608,8 @@ def read_file(
     path: str | Path,
     *,
     category: str = "files",
-    import_legacy: bool = True,
 ) -> bytes:
-    """Read generated file content from SQLite, importing an old file once."""
+    """Read generated-file content from SQLite."""
     target = Path(path).expanduser().resolve()
     with closing(_connect(database_path(target))) as conn:
         row = conn.execute(
@@ -720,10 +618,6 @@ def read_file(
         ).fetchone()
         if row is not None:
             return bytes(row["content"])
-    if import_legacy and target.exists() and target.is_file():
-        content = target.read_bytes()
-        write_file(target, content, category=category, mirror=False)
-        return content
     raise FileNotFoundError(str(target))
 
 
@@ -732,9 +626,8 @@ def read_text_file(
     *,
     category: str = "files",
     encoding: str = "utf-8",
-    import_legacy: bool = True,
 ) -> str:
-    return read_file(path, category=category, import_legacy=import_legacy).decode(encoding)
+    return read_file(path, category=category).decode(encoding)
 
 
 def file_exists(path: str | Path, *, category: str = "files") -> bool:
@@ -744,7 +637,7 @@ def file_exists(path: str | Path, *, category: str = "files") -> bool:
             "SELECT 1 FROM storage_files WHERE file_key=? AND category=?",
             (_source_key(target), str(category or "files")),
         ).fetchone()
-    return row is not None or (target.exists() and target.is_file())
+    return row is not None
 
 
 def list_files(
@@ -753,16 +646,8 @@ def list_files(
     *,
     category: str = "files",
 ) -> list[dict[str, Any]]:
-    """List SQLite-backed files, importing matching legacy directory entries."""
+    """List generated files stored in SQLite."""
     root = Path(directory).expanduser().resolve()
-    if root.exists():
-        for legacy_path in root.glob(pattern):
-            if legacy_path.is_file():
-                try:
-                    read_file(legacy_path, category=category)
-                except OSError:
-                    logger.warning("无法导入旧文件：%s", legacy_path, exc_info=True)
-
     prefix = _source_key(root).rstrip("/") + "/"
     # Resolve the database as if it were a child file.  This keeps an absent
     # directory (which may be created by the first write) on the same sidecar
@@ -798,8 +683,8 @@ def delete_file(
     path: str | Path,
     *,
     category: str = "files",
-    delete_mirror: bool = True,
 ) -> bool:
+    """Delete generated-file content from SQLite."""
     target = Path(path).expanduser().resolve()
     with closing(_connect(database_path(target))) as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -812,10 +697,7 @@ def delete_file(
         except Exception:
             conn.execute("ROLLBACK")
             raise
-    mirror_existed = target.exists()
-    if delete_mirror and mirror_existed:
-        target.unlink()
-    return deleted or mirror_existed
+    return deleted
 
 
 def storage_info(path: Path | None = None) -> dict[str, Any]:
@@ -841,8 +723,7 @@ __all__ = [
     "delete_file",
     "file_exists",
     "list_files",
-    "legacy_mirror_allowed",
-    "migrate_json_file",
+    "ensure_collection",
     "read_json",
     "read_file",
     "read_text_file",

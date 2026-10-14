@@ -1,3 +1,6 @@
+import socket
+import threading
+
 import pytest
 
 from core import chrome_cdp_driver as chrome_cdp
@@ -176,3 +179,87 @@ def test_wait_for_cdp_reports_early_process_exit():
 
     with pytest.raises(RuntimeError, match="exit=17"):
         chrome_cdp._wait_for_cdp(9333, process, timeout=1)
+
+
+def test_proxy_endpoint_mask_drops_credentials():
+    assert chrome_cdp._mask_proxy_endpoint(
+        "http://user:password@proxy.example:8080"
+    ) == "http://proxy.example:8080"
+
+
+def test_configured_invalid_proxy_pool_never_falls_back_to_direct(monkeypatch):
+    from config import proxy as proxy_cfg
+
+    monkeypatch.setattr(proxy_cfg, "PROXY_POOL", ["https://example.test/subscription?token=secret"])
+    monkeypatch.setattr(
+        chrome_cdp,
+        "_probe_chatgpt_route",
+        lambda _proxy: pytest.fail("invalid configured pool must not probe direct"),
+    )
+
+    with pytest.raises(RuntimeError, match="代理池没有有效代理端点") as exc_info:
+        chrome_cdp._select_proxy(None)
+
+    assert "secret" not in str(exc_info.value)
+
+
+def test_empty_proxy_pool_allows_direct_access(monkeypatch):
+    from config import proxy as proxy_cfg
+
+    monkeypatch.setattr(proxy_cfg, "PROXY_POOL", [])
+    assert chrome_cdp._proxy_candidates(None) == [""]
+
+
+def test_select_proxy_skips_failed_candidate(monkeypatch):
+    candidates = [
+        "http://bad.example:8080",
+        "socks5://127.0.0.1:7897",
+    ]
+    monkeypatch.setattr(chrome_cdp, "_proxy_candidates", lambda _proxy: list(candidates))
+    monkeypatch.setattr(chrome_cdp.random, "shuffle", lambda _items: None)
+
+    def probe(proxy):
+        return (proxy.endswith("7897"), "HTTP 403" if proxy.endswith("7897") else "reset")
+
+    monkeypatch.setattr(chrome_cdp, "_probe_chatgpt_route", probe)
+
+    assert chrome_cdp._select_proxy(None) == "socks5://127.0.0.1:7897"
+
+
+def test_select_proxy_reports_all_failed_candidates(monkeypatch):
+    monkeypatch.setattr(chrome_cdp, "_proxy_candidates", lambda _proxy: ["http://bad.example:8080"])
+    monkeypatch.setattr(chrome_cdp, "_probe_chatgpt_route", lambda _proxy: (False, "reset"))
+
+    with pytest.raises(RuntimeError, match="无可用的 ChatGPT 网络路由") as exc_info:
+        chrome_cdp._select_proxy(None)
+
+    message = str(exc_info.value)
+    assert "http://bad.example:8080" in message
+    assert "reset" in message
+
+
+def test_authenticated_bridge_returns_502_when_upstream_closes():
+    upstream_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    upstream_listener.bind(("127.0.0.1", 0))
+    upstream_listener.listen(1)
+    upstream_port = upstream_listener.getsockname()[1]
+
+    def close_upstream():
+        connection, _ = upstream_listener.accept()
+        connection.close()
+        upstream_listener.close()
+
+    threading.Thread(target=close_upstream, daemon=True).start()
+    bridge = chrome_cdp._AuthenticatedProxyBridge(
+        f"http://user:password@127.0.0.1:{upstream_port}"
+    )
+    bridge.start()
+    client, server = socket.socketpair()
+    try:
+        server.sendall(b"CONNECT chatgpt.com:443 HTTP/1.1\r\nHost: chatgpt.com\r\n\r\n")
+        bridge._handle(client)
+        assert server.recv(256).startswith(b"HTTP/1.1 502 Bad Gateway")
+    finally:
+        client.close()
+        server.close()
+        bridge.stop()

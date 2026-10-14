@@ -1,47 +1,47 @@
 # -*- coding: utf-8 -*-
-"""Extract verified ChatGPT login material from registered-account records."""
+"""Read and sanitize ChatGPT login material from a GPT account row."""
 from __future__ import annotations
 
-import json
 from typing import Any
 
+from core.import_parser import configured_import_separators
 
-def _extra(row: dict[str, Any]) -> dict[str, Any]:
-    value = row.get("extra")
-    if isinstance(value, dict):
-        return value
-    value = row.get("extra_json")
-    if isinstance(value, dict):
-        return value
-    if not value:
-        return {}
-    try:
-        parsed = json.loads(str(value))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+
+def _credential_text(value: Any) -> str:
+    """Return a trimmed credential string; malformed values are empty."""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _clean_password(value: Any, email: str) -> str:
+    """Strip a mistakenly imported ``email<separator>password`` wrapper.
+
+    Only a prefix that exactly matches the account email is removed.  This
+    avoids splitting legitimate passwords that happen to contain a configured
+    separator.
+    """
+    text = _credential_text(value)
+    if not text:
+        return ""
+    normalized_email = _credential_text(email).lower()
+    if normalized_email and text.lower() == normalized_email:
+        return ""
+    if normalized_email and text.lower().startswith(normalized_email):
+        tail = text[len(normalized_email):]
+        for separator in configured_import_separators():
+            if tail.startswith(separator):
+                password = tail[len(separator):].strip()
+                return password if password and password.lower() != normalized_email else ""
+    return text
 
 
 def registered_account_login_material(row: dict[str, Any] | None) -> dict[str, str]:
+    """Return credentials from the canonical flat GPT account fields."""
     row = row or {}
-    extra = _extra(row)
-
-    def first(*values: Any) -> str:
-        for value in values:
-            text = str(value or "").strip()
-            if text:
-                return text
-        return ""
-
+    email = _credential_text(row.get("email"))
     return {
-        "chatgpt_password": first(
-            row.get("chatgpt_password"),
-            row.get("openai_password"),
-            extra.get("registration_password"),
-            extra.get("openai_password"),
-        ),
-        "totp_secret": first(row.get("totp_secret"), extra.get("totp_secret")),
-        "login_method": first(row.get("login_method"), extra.get("login_method")),
+        "chatgpt_password": _clean_password(row.get("chatgpt_password"), email),
+        "totp_secret": _credential_text(row.get("totp_secret")),
+        "login_method": _credential_text(row.get("login_method")),
     }
 
 

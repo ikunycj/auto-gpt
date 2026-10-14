@@ -439,15 +439,6 @@ def build_sub2api_account_entry(
             "plan_type": plan_type,
             "chatgpt_account_is_fedramp": bool(identity.get("chatgpt_account_is_fedramp", False)),
         },
-        "extra": {
-            "email": email,
-            "account_id": account_id,
-            "chatgpt_account_id": account_id,
-            "chatgpt_user_id": chatgpt_user_id,
-            "agent_runtime_id": agent_runtime_id,
-            "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "source": "codex_agent",
-        },
         "concurrency": 10,
         "priority": 1,
         "rate_multiplier": 1,
@@ -460,15 +451,14 @@ def build_sub2api_account_entry(
 
 def _sub2api_dedupe_key(entry: dict[str, Any]) -> str:
     credentials = entry.get("credentials") if isinstance(entry.get("credentials"), dict) else {}
-    extra = entry.get("extra") if isinstance(entry.get("extra"), dict) else {}
-    agent_runtime_id = credentials.get("agent_runtime_id") or extra.get("agent_runtime_id")
+    agent_runtime_id = credentials.get("agent_runtime_id")
     if agent_runtime_id:
         return f"agent:{agent_runtime_id}"
-    user_id = credentials.get("chatgpt_user_id") or extra.get("chatgpt_user_id")
-    account_id = credentials.get("chatgpt_account_id") or credentials.get("account_id") or extra.get("chatgpt_account_id") or extra.get("account_id")
+    user_id = credentials.get("chatgpt_user_id")
+    account_id = credentials.get("chatgpt_account_id") or credentials.get("account_id")
     if user_id and account_id:
         return f"account-user:{user_id}|{account_id}"
-    email = credentials.get("email") or extra.get("email")
+    email = credentials.get("email")
     if email:
         return f"email:{email}"
     return ""
@@ -527,8 +517,6 @@ def upsert_sub2api_account(
         mutate,
         {},
         collection=collection,
-        mode=0o600,
-        mirror=False,
     )
     updated = bool(operation["updated"])
     return {
@@ -537,7 +525,7 @@ def upsert_sub2api_account(
         "added": not updated,
         "path": os.path.abspath(path),
         "total": int(operation["total"]),
-        "email": incoming.get("extra", {}).get("email"),
+        "email": (incoming.get("credentials") or {}).get("email"),
         "dedupe_key": key,
     }
 
@@ -618,7 +606,7 @@ def upload_sub2api_account(
         "url": url,
         "status_code": status,
         "payload_mode": mode,
-        "email": (incoming or {}).get("extra", {}).get("email") or (
+        "email": ((incoming or {}).get("credentials") or {}).get("email") or (
             (auth_json.get("agent_identity") or {}).get("email") if isinstance(auth_json, dict) else None
         ),
         "dedupe_key": _sub2api_dedupe_key(incoming) if incoming else (
@@ -706,8 +694,6 @@ def create_codex_agent_identity(
         output_path,
         json.dumps(auth_json, indent=2, ensure_ascii=False) + "\n",
         category="agent_credentials",
-        mode=0o600,
-        mirror=False,
     )
 
     _log("Step 5", f"已保存到 {output_path}", "OK")

@@ -15,60 +15,63 @@ from urllib.parse import quote, unquote, urlparse
 
 
 def normalize_proxy_url(value: str) -> str:
-    """Normalize common proxy pool formats to a URL accepted by clients.
+    """Normalize a proxy *endpoint*, rejecting subscription/download links.
 
-    Besides regular URLs, accept ``host:port:user:password`` entries commonly
-    exported by proxy providers.  Colons in credentials are preserved when
-    they are percent-encoded by the caller or supplied in URL form.
+    PROXY_POOL entries must have a host and port and cannot have a path or
+    query. Providers often issue HTTPS subscription URLs with a token query;
+    accepting one as an HTTPS proxy makes CONNECT fail with a misleading 400.
+    Error messages intentionally never include user-supplied material.
     """
     text = str(value or "").strip()
     if not text:
         return ""
     if "://" in text:
         scheme, payload = text.split("://", 1)
-        # Some providers prepend a scheme to their four-field export:
-        # ``http://host:port:user:password``.
+        # Common four-field provider export with a prepended scheme.
         fields = payload.split(":")
-        if len(fields) == 4 and fields[1].isdigit() and fields[2] and fields[3]:
+        if len(fields) == 4 and fields[1].isdigit() and fields[2] and fields[3] and not any(
+            marker in payload for marker in ("/", "?", "#", "@")
+        ):
             host, port, username, password = fields
-            return (
-                f"{scheme.lower()}://{quote(username, safe='')}:{quote(password, safe='')}"
-                f"@{host}:{port}"
-            )
-        parsed = urlparse(text)
-        if not parsed.hostname:
-            raise ValueError("代理地址无效")
-        # Re-emit credentials safely while preserving the selected scheme.
-        scheme = parsed.scheme.lower()
-        auth = ""
-        if parsed.username is not None:
-            auth = quote(unquote(parsed.username), safe="")
-            if parsed.password is not None:
-                auth += ":" + quote(unquote(parsed.password), safe="")
-            auth += "@"
-        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-        try:
-            parsed_port = parsed.port
-        except ValueError as exc:
-            raise ValueError("代理端口无效") from exc
-        port = f":{parsed_port}" if parsed_port is not None else ""
-        return f"{scheme}://{auth}{host}{port}"
+            text = f"{scheme.lower()}://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}"
+        else:
+            text = f"{scheme.lower()}://{payload}"
+    else:
+        parts = text.split(":")
+        if len(parts) == 4 and parts[1].isdigit() and parts[0] and parts[2] and parts[3]:
+            host, port, username, password = parts
+            text = f"http://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}"
+        elif len(parts) == 2 and parts[0] and parts[1].isdigit():
+            text = f"http://{text}"
+        else:
+            raise ValueError("代理地址无效：请输入带端口的代理服务器地址")
 
-    parts = text.split(":")
-    if len(parts) == 4 and parts[1].isdigit():
-        host, port, username, password = parts
-        if host and username and password:
-            return f"http://{quote(username, safe='')}:{quote(password, safe='')}@{host}:{port}"
-    if len(parts) >= 2 and parts[1].isdigit():
-        return f"http://{text}"
-    raise ValueError("代理地址无效")
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https", "socks4", "socks4a", "socks5", "socks5h"}:
+        raise ValueError("代理协议无效：仅支持 HTTP(S) 或 SOCKS 代理")
+    if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
+        raise ValueError("代理池需要代理服务器 host:port，不能填写订阅下载链接")
+    if not parsed.hostname:
+        raise ValueError("代理地址无效：缺少服务器主机名")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("代理端口无效") from exc
+    if port is None:
+        raise ValueError("代理地址无效：缺少代理端口；订阅链接不能作为代理服务器")
+    auth = ""
+    if parsed.username is not None:
+        auth = quote(unquote(parsed.username), safe="")
+        if parsed.password is not None:
+            auth += ":" + quote(unquote(parsed.password), safe="")
+        auth += "@"
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    return f"{parsed.scheme}://{auth}{host}:{port}"
 
 
-# 本地代理入口；实际出口地区以代理/分流规则为准。
+# 有配置优先走代理；没有配置时使用本机网络，不假定本机存在代理服务。
 # 推荐使用 socks5h://（DNS 在代理端解析），避免本地 DNS 与出口 IP 地区错配。
-PROXY_POOL = [
-    "socks5://127.0.0.1:7897",
-]
+PROXY_POOL = []
 
 # 套餐/Plus 试用资格查询与 Codex Agent Token 生成共用这组独立网络策略，
 # 避免批量请求被注册代理池中的临时本地代理拖垮，也避免无条件直连造成出口策略失控。
@@ -100,11 +103,30 @@ PLAN_CHECK_JITTER = 0.3
 
 def pick_proxy() -> str:
     """从代理池中随机抽取一个代理 URL；池为空时返回空串（即不使用代理）。"""
-    return normalize_proxy_url(random.choice(PROXY_POOL)) if PROXY_POOL else ""
+    candidates = [str(value).strip() for value in PROXY_POOL if str(value or "").strip()]
+    return normalize_proxy_url(random.choice(candidates)) if candidates else ""
+
+
+def resolve_proxy(proxy: str | None = None) -> str:
+    """Explicit route > configured pool > local network; empty string pins direct.
+
+    Invalid/unreachable configured proxies are not equivalent to no proxy. Do
+    not silently switch an account's network exit after a proxy error.
+    """
+    return pick_proxy() if proxy is None else normalize_proxy_url(proxy)
 
 
 # 兼容入口：默认每次进程启动随机选一个，作为本次注册全程的固定代理
-PROXY = pick_proxy()
+# The legacy constant is imported during application startup. Defer invalid
+# user configuration errors to the route selection so WebUI can show them.
+def _legacy_proxy() -> str:
+    try:
+        return pick_proxy()
+    except ValueError:
+        return ""
+
+
+PROXY = _legacy_proxy()
 
 # ---- .env overrides for WebUI editable fields ----
 apply_env_overrides(globals(), {
@@ -120,4 +142,4 @@ apply_env_overrides(globals(), {
     'PLAN_CHECK_MIN_INTERVAL': 'float',
     'PLAN_CHECK_JITTER': 'float',
 })
-PROXY = pick_proxy()
+PROXY = _legacy_proxy()

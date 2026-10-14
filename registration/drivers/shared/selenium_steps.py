@@ -25,6 +25,10 @@ def _fill_password_page_if_present(*args, **kwargs):
     return _call("_fill_password_page_if_present", *args, **kwargs)
 
 
+def _click_continue_with_password_if_present(*args, **kwargs):
+    return _call("_click_continue_with_password_if_present", *args, **kwargs)
+
+
 def _is_email_verification_page(*args, **kwargs):
     return _call("_is_email_verification_page", *args, **kwargs)
 
@@ -68,6 +72,7 @@ __all__ = [
     "_maybe_accept",
     "_submit_email_and_wait_next",
     "_fill_password_page_if_present",
+    "_click_continue_with_password_if_present",
     "_is_email_verification_page",
     "_has_access_token",
     "_clear_otp_inputs",

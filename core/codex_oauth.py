@@ -1093,6 +1093,20 @@ def _follow_until_callback(session: BrowserSession, url: str, state: str) -> str
 # 换 token（对照 CLIProxyAPI ExchangeCodeForTokensWithRedirect）—— 未改动
 # ============================================================
 
+def _require_oauth_token_pair(token_resp: object, *, context: str = "token") -> dict:
+    """Validate the credential pair without ever including token values in errors."""
+    if not isinstance(token_resp, dict):
+        raise RuntimeError(f"[Codex] {context}响应格式无效")
+    missing = []
+    for key in ("access_token", "refresh_token"):
+        value = token_resp.get(key)
+        if not isinstance(value, str) or not value.strip():
+            missing.append(key)
+    if missing:
+        raise RuntimeError(f"[Codex] {context}响应缺少 {', '.join(missing)}")
+    return token_resp
+
+
 def exchange_codex_token(session: BrowserSession, code: str, code_verifier: str) -> dict:
     """用 authorization code 换 token。"""
     data = {
@@ -1114,13 +1128,16 @@ def exchange_codex_token(session: BrowserSession, code: str, code_verifier: str)
     resp = session.post(_cfg.CODEX_TOKEN_URL, headers=headers, data=urlencode(data))
     http_status = resp.status_code
     if http_status != 200:
-        raise RuntimeError(
-            f"[Codex] 换 token 失败 status={http_status}: {(resp.text or '')[:300]}"
-        )
-    token_resp = resp.json()
-    if not token_resp.get("access_token"):
-        raise RuntimeError(f"[Codex] token 响应缺少 access_token: {token_resp}")
-    logger.info(f"[Codex] 换 token 成功，expires_in={token_resp.get('expires_in')}")
+        raise RuntimeError(f"[Codex] 换 token 失败 status={http_status}")
+    try:
+        token_resp = resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"[Codex] token 响应 JSON 无效（{type(exc).__name__}）") from None
+    _require_oauth_token_pair(token_resp, context="token ")
+    logger.info(
+        "[Codex] 换 token 成功，expires_in=%s",
+        token_resp.get("expires_in"),
+    )
     return token_resp
 
 
@@ -1250,8 +1267,6 @@ def refresh_codex_credential(path: str | Path, *, proxy: str = "") -> dict:
         credential_path,
         json.dumps(refreshed, ensure_ascii=False, indent=2) + "\n",
         category="codex_credentials",
-        mode=0o600,
-        mirror=sqlite_store.legacy_mirror_allowed(credential_path),
     )
     return refreshed
 
@@ -1287,6 +1302,7 @@ def _parse_id_token(id_token: str) -> dict:
 
 def build_codex_storage(token_resp: dict, id_claims: dict) -> dict:
     """组装 CLIProxyAPI CodexTokenStorage JSON 结构。"""
+    _require_oauth_token_pair(token_resp, context="token ")
     expires_in = token_resp.get("expires_in", 0) or 0
     expired_dt = datetime.now(timezone.utc) + _timedelta_seconds(expires_in)
     last_refresh_dt = datetime.now(timezone.utc)
@@ -1325,8 +1341,6 @@ def save_codex_credential(storage: dict, email: str, plan_type: str) -> Path:
         path,
         json.dumps(storage, ensure_ascii=False, indent=2) + "\n",
         category="codex_credentials",
-        mode=0o600,
-        mirror=sqlite_store.legacy_mirror_allowed(path),
     )
     return path
 
@@ -1407,8 +1421,6 @@ def _save_cpa_local_record(
         path,
         json.dumps(record, ensure_ascii=False, indent=2) + "\n",
         category="codex_credentials",
-        mode=0o600,
-        mirror=sqlite_store.legacy_mirror_allowed(path),
     )
     return path
 
@@ -1453,8 +1465,6 @@ def _save_sub2_local_record(
         path,
         json.dumps(record, ensure_ascii=False, indent=2) + "\n",
         category="codex_credentials",
-        mode=0o600,
-        mirror=sqlite_store.legacy_mirror_allowed(path),
     )
     return path
 
@@ -1590,7 +1600,14 @@ def run_codex_oauth(
         if oauth_driver not in ("protocol", "api", "http"):
             raise RuntimeError(f"[Codex] 不支持的 CODEX_OAUTH_DRIVER={oauth_driver!r}，可选 protocol / roxy / cloak / chrome_cdp / browser_use / skyvern")
     except ImportError:
-        # 没装 selenium / 未提供 roxy 配置时继续走协议模式，保持旧行为。
+        if require_browser:
+            return _codex_result(
+                status="failed",
+                email=email,
+                message="需要浏览器授权驱动，但其依赖不可用，请检查驱动安装和配置",
+            )
+        # Keep the historical protocol fallback for callers which did not
+        # require a real browser.
         pass
 
     if login_password:

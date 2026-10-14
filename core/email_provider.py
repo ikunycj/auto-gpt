@@ -249,6 +249,12 @@ def registration_email_status(*, include_all: bool = True) -> dict:
     usable_sources = [item["id"] for item in channels if item["ready"]]
     manual_email = _text_config(register_config, "REGISTER_EMAIL")
     manual_configured = bool(manual_email and "@" in manual_email)
+    # Expose only whether the local MailNest settings are complete.  Never
+    # include the API key itself in the WebUI runtime payload.
+    mailnest_configured = bool(
+        _text_config(email_config, "MAIL_NEST_API_KEY")
+        and _text_config(email_config, "MAIL_NEST_PROJECT_CODE")
+    )
     return {
         "automatic": automatic,
         "sources": sources,
@@ -258,6 +264,7 @@ def registration_email_status(*, include_all: bool = True) -> dict:
         "ready_sources": [item["id"] for item in all_channels if item["ready"]],
         "ready": bool(usable_sources) if automatic else manual_configured,
         "manual_configured": manual_configured,
+        "mailnest_configured": mailnest_configured,
     }
 
 

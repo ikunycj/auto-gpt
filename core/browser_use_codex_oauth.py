@@ -179,7 +179,7 @@ def _wait_for_fresh_email_otp(otp_provider, email: str, after_ts: float, used_co
                 return code
         time.sleep(1 if _fast_mode() else 2)
     if last_code:
-        raise RuntimeError(f"等待邮箱 OTP 超时，最后只拿到已使用验证码：{last_code}")
+        raise RuntimeError("等待邮箱 OTP 超时，最后只拿到已使用验证码")
     raise RuntimeError("等待邮箱 OTP 超时")
 
 
@@ -812,17 +812,8 @@ def _submit_browser_use_login_password(page, password: str, timeout: int = 25) -
         if time.time() - started_at < password_render_grace:
             time.sleep(0.2 if _fast_mode() else 0.5)
             continue
-        if _click_passwordless_signup_if_present(page):
-            logger.info("[Codex][BrowserUse] 密码输入框不可用，已切换到一次性验证码")
-            wait_end = min(end, time.time() + 18)
-            while time.time() < wait_end:
-                error_text = _password_error_text(page)
-                if error_text:
-                    raise RuntimeError("ChatGPT 密码错误或账号密码已变更")
-                state = _browser_login_step_state(page)
-                if state in ("email_otp", "totp", "next"):
-                    return state
-                time.sleep(0.2 if _fast_mode() else 0.5)
+        # A known password cannot use the passwordless branch: its mailbox may
+        # already have expired by the time this authorization runs.
         time.sleep(0.2 if _fast_mode() else 0.5)
 
     error_text = _password_error_text(page)
@@ -925,7 +916,9 @@ def _fill_email_and_otp(
             login_state = _handle_browser_use_totp(page, totp_provider)
         if login_state == "next":
             return
-        logger.info("[Codex][BrowserUse] 密码登录后继续处理：%s", login_state)
+        if login_state == "email_otp":
+            raise RuntimeError("账号已有密码，但登录页要求邮箱验证码；已停止，不能使用临时邮箱登录")
+        raise RuntimeError(f"密码与 2FA 登录尚未完成：{login_state or '未知页面'}")
     else:
         _maybe_click_passwordless_after_email(page, email, timeout=18)
 
@@ -933,6 +926,8 @@ def _fill_email_and_otp(
 
     def _restart_email_otp_flow(reason: str) -> str:
         """Codex Auth 上直接点 resend 可能触发服务端 500；改为重开授权地址并重新提交邮箱。"""
+        if login_password:
+            raise RuntimeError("账号已有密码，已停止重新触发临时邮箱验证码")
         nonlocal otp_after_ts
         logger.info("[Codex][BrowserUse] 重新触发邮箱 OTP：%s", reason)
         otp_after_ts = time.time()
@@ -987,7 +982,7 @@ def _fill_email_and_otp(
                 return
             continue
         used_codes.add(str(code))
-        logger.info("[Codex][BrowserUse] 邮箱 OTP 收到：%s", code)
+        logger.info("[Codex][BrowserUse] 邮箱 OTP 已收到")
         _t_otp_submit = _StepTimer("提交邮箱 OTP")
         _clear_otp_inputs(page)
         _type_otp(page, code)
@@ -1481,7 +1476,7 @@ def _do_phone_verification_if_present(page) -> None:
             _t_sms = _StepTimer(f"等待手机短信 attempt={attempt}")
             sms_code = sms_provider.wait_for_sms_code(activation_id, http)
             _t_sms.done()
-            logger.info("[Codex][BrowserUse] 手机 OTP 收到：%s", sms_code)
+            logger.info("[Codex][BrowserUse] 手机 OTP 已收到")
             _clear_otp_inputs(page)
             _type_otp(page, sms_code)
             _bu_delay("otp_input")

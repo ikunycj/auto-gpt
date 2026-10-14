@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -12,14 +13,16 @@ import uuid
 import zipfile
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import pyotp
 
-from core import sms_provider, sqlite_store
+from core import account_store, phone_store, sms_provider, sqlite_store
 from config import codex as _codex_config
+from config.proxy import normalize_proxy_url
+from core.account_proxy import account_proxy as saved_account_proxy
 from core.import_parser import (
     clean_import_value,
     is_http_url,
@@ -29,9 +32,8 @@ from core.import_parser import (
 )
 
 _ROOT = Path(__file__).resolve().parent.parent
-# The following paths are stable SQLite source-key labels. They are retained
-# for migration and test injection; production writes use mirror=False for
-# repository paths, so no matching directories or JSON files are created.
+# These paths are stable SQLite source-key labels for isolated runtime data.
+# Canonical account and phone entities are stored in gpt_accounts and phones.
 _RELAY_ACCOUNTS_KEY = _ROOT / "codex_接码账号.json"
 _RELAY_PHONES_KEY = _ROOT / "codex_接码手机.json"
 _RELAY_JOBS_KEY = _ROOT / "codex_接码任务.json"
@@ -48,18 +50,21 @@ _LOG_DIR = _RELAY_LOG_KEY_ROOT
 _CREDENTIAL_DIR = _CODEX_CREDENTIAL_KEY_ROOT
 _SUB2_SERVICES_PATH = _RELAY_SUB2_SERVICES_KEY
 _SUB2_SYNC_MARKER = "自动导入注册机"
-_SUB2_LEGACY_TRAILING_MARKERS = {"注册机自动转入"}
 _SUB2_PAGE_SIZE = 100
 _SUB2_MAX_PAGES = 1000
 _PHONE_AVAILABLE_DEFAULT = 1
 _PHONE_AVAILABLE_MAX = 3
+_PHONE_SETTING_UNSET = object()
 _LOCK = threading.RLock()
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _CODE_RE = re.compile(r"^\d{4,8}$")
 _SENSITIVE_RE = re.compile(
     r"(?i)(refresh_token|access_token|id_token|password|code|otp|token)=([^\s&]+)"
 )
-_PHONE_RE = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)(?!\d)")
+_OTP_CONTEXT_RE = re.compile(
+    r"(?i)((?:(?:邮箱|手机|短信|手动)\s*)?(?:一次性)?(?:验证码|OTP)"
+    r"\s*(?:已?收到|已?提交|为)?\s*[:：=]\s*)(?<!\d)\d{4,8}(?!\d)"
+)
 _IMPORT_FORMATS = {
     "auto",
     "generic_api",
@@ -132,6 +137,10 @@ class RelayStopped(RuntimeError):
     pass
 
 
+class RoxyProfileRouteError(RuntimeError):
+    """The saved Roxy Profile cannot supply the required Codex API route."""
+
+
 class BrowserAssistTimeout(RuntimeError):
     pass
 
@@ -162,27 +171,31 @@ def _now() -> str:
 
 
 def _read(path: Path) -> list[dict]:
+    if Path(path).expanduser().resolve() == Path(_ACCOUNTS_PATH).expanduser().resolve():
+        return account_store.read_gpt_accounts(path)
+    if Path(path).expanduser().resolve() == Path(_PHONES_PATH).expanduser().resolve():
+        return phone_store.read(path)
     data = sqlite_store.read_json(path, [], collection=_collection_name(path))
     return data if isinstance(data, list) else []
 
 
 def _write(path: Path, rows: list[dict]) -> None:
+    if Path(path).expanduser().resolve() == Path(_ACCOUNTS_PATH).expanduser().resolve():
+        account_store.write_gpt_accounts(path, rows)
+        return
+    if Path(path).expanduser().resolve() == Path(_PHONES_PATH).expanduser().resolve():
+        phone_store.write(path, rows)
+        return
     sqlite_store.write_json(
-        path,
-        rows,
-        collection=_collection_name(path),
-        mode=0o600,
-        # Temporary paths used by isolated tests and explicit export tooling
-        # may still request a mirror; repository runtime paths remain SQLite-only.
-        mirror=sqlite_store.legacy_mirror_allowed(path),
+        path, rows, collection=_collection_name(path),
     )
 
 
 def _collection_name(path: Path) -> str:
     target = Path(path).expanduser().resolve()
     mapping = {
-        Path(_ACCOUNTS_PATH).expanduser().resolve(): "relay_accounts",
-        Path(_PHONES_PATH).expanduser().resolve(): "relay_phones",
+        Path(_ACCOUNTS_PATH).expanduser().resolve(): account_store.COLLECTION,
+        Path(_PHONES_PATH).expanduser().resolve(): phone_store.COLLECTION,
         Path(_JOBS_PATH).expanduser().resolve(): "relay_jobs",
         Path(_SUB2_SERVICES_PATH).expanduser().resolve(): "relay_sub2_services",
     }
@@ -190,14 +203,38 @@ def _collection_name(path: Path) -> str:
 
 
 def initialize_storage() -> dict:
-    """Import relay compatibility documents into the shared SQLite database."""
-    for path in (_ACCOUNTS_PATH, _PHONES_PATH, _JOBS_PATH, _SUB2_SERVICES_PATH):
-        sqlite_store.migrate_json_file(path, default=[], collection=_collection_name(path))
+    """Initialize only the current Relay job collections."""
+    for path in (_JOBS_PATH, _SUB2_SERVICES_PATH):
+        sqlite_store.ensure_collection(path, collection=_collection_name(path), default=[])
     return sqlite_store.storage_info(sqlite_store.database_path(_ACCOUNTS_PATH))
 
 
 def _valid_url(value: str) -> bool:
     return is_http_url(value)
+
+
+def _normalize_proxy_value(value: object) -> str:
+    """Normalize one account proxy without echoing credentials or URLs."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return normalize_proxy_url(text)
+    except Exception as exc:
+        # ``normalize_proxy_url`` deliberately uses generic messages. Keep this
+        # boundary generic too in case a future parser raises a raw exception.
+        if isinstance(exc, ValueError):
+            raise ValueError(f"代理地址无效：{str(exc).split('：', 1)[-1]}") from exc
+        raise ValueError("代理地址无效") from exc
+
+
+def _proxy_alias(data: dict) -> tuple[str, str]:
+    """Return the first populated proxy alias and its non-sensitive source."""
+    for key in ("proxy", "proxy_url", "proxy_used", "ip"):
+        value = data.get(key)
+        if str(value or "").strip():
+            return str(value).strip(), key
+    return "", ""
 
 
 def _normalize_phone(value: str) -> str:
@@ -306,6 +343,7 @@ def _parse_record(
     line = str(raw or "").strip()
     if not line or line.startswith("#"):
         return {}
+    proxy_supplied = False
     if line.startswith("{"):
         try:
             data = json.loads(line)
@@ -313,6 +351,8 @@ def _parse_record(
             raise ValueError(f"第 {line_no} 行 JSON 格式错误") from exc
         if not isinstance(data, dict):
             raise ValueError(f"第 {line_no} 行必须是 JSON 对象")
+        proxy_supplied = any(key in data for key in ("proxy", "proxy_url", "proxy_used", "ip"))
+        proxy_value, proxy_source = _proxy_alias(data)
         record = {
             "email": data.get("email"),
             "chatgpt_password": data.get("chatgpt_password") or data.get("password"),
@@ -323,6 +363,8 @@ def _parse_record(
             "totp_secret": data.get("totp_secret") or data.get("totp"),
             "phone": data.get("phone"),
             "sms_code_url": data.get("sms_code_url") or data.get("sms_url"),
+            "proxy": proxy_value,
+            "proxy_source": proxy_source,
         }
     else:
         semantic_record = parse_account_material_line(line) if format_name == "auto" else None
@@ -408,7 +450,18 @@ def _parse_record(
         else:
             raise ValueError(f"第 {line_no} 行字段数应为 2、3、4、5 或 6")
 
+    if not line.startswith("{"):
+        proxy_supplied = any(key in record for key in ("proxy", "proxy_url", "proxy_used", "ip"))
     record = {k: clean_import_value(v) for k, v in record.items()}
+    declared_proxy_source = str(record.get("proxy_source") or "").strip().lower()
+    proxy_value, proxy_alias = _proxy_alias(record)
+    record["proxy"] = _normalize_proxy_value(proxy_value)
+    if proxy_value:
+        record["proxy_source"] = declared_proxy_source or proxy_alias
+    else:
+        record.pop("proxy_source", None)
+        if not proxy_supplied:
+            record.pop("proxy", None)
     email = record.get("email", "").lower()
     if not _EMAIL_RE.match(email):
         raise ValueError(f"第 {line_no} 行邮箱格式错误")
@@ -446,10 +499,7 @@ def _parse_phone_record(raw: str, line_no: int) -> dict:
             raise ValueError(f"第 {line_no} 行必须是 JSON 对象")
         phone = data.get("phone")
         code_url = data.get("sms_code_url") or data.get("sms_url") or data.get("code_url")
-        available_uses = next(
-            (data[key] for key in ("available_uses", "max_uses", "reuse_limit", "uses") if key in data),
-            _PHONE_AVAILABLE_DEFAULT,
-        )
+        available_uses = data.get("available_uses", _PHONE_AVAILABLE_DEFAULT)
     else:
         dash_separator = re.compile(r"(?<!-)-{3,4}(?!-)")
         parts = [x.strip() for x in (
@@ -488,7 +538,36 @@ def _active_reservation_ids(row: dict) -> list[str]:
     return _id_list(row.get("reserved_job_ids"))
 
 
+def _phone_expiration(row: dict, *, now: datetime | None = None) -> tuple[bool, int | None]:
+    """Missing deadlines mean unlimited; malformed deadlines fail closed.
+
+    New deadlines carry an offset. Legacy naive timestamps use server-local
+    time, matching the other timestamps already stored in this workspace.
+    """
+    value = str(row.get("expires_at") or "").strip()
+    if not value:
+        return False, None
+    try:
+        deadline = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+        current = (now or datetime.fromisoformat(_now())).astimezone(timezone.utc)
+        seconds = (deadline - current).total_seconds()
+    except (TypeError, ValueError, OverflowError):
+        return True, 0
+    return seconds <= 0, max(0, math.ceil(seconds / 86400))
+
+
+def _phone_setting_integer(value: object, label: str) -> int:
+    # Do not silently truncate fractional JSON numbers or accept booleans.
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError(f"{label}必须是非负整数")
+    text = str(value).strip()
+    if not re.fullmatch(r"[0-9]+", text):
+        raise ValueError(f"{label}必须是非负整数")
+    return int(text)
+
+
 def _upsert_phone_locked(phones: list[dict], phone_value: str, sms_url: str, *, now: str | None = None) -> dict:
+    """Insert or update one current phone-pool entity."""
     now = now or _now()
     key = _phone_key(phone_value)
     row = next((item for item in phones if _phone_key(item.get("phone")) == key), None)
@@ -497,10 +576,9 @@ def _upsert_phone_locked(phones: list[dict], phone_value: str, sms_url: str, *, 
             "id": uuid.uuid4().hex,
             "phone": phone_value,
             "sms_code_url": sms_url,
-            "assigned_account_id": "",
-            "assigned_account_ids": [],
             "reserved_job_ids": [],
             "available_uses": _PHONE_AVAILABLE_DEFAULT,
+            "expires_at": "",
             "invalid": False,
             "seq": max((int(item.get("seq") or 0) for item in phones), default=0) + 1,
             "created_at": now,
@@ -510,118 +588,26 @@ def _upsert_phone_locked(phones: list[dict], phone_value: str, sms_url: str, *, 
     else:
         row["phone"] = phone_value
         row["sms_code_url"] = sms_url
-        if not any(key in row for key in ("available_uses", "remaining_uses", "max_uses")):
-            row["available_uses"] = _PHONE_AVAILABLE_DEFAULT
+        row.setdefault("available_uses", _PHONE_AVAILABLE_DEFAULT)
+        row.setdefault("expires_at", "")
         row.setdefault("invalid", False)
-        row.setdefault("assigned_account_ids", _id_list(row.get("assigned_account_id")))
         row.setdefault("reserved_job_ids", [])
         row["updated_at"] = now
     return row
 
 
-def _ensure_assignments_locked(accounts: list[dict], phones: list[dict]) -> tuple[int, bool]:
-    """Migrate legacy phone data without binding unverified numbers to accounts."""
-    changed = False
-    now = _now()
-    next_account_seq = max((int(row.get("seq") or 0) for row in accounts), default=0) + 1
-    for account in accounts:
-        if not account.get("seq"):
-            account["seq"] = next_account_seq
-            next_account_seq += 1
-            changed = True
-    next_phone_seq = max((int(row.get("seq") or 0) for row in phones), default=0) + 1
-    for phone in phones:
-        legacy_assigned = len(_id_list(phone.get("assigned_account_ids") or phone.get("assigned_account_id")))
-        if not legacy_assigned:
-            phone_key = _phone_key(phone.get("phone"))
-            legacy_assigned = sum(
-                1 for account in accounts
-                if account.get("phone_verified_at") and _phone_key(account.get("phone")) == phone_key
-            )
-        try:
-            if "available_uses" in phone:
-                available_uses = int(phone.get("available_uses"))
-            elif "remaining_uses" in phone:
-                available_uses = int(phone.get("remaining_uses"))
-            elif "max_uses" in phone:
-                available_uses = int(phone.get("max_uses")) - legacy_assigned
-            else:
-                available_uses = _PHONE_AVAILABLE_DEFAULT
-        except (TypeError, ValueError):
-            available_uses = _PHONE_AVAILABLE_DEFAULT
-        available_uses = max(0, min(_PHONE_AVAILABLE_MAX, available_uses))
-        if phone.get("available_uses") != available_uses:
-            phone["available_uses"] = available_uses
-            changed = True
-        for legacy_key in ("max_uses", "remaining_uses", "use_count"):
-            if legacy_key in phone:
-                phone.pop(legacy_key, None)
-                changed = True
-        if "invalid" not in phone:
-            phone["invalid"] = False
-            changed = True
-        if not phone.get("seq"):
-            phone["seq"] = next_phone_seq
-            next_phone_seq += 1
-            changed = True
-    account_by_id = {str(row.get("id") or ""): row for row in accounts if row.get("id")}
-
-    # Combined imports and legacy pre-bindings become unbound phone-pool candidates
-    # unless the account has a confirmed phone verification timestamp.
-    for account in accounts:
-        verified = bool(account.get("phone_verified_at"))
-        phone_value = account.get("phone") or (account.get("last_sms_phone") if verified else "") or ""
-        sms_url = account.get("sms_code_url") or (account.get("last_sms_code_url") if verified else "") or ""
-        key = _phone_key(phone_value)
-        if not key or not sms_url:
-            continue
-        existing_phone = next((item for item in phones if _phone_key(item.get("phone")) == key), None)
-        phone_changed = (
-            existing_phone is None
-            or existing_phone.get("phone") != phone_value
-            or existing_phone.get("sms_code_url") != sms_url
-        )
-        _upsert_phone_locked(phones, phone_value, sms_url, now=now)
-        if phone_changed:
-            changed = True
-        if verified:
-            if account.get("phone") != phone_value or account.get("sms_code_url") != sms_url:
-                account["phone"] = phone_value
-                account["sms_code_url"] = sms_url
-                account["updated_at"] = now
-                changed = True
-        else:
-            if account.get("phone") or account.get("sms_code_url"):
-                account["phone"] = ""
-                account["sms_code_url"] = ""
-                account["updated_at"] = now
-                changed = True
-
-    owners_by_phone: dict[str, list[str]] = {}
-    for account in accounts:
-        if not account.get("phone_verified_at"):
-            continue
-        key = _phone_key(account.get("phone"))
-        if key and account.get("sms_code_url"):
-            owners_by_phone.setdefault(key, []).append(str(account.get("id") or ""))
-
-    for phone in phones:
-        desired_ids = [
-            account_id for account_id in owners_by_phone.get(_phone_key(phone.get("phone")), [])
-            if account_id in account_by_id
-        ]
-        current_ids = _id_list(phone.get("assigned_account_ids") or phone.get("assigned_account_id"))
-        reservations = _id_list(phone.get("reserved_job_ids"))
-        desired_last = desired_ids[-1] if desired_ids else ""
-        if current_ids != desired_ids or str(phone.get("assigned_account_id") or "") != desired_last:
-            phone["assigned_account_ids"] = desired_ids
-            phone["assigned_account_id"] = desired_last
-            phone["updated_at"] = now
-            changed = True
-        if phone.get("reserved_job_ids") != reservations:
-            phone["reserved_job_ids"] = reservations
-            changed = True
-    return 0, changed
+def _bound_account_ids(accounts: list[dict], phone_value: object) -> list[str]:
+    """Derive current phone bindings from verified GPT account records."""
+    key = _phone_key(phone_value)
+    if not key:
+        return []
+    return [
+        str(account.get("id") or "")
+        for account in accounts
+        if account.get("phone_verified_at")
+        and _phone_key(account.get("phone")) == key
+        and account.get("id")
+    ]
 
 
 def _validate_unique_account_phones(accounts: list[dict]) -> None:
@@ -629,13 +615,17 @@ def _validate_unique_account_phones(accounts: list[dict]) -> None:
     return None
 
 
-def import_accounts(text: str, format_name: str = "auto", *, include_emails: bool = False) -> dict:
+def import_accounts(text: str, format_name: str = "auto", *, include_emails: bool = False, proxy: str | None = None) -> dict:
+    default_proxy = _normalize_proxy_value(proxy) if proxy is not None else None
     records: list[dict] = []
     errors: list[str] = []
     for line_no, raw in enumerate(str(text or "").splitlines(), 1):
         try:
             item = _parse_record(raw, line_no, format_name=format_name)
             if item:
+                # Per-row JSON proxy takes precedence over the optional batch default.
+                if default_proxy is not None and "proxy" not in item:
+                    item.update(proxy=default_proxy, proxy_source="import" if default_proxy else "")
                 records.append(item)
         except ValueError as exc:
             errors.append(str(exc))
@@ -647,32 +637,43 @@ def import_accounts(text: str, format_name: str = "auto", *, include_emails: boo
     with _LOCK:
         rows = _read(_ACCOUNTS_PATH)
         phones = _read(_PHONES_PATH)
-        _ensure_assignments_locked(rows, phones)
         next_seq = max((int(row.get("seq") or 0) for row in rows), default=0) + 1
         by_email = {str(x.get("email") or "").lower(): x for x in rows}
         inserted = updated = 0
         for record in records:
+            account_material = {key: value for key, value in record.items() if key not in {"phone", "sms_code_url"}}
             old = by_email.get(record["email"])
             if old:
-                for key, value in record.items():
+                if "proxy" in account_material:
+                    if account_material["proxy"] != (old.get("proxy") or ""):
+                        old.pop("_codex_verified_proxy", None)
+                        old.pop("codex_profile_id", None)
+                    # Explicit empty proxy switches to local network; omission
+                    # preserves a previously imported binding.
+                    old["proxy"] = account_material["proxy"]
+                    old["proxy_source"] = account_material.get("proxy_source", "")
+                for key, value in account_material.items():
                     if value:
                         old[key] = value
                 old["updated_at"] = _now()
                 updated += 1
             else:
-                record.update({
+                account_material.update({
                     "id": uuid.uuid4().hex,
                     "seq": next_seq,
                     "created_at": _now(),
                     "updated_at": _now(),
                     "last_status": "not_started",
                 })
-                rows.append(record)
-                by_email[record["email"]] = record
+                rows.append(account_material)
+                by_email[record["email"]] = account_material
                 inserted += 1
                 next_seq += 1
         _validate_unique_account_phones(rows)
-        assigned, _changed = _ensure_assignments_locked(rows, phones)
+        for record in records:
+            if record.get("phone") and record.get("sms_code_url"):
+                _upsert_phone_locked(phones, record["phone"], record["sms_code_url"])
+        assigned = sum(len(_bound_account_ids(rows, row.get("phone"))) for row in phones)
         _write(_ACCOUNTS_PATH, rows)
         _write(_PHONES_PATH, phones)
     result = {
@@ -680,9 +681,7 @@ def import_accounts(text: str, format_name: str = "auto", *, include_emails: boo
         "assigned": assigned,
         "unassigned_accounts": sum(1 for row in rows if not row.get("phone") or not row.get("sms_code_url")),
     }
-    # The WebUI uses this transient list to clear matching soft-delete
-    # markers. Keep it opt-in so the lower-level import API remains backward
-    # compatible and does not expose account identifiers unnecessarily.
+    # The WebUI uses the transient email list to clear matching deletion markers.
     if include_emails:
         result["emails"] = [record["email"] for record in records]
     return result
@@ -701,6 +700,13 @@ def _normalize_account_material(material: dict) -> tuple[str, dict]:
         "phone", "sms_code_url", "note", "login_method",
     )
     incoming = {key: str(material.get(key) or "").strip() for key in fields}
+    proxy_value, proxy_alias = _proxy_alias(material)
+    incoming["proxy"] = _normalize_proxy_value(proxy_value)
+    if incoming["proxy"]:
+        source = str(material.get("proxy_source") or proxy_alias or "account").strip().lower()
+        incoming["proxy_source"] = source[:32] or "account"
+    else:
+        incoming["proxy_source"] = ""
     provider = str(material.get("email_provider") or "").strip().lower()
     if provider and provider not in _EMAIL_PROVIDER_LABELS:
         raise ValueError(f"不支持的邮箱取码渠道：{provider}")
@@ -744,9 +750,8 @@ def validate_account_material(material: dict) -> dict:
 def ensure_account_material(material: dict) -> dict:
     """Create or complete one Relay account from an existing GPT account.
 
-    Registration accounts and Relay accounts intentionally live in separate
-    collections for backwards compatibility.  This helper is the small,
-    idempotent bridge used by the unified GPT account workspace.  It accepts a
+    Registration and Relay account state share one GPT account document.
+    This helper initializes its Relay material when needed. It accepts a
     structured dict instead of rebuilding an import line, so URLs containing
     configured separators are preserved byte-for-byte.
 
@@ -786,11 +791,18 @@ def ensure_account_material(material: dict) -> dict:
             created = True
             changed = True
 
-        # Never overwrite an explicitly maintained Relay value with an empty
-        # value (or a stale value from the registration projection).
+        # A supplied number becomes a reusable phone-pool candidate; only
+        # successful verification sets the account's bound phone fields.
+        if incoming.get("phone") and incoming.get("sms_code_url"):
+            _upsert_phone_locked(phones, incoming["phone"], incoming["sms_code_url"], now=now)
         for key, value in incoming.items():
+            if key in {"phone", "sms_code_url"}:
+                continue
             if not value or existing.get(key):
                 continue
+            if key == "proxy":
+                existing.pop("_codex_verified_proxy", None)
+                existing.pop("codex_profile_id", None)
             existing[key] = value
             changed = True
         if not existing.get("email_provider"):
@@ -803,7 +815,6 @@ def ensure_account_material(material: dict) -> dict:
         if changed and not created:
             existing["updated_at"] = now
         _validate_unique_account_phones(rows)
-        _ensure_assignments_locked(rows, phones)
         _write(_ACCOUNTS_PATH, rows)
         _write(_PHONES_PATH, phones)
         public = _public_account(existing)
@@ -834,7 +845,6 @@ def import_phones(text: str) -> dict:
     with _LOCK:
         accounts = _read(_ACCOUNTS_PATH)
         phones = _read(_PHONES_PATH)
-        _ensure_assignments_locked(accounts, phones)
         by_phone = {_phone_key(row.get("phone")): row for row in phones}
         next_seq = max((int(row.get("seq") or 0) for row in phones), default=0) + 1
         inserted = updated = 0
@@ -848,16 +858,16 @@ def import_phones(text: str) -> dict:
                     "available_uses", old.get("available_uses", _PHONE_AVAILABLE_DEFAULT)
                 )
                 old["invalid"] = False
+                old.setdefault("expires_at", "")
                 old.pop("invalid_reason", None)
                 old["updated_at"] = _now()
                 updated += 1
             else:
                 record.update({
                     "id": uuid.uuid4().hex,
-                    "assigned_account_id": "",
-                    "assigned_account_ids": [],
                     "reserved_job_ids": [],
                     "available_uses": record.get("available_uses", _PHONE_AVAILABLE_DEFAULT),
+                    "expires_at": "",
                     "invalid": False,
                     "seq": next_seq,
                     "created_at": _now(),
@@ -867,13 +877,13 @@ def import_phones(text: str) -> dict:
                 by_phone[key] = record
                 inserted += 1
                 next_seq += 1
-        assigned, _changed = _ensure_assignments_locked(accounts, phones)
+        assigned = sum(len(_bound_account_ids(accounts, row.get("phone"))) for row in phones)
         _write(_ACCOUNTS_PATH, accounts)
         _write(_PHONES_PATH, phones)
     return {
         "ok": True, "inserted": inserted, "updated": updated, "total": len(records),
         "assigned": assigned,
-        "unassigned_phones": sum(1 for row in phones if not row.get("assigned_account_id")),
+        "unassigned_phones": sum(1 for row in phones if not _bound_account_ids(accounts, row.get("phone"))),
     }
 
 
@@ -891,6 +901,8 @@ def _public_account(row: dict) -> dict:
         "email": row.get("email"),
         "has_password": bool(chatgpt_password or mailbox_password),
         "password_kind": "ChatGPT" if chatgpt_password else "微软邮箱" if mailbox_password else "",
+        "has_proxy": bool(row.get("proxy")),
+        "proxy_source": (str(row.get("proxy_source") or "relay").strip() if row.get("proxy") else ""),
         "chatgpt_password": chatgpt_password,
         "mailbox_password": mailbox_password,
         "has_email_code_url": bool(row.get("email_code_url")),
@@ -908,9 +920,6 @@ def _public_account(row: dict) -> dict:
         "sms_provider": _url_host(row.get("sms_code_url") or ""),
         "sms_code_url": row.get("sms_code_url") or "",
         "phone_verified_at": row.get("phone_verified_at") or "",
-        "last_sms_phone": row.get("last_sms_phone") or "",
-        "last_sms_provider": row.get("last_sms_provider") or "",
-        "last_sms_code_url": row.get("last_sms_code_url") or "",
         "codex_status": codex_status,
         "codex_authorized_at": row.get("codex_authorized_at") or "",
         "liveness_status": row.get("liveness_status") or "unknown",
@@ -1014,10 +1023,6 @@ def list_accounts(
             for job in _read(_JOBS_PATH)
             if not job.get("action") and str(job.get("status") or "") in _ACTIVE_JOB_STATUSES
         }
-        _assigned, changed = _ensure_assignments_locked(accounts, phones)
-        if changed:
-            _write(_ACCOUNTS_PATH, accounts)
-            _write(_PHONES_PATH, phones)
         rows = []
         for account in accounts:
             public = _public_account(account)
@@ -1055,15 +1060,16 @@ def _mask_phone(value: str) -> str:
     return prefix + ("*" * max(0, len(digits) - 4)) + digits[-4:]
 
 
-def _phone_public_status(*, invalid: bool, reserved: bool, assigned: bool, available_uses: int) -> str:
+def _phone_public_status(*, invalid: bool, reserved: bool, assigned: bool, available_uses: int, expired: bool = False) -> str:
     """Return the single status used by the phone-pool UI and API filters.
 
-    A bound number remains visibly bound even after its reusable balance is
-    exhausted.  This preserves the relationship users need to inspect, while
-    unbound numbers with no remaining balance are reported as ``used``.
+    Expiry takes priority over reservation/binding, but binding metadata is
+    retained. Non-expired bound numbers remain bound even with zero balance.
     """
     if invalid:
         return "invalid"
+    if expired:
+        return "expired"
     if reserved:
         return "reserved"
     if assigned:
@@ -1125,6 +1131,9 @@ def _sms_platform_row() -> dict | None:
         "status": "platform" if state["ready"] else "unavailable",
         "candidate": state["ready"],
         "available_uses": None,
+        "expires_at": "",
+        "expired": False,
+        "expires_in_days": None,
         "reserved_count": 0,
         "assigned": False,
         "assigned_count": 0,
@@ -1143,14 +1152,11 @@ def list_phones(q: str = "", status: str = "") -> list[dict]:
     with _LOCK:
         accounts = _read(_ACCOUNTS_PATH)
         phones = _read(_PHONES_PATH)
-        _assigned, changed = _ensure_assignments_locked(accounts, phones)
-        if changed:
-            _write(_ACCOUNTS_PATH, accounts)
-            _write(_PHONES_PATH, phones)
         emails = {str(row.get("id") or ""): str(row.get("email") or "") for row in accounts}
+        now = datetime.fromisoformat(_now())
         rows = []
         for row in phones:
-            assigned_ids = _id_list(row.get("assigned_account_ids") or row.get("assigned_account_id"))
+            assigned_ids = _bound_account_ids(accounts, row.get("phone"))
             assigned_emails = [emails[account_id] for account_id in assigned_ids if emails.get(account_id)]
             reserved_ids = _active_reservation_ids(row)
             try:
@@ -1159,11 +1165,13 @@ def list_phones(q: str = "", status: str = "") -> list[dict]:
                 available_uses = _PHONE_AVAILABLE_DEFAULT
             available_uses = max(0, min(_PHONE_AVAILABLE_MAX, available_uses))
             invalid = bool(row.get("invalid"))
+            expired, expires_in_days = _phone_expiration(row, now=now)
             public_status = _phone_public_status(
                 invalid=invalid,
                 reserved=bool(reserved_ids),
                 assigned=bool(assigned_ids),
                 available_uses=available_uses,
+                expired=expired,
             )
             rows.append({
                 "id": row.get("id"),
@@ -1178,9 +1186,12 @@ def list_phones(q: str = "", status: str = "") -> list[dict]:
                 "reserved": bool(reserved_ids),
                 "reserved_count": len(reserved_ids),
                 "available_uses": available_uses,
+                "expires_at": row.get("expires_at") or "",
+                "expired": expired,
+                "expires_in_days": expires_in_days,
                 "invalid": invalid,
                 "invalid_reason": row.get("invalid_reason") or "",
-                "candidate": not invalid and len(reserved_ids) < available_uses,
+                "candidate": not invalid and not expired and len(reserved_ids) < available_uses,
                 "status": public_status,
                 "import_seq": int(row.get("seq") or 0),
                 "updated_at": row.get("updated_at"),
@@ -1200,6 +1211,8 @@ def list_phones(q: str = "", status: str = "") -> list[dict]:
         rows = [row for row in rows if row.get("candidate")]
     elif status == "invalid":
         rows = [row for row in rows if row.get("invalid")]
+    elif status == "expired":
+        rows = [row for row in rows if row.get("expired")]
     elif status == "reserved":
         rows = [row for row in rows if row.get("reserved")]
     elif status == "used":
@@ -1220,9 +1233,8 @@ def delete_phones(phone_ids: list[str]) -> int:
     with _LOCK:
         accounts = _read(_ACCOUNTS_PATH)
         phones = _read(_PHONES_PATH)
-        _ensure_assignments_locked(accounts, phones)
         selected = [row for row in phones if row.get("id") in ids]
-        if any(_id_list(row.get("assigned_account_ids") or row.get("assigned_account_id")) for row in selected):
+        if any(_bound_account_ids(accounts, row.get("phone")) for row in selected):
             raise ValueError("已绑定账号的手机号不能删除；请先删除对应账号")
         if any(_id_list(row.get("reserved_job_ids")) for row in selected):
             raise ValueError("任务占用中的手机号不能删除")
@@ -1247,7 +1259,6 @@ def adjust_phone_available_uses(phone_ids: list[str], delta: int) -> dict:
     with _LOCK:
         accounts = _read(_ACCOUNTS_PATH)
         phones = _read(_PHONES_PATH)
-        _ensure_assignments_locked(accounts, phones)
         by_id = {str(row.get("id") or ""): row for row in phones}
         missing = [phone_id for phone_id in ids if phone_id not in by_id]
         if missing:
@@ -1265,7 +1276,6 @@ def adjust_phone_available_uses(phone_ids: list[str], delta: int) -> dict:
             row["available_uses"] = value
             row["updated_at"] = _now()
             changed.append({"id": phone_id, "available_uses": value})
-        _write(_ACCOUNTS_PATH, accounts)
         _write(_PHONES_PATH, phones)
     return {
         "ok": True,
@@ -1273,6 +1283,83 @@ def adjust_phone_available_uses(phone_ids: list[str], delta: int) -> dict:
         "updated": len(changed),
         "unchanged": len(ids) - len(changed),
         "items": changed,
+    }
+
+
+def update_phone_settings(
+    phone_ids: list[str],
+    *,
+    available_uses: object = _PHONE_SETTING_UNSET,
+    expiration_days: object = _PHONE_SETTING_UNSET,
+) -> dict:
+    """Set one or more phones atomically; omitted fields remain unchanged.
+
+    A positive day count starts at save time, zero removes the deadline.
+    Settings never reset invalid flags or verified account bindings.
+    """
+    if not isinstance(phone_ids, list) or not phone_ids:
+        raise ValueError("请先选择手机号（phone_ids 必须是非空数组）")
+    if any(not isinstance(value, str) or not value.strip() for value in phone_ids):
+        raise ValueError("手机号 ID 必须是非空字符串")
+    ids = list(dict.fromkeys(value.strip() for value in phone_ids))
+    if any(value.startswith(_SMS_PLATFORM_ROW_PREFIX) for value in ids):
+        raise ValueError("接码平台特殊来源没有固定次数或过期时间，请到设置中管理")
+    set_uses = available_uses is not _PHONE_SETTING_UNSET
+    set_expiration = expiration_days is not _PHONE_SETTING_UNSET
+    if not set_uses and not set_expiration:
+        raise ValueError("请设置可用次数或过期天数")
+    if set_uses:
+        available_uses = _phone_setting_integer(available_uses, "可用次数")
+        if available_uses > _PHONE_AVAILABLE_MAX:
+            raise ValueError(f"可用次数必须在 0–{_PHONE_AVAILABLE_MAX} 之间")
+    if set_expiration:
+        expiration_days = _phone_setting_integer(expiration_days, "过期天数")
+
+    with _LOCK:
+        phones = _read(_PHONES_PATH)
+        by_id = {str(row.get("id") or ""): row for row in phones}
+        if any(phone_id not in by_id for phone_id in ids):
+            raise ValueError("包含不存在的手机号素材")
+        # Validate the entire selection before writing anything.
+        for phone_id in ids:
+            row = by_id[phone_id]
+            if _active_reservation_ids(row):
+                if set_uses and available_uses < int(row.get("available_uses", _PHONE_AVAILABLE_DEFAULT)):
+                    raise ValueError("任务占用中的手机号不能减少可用次数")
+                if set_expiration:
+                    raise ValueError("任务占用中的手机号不能修改过期时间")
+        now = _now()
+        changes = {}
+        if set_uses:
+            changes["available_uses"] = available_uses
+        if set_expiration:
+            try:
+                changes["expires_at"] = (
+                    (datetime.fromisoformat(now).astimezone(timezone.utc) + timedelta(days=expiration_days))
+                    .astimezone().isoformat(timespec="seconds")
+                    if expiration_days else ""
+                )
+            except (ValueError, OverflowError) as exc:
+                raise ValueError("过期天数超出支持范围") from exc
+        changed = []
+        for phone_id in ids:
+            row = by_id[phone_id]
+            if all(row.get(key, "" if key == "expires_at" else _PHONE_AVAILABLE_DEFAULT) == value for key, value in changes.items()):
+                continue
+            row.update(changes, updated_at=now)
+            expired, expires_in_days = _phone_expiration(row, now=datetime.fromisoformat(now))
+            changed.append({
+                "id": phone_id,
+                "available_uses": row.get("available_uses", _PHONE_AVAILABLE_DEFAULT),
+                "expires_at": row.get("expires_at") or "",
+                "expired": expired,
+                "expires_in_days": expires_in_days,
+            })
+        if changed:
+            _write(_PHONES_PATH, phones)
+    return {
+        "ok": True, "requested": len(ids), "updated": len(changed),
+        "unchanged": len(ids) - len(changed), "items": changed,
     }
 
 
@@ -1350,7 +1437,6 @@ def update_account(account_id: str, data: dict) -> dict:
 
         row["updated_at"] = _now()
         _validate_unique_account_phones(rows)
-        _ensure_assignments_locked(rows, phones)
         _write(_ACCOUNTS_PATH, rows)
         _write(_PHONES_PATH, phones)
         return _public_account(row)
@@ -1417,6 +1503,8 @@ def _mark_phone_invalid(phone_id: str, reason: str = "") -> None:
 
 def _phone_capacity(row: dict) -> tuple[int, int]:
     reserved = len(_active_reservation_ids(row))
+    if _phone_expiration(row)[0]:
+        return reserved, 0
     try:
         available = int(row.get("available_uses"))
     except (TypeError, ValueError):
@@ -1430,19 +1518,18 @@ def _acquire_phone_for_job(
     preferred_phone_ids: list[str] | None = None,
     prefer_bound: bool = True,
 ) -> dict:
-    """Return the slot reserved for this job, or reserve one for legacy callers."""
+    """Return a phone slot reserved for this job."""
     preferred = {str(item) for item in (preferred_phone_ids or []) if item}
     account_id = str(account.get("id") or "")
     with _LOCK:
         accounts = _read(_ACCOUNTS_PATH)
         phones = _read(_PHONES_PATH)
-        _ensure_assignments_locked(accounts, phones)
         current = next((row for row in accounts if str(row.get("id") or "") == account_id), account)
         bound_key = _phone_key(current.get("phone")) if current.get("phone_verified_at") else ""
         candidates = []
         for row in phones:
             key = _phone_key(row.get("phone"))
-            if not key or not row.get("sms_code_url") or row.get("invalid"):
+            if not key or not row.get("sms_code_url") or row.get("invalid") or _phone_expiration(row)[0]:
                 continue
             reserved, available = _phone_capacity(row)
             reservations = _id_list(row.get("reserved_job_ids"))
@@ -1458,7 +1545,7 @@ def _acquire_phone_for_job(
         ))
         chosen = candidates[0][0] if candidates else None
         if chosen is None:
-            raise sms_provider.SmsProviderError("检测到手机验证页，但没有可用手机号；请导入手机号或增加可用次数")
+            raise sms_provider.SmsProviderError("检测到手机验证页，但没有可用手机号；请导入手机号、增加可用次数或检查过期时间")
         reservations = _id_list(chosen.get("reserved_job_ids"))
         if job_id not in reservations:
             reservations.append(job_id)
@@ -1488,44 +1575,129 @@ def _bind_verified_phone(
         account = next((row for row in accounts if str(row.get("id") or "") == account_id), None)
         if account is None:
             raise ValueError("ChatGPT账号不存在")
-        _ensure_assignments_locked(accounts, phones)
         pool_row = next((row for row in phones if str(row.get("id") or "") == str(phone_id or "")), None)
         if pool_row is None:
             pool_row = _upsert_phone_locked(phones, phone_value, sms_url, now=now)
         else:
             pool_row["phone"] = phone_value
             pool_row["sms_code_url"] = sms_url
+        # A successfully recorded verification may be finalized after expiry,
+        # but neither a new verification nor consume_use=False may bypass it.
+        already_bound = bool(
+            account.get("phone_verified_at")
+            and _phone_key(account.get("phone")) == _phone_key(phone_value)
+        )
+        if _phone_expiration(pool_row)[0] and (consume_use or not already_bound):
+            raise sms_provider.SmsProviderError("手机号已过期；请更新过期时间或设为不过期")
         if consume_use:
             available = int(pool_row.get("available_uses") or 0)
             if available <= 0:
                 raise sms_provider.SmsProviderError("手机号可用次数不足；请先增加可用次数")
             pool_row["available_uses"] = available - 1
-        for other in phones:
-            if other is pool_row:
-                continue
-            other_ids = _id_list(other.get("assigned_account_ids") or other.get("assigned_account_id"))
-            if account_id in other_ids:
-                other_ids = [value for value in other_ids if value != account_id]
-                other["assigned_account_ids"] = other_ids
-                other["assigned_account_id"] = other_ids[-1] if other_ids else ""
-                other["updated_at"] = now
-        assigned_ids = _id_list(pool_row.get("assigned_account_ids") or pool_row.get("assigned_account_id"))
-        if account_id not in assigned_ids:
-            assigned_ids.append(account_id)
-        pool_row["assigned_account_ids"] = assigned_ids
-        pool_row["assigned_account_id"] = account_id
         pool_row["last_verified_at"] = now
         pool_row["updated_at"] = now
         account.update(
             phone=phone_value,
             sms_code_url=sms_url,
             phone_verified_at=now,
-            last_sms_phone=phone_value,
-            last_sms_code_url=sms_url,
             updated_at=now,
         )
         _write(_ACCOUNTS_PATH, accounts)
         _write(_PHONES_PATH, phones)
+
+
+def _validate_saved_codex_credential(
+    result: dict,
+    account: dict,
+    *,
+    proxy: str | None = None,
+) -> tuple[Path, dict, dict]:
+    """Validate and live-check the credential produced by one OAuth job.
+
+    OAuth drivers may report success after a remote callback has been accepted,
+    while the local record is only a callback receipt (or is missing entirely).
+    Treat the job as authorized only after the reported file is a JSON Codex
+    credential in the controlled SQLite-backed directory, belongs to the
+    requested account, contains both OAuth tokens, and passes one live usage
+    request through the same explicitly selected route.
+    """
+    if not isinstance(result, dict):
+        raise RuntimeError("Codex OAuth 返回结果格式无效")
+
+    result_file = str(result.get("file_path") or "").strip()
+    if not result_file:
+        raise RuntimeError("Codex OAuth 未返回凭证文件")
+    candidate = Path(result_file).expanduser()
+    if not candidate.is_absolute():
+        candidate = _ROOT / candidate
+    try:
+        credential_path = candidate.resolve()
+        credential_root = _CREDENTIAL_DIR.expanduser().resolve()
+    except (OSError, RuntimeError, TypeError):
+        raise RuntimeError("Codex OAuth 凭证路径无效") from None
+    if credential_path.parent != credential_root or credential_path.suffix.lower() != ".json":
+        raise RuntimeError("Codex OAuth 凭证未保存到受控目录")
+    try:
+        if not sqlite_store.file_exists(credential_path, category="codex_credentials"):
+            raise RuntimeError("Codex OAuth 凭证文件不存在")
+        credential = json.loads(
+            sqlite_store.read_text_file(credential_path, category="codex_credentials")
+        )
+    except RuntimeError:
+        raise
+    except Exception:
+        raise RuntimeError("无法读取 Codex OAuth 凭证") from None
+    if not isinstance(credential, dict):
+        raise RuntimeError("Codex OAuth 凭证格式无效")
+
+    access_token, _refresh_token, account_id = _validated_codex_credential_fields(credential, account)
+    expected_email = _email_key(account.get("email"))
+    result_email = _email_key(result.get("email"))
+    if result_email and result_email != expected_email:
+        raise RuntimeError("OAuth 凭证邮箱与目标 ChatGPT 账号不一致")
+    from core.chatgpt_plan import check_codex_usage
+
+    # Passing an explicit value makes the verification route deterministic:
+    # empty string means direct, while a configured account/profile proxy is
+    # used verbatim.  Do not silently fall back to another proxy pool here.
+    route_proxy = str(proxy or "").strip()
+    usage = check_codex_usage(access_token, account_id, proxy=route_proxy)
+    if not isinstance(usage, dict) or not usage.get("ok"):
+        raise RuntimeError("Codex 凭证在线验证失败")
+
+    # Return the pair only to the caller that already owns the job; never put
+    # either token in a job message, account list, or exception.
+    return credential_path, credential, usage
+
+
+def _validated_codex_credential_fields(credential: dict, account: dict) -> tuple[str, str, str]:
+    """Return the usable token pair only after validating one account's credential.
+
+    Refreshing a local JSON file proves that the refresh endpoint returned a
+    response, but it does not by itself prove that the response still contains
+    a complete credential for the requested ChatGPT account.  Keep this check
+    separate from the live usage request so maintenance jobs cannot mark an
+    account authorized from a partial refresh response.
+    """
+    if not isinstance(credential, dict):
+        raise RuntimeError("Codex OAuth 凭证格式无效")
+    access_token = _credential_text(credential, "access_token", "accessToken")
+    refresh_token = _credential_text(credential, "refresh_token", "refreshToken")
+    missing = [
+        name for name, value in (("access_token", access_token), ("refresh_token", refresh_token))
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(f"Codex OAuth 凭证缺少 {', '.join(missing)}")
+
+    expected_email = _email_key(account.get("email"))
+    credential_email = _email_key(_credential_text(credential, "email"))
+    if not expected_email or not credential_email or credential_email != expected_email:
+        raise RuntimeError("OAuth 凭证邮箱与目标 ChatGPT 账号不一致")
+    account_id = _credential_text(
+        credential, "account_id", "chatgpt_account_id", "accountId", "chatgptAccountId"
+    )
+    return access_token, refresh_token, account_id
 
 
 def _credential_path_for_account(account: dict) -> Path | None:
@@ -1607,9 +1779,8 @@ def _sub2_account_line(account: dict) -> str:
 
 
 def _sub2_phone_line(account: dict) -> str:
-    verified = bool(account.get("phone_verified_at"))
-    phone = str(account.get("phone") or (account.get("last_sms_phone") if verified else "") or "").strip()
-    sms_code_url = str(account.get("sms_code_url") or (account.get("last_sms_code_url") if verified else "") or "").strip()
+    phone = str(account.get("phone") or "").strip()
+    sms_code_url = str(account.get("sms_code_url") or "").strip()
     if not phone or not sms_code_url:
         return ""
     plain = _sub2_plain_line(phone, sms_code_url)
@@ -1627,12 +1798,10 @@ def _parse_sub2_notes(remote_item: dict) -> dict:
     lines = notes.split("\n")
     if not lines or lines[0].strip() != _SUB2_SYNC_MARKER:
         raise ValueError("备注没有新格式标记")
-    if len(lines) == 4 and lines[3].strip() in _SUB2_LEGACY_TRAILING_MARKERS:
-        lines = lines[:3]
     # Some sub2api versions trim the final blank line. Treat a two-line
     # response as the canonical empty third (phone) line.
     if len(lines) not in (2, 3):
-        raise ValueError("备注必须为两或三行；仅兼容末行“注册机自动转入”的旧格式")
+        raise ValueError("备注必须为两或三行")
     account_line = lines[1].strip()
     phone_line = lines[2].strip() if len(lines) == 3 else ""
     if not account_line:
@@ -2642,9 +2811,7 @@ def sync_accounts_from_sub2(service_id: str) -> dict:
         if not raw_lines or raw_lines[0].strip() != _SUB2_SYNC_MARKER:
             stats["skipped_unmarked"] += 1
             continue
-        if len(raw_lines) in (2, 3) or (
-            len(raw_lines) == 4 and raw_lines[3].strip() in _SUB2_LEGACY_TRAILING_MARKERS
-        ):
+        if len(raw_lines) in (2, 3):
             stats["marked"] += 1
         try:
             parsed = _parse_sub2_notes(remote_item)
@@ -2666,7 +2833,6 @@ def sync_accounts_from_sub2(service_id: str) -> dict:
     with _LOCK:
         accounts = _read(_ACCOUNTS_PATH)
         phones = _read(_PHONES_PATH)
-        _ensure_assignments_locked(accounts, phones)
         by_email = {str(row.get("email") or "").strip().lower(): row for row in accounts}
         candidates: list[dict] = []
         service_key = str(service.get("id") or "")
@@ -2801,8 +2967,6 @@ def sync_accounts_from_sub2(service_id: str) -> dict:
                     desired_phone = {
                         "phone": remote_phone,
                         "sms_code_url": remote_sms_url,
-                        "last_sms_phone": remote_phone,
-                        "last_sms_code_url": remote_sms_url,
                     }
                     for key, value in desired_phone.items():
                         if str(account.get(key) or "") != value:
@@ -2812,7 +2976,7 @@ def sync_accounts_from_sub2(service_id: str) -> dict:
                         account["phone_verified_at"] = now
                         changed = True
                 else:
-                    for key in ("phone", "sms_code_url", "phone_verified_at", "last_sms_phone", "last_sms_code_url"):
+                    for key in ("phone", "sms_code_url", "phone_verified_at"):
                         if account.get(key):
                             account[key] = ""
                             changed = True
@@ -2827,7 +2991,6 @@ def sync_accounts_from_sub2(service_id: str) -> dict:
             else:
                 stats["unchanged"] += 1
 
-        _ensure_assignments_locked(accounts, phones)
         _write(_ACCOUNTS_PATH, accounts)
         _write(_PHONES_PATH, phones)
     return {"ok": True, "service": _sub2_public_service(service), **stats, "errors": errors[:100]}
@@ -3138,7 +3301,6 @@ def delete_accounts(account_ids: list[str]) -> int:
         rows = _read(_ACCOUNTS_PATH)
         kept = [x for x in rows if x.get("id") not in ids]
         phones = _read(_PHONES_PATH)
-        _ensure_assignments_locked(kept, phones)
         _write(_ACCOUNTS_PATH, kept)
         _write(_PHONES_PATH, phones)
         return len(rows) - len(kept)
@@ -3189,6 +3351,7 @@ def _update_job(job_id: str, **changes) -> None:
 
 def _redact(message: str) -> str:
     text = _SENSITIVE_RE.sub(lambda m: f"{m.group(1)}=[已隐藏]", str(message or ""))
+    text = _OTP_CONTEXT_RE.sub(lambda m: f"{m.group(1)}[已隐藏]", text)
     def replace_url(match):
         if _show_full_urls():
             return match.group(0).rstrip(".,;:)]}")
@@ -3207,7 +3370,6 @@ def _redact(message: str) -> str:
         except Exception:
             return "[URL已隐藏]"
     text = re.sub(r"https?://\S+", replace_url, text)
-    text = _PHONE_RE.sub("[手机号已隐藏]", text)
     return text[:2000]
 
 
@@ -3248,8 +3410,6 @@ def _append_log(job_id: str, message: str) -> None:
             f"[{_now()}] {_redact(message)}\n",
             category="relay_logs",
             encoding="utf-8",
-            mode=0o600,
-            mirror=sqlite_store.legacy_mirror_allowed(path),
         )
 
 
@@ -3669,6 +3829,7 @@ def _run_job(
     account_id: str,
     phone_override: dict | None = None,
     execution_slot: _ExecutionSlot | None = None,
+    proxy: str | None = None,
 ) -> None:
     account = _get_account(account_id)
     override = phone_override if isinstance(phone_override, dict) else {}
@@ -3750,8 +3911,16 @@ def _run_job(
         with sms_context:
             from core.codex_oauth import run_codex_oauth
 
+            from config.proxy import resolve_proxy
+
+            # Existing accounts must not inherit the registration pool or an old
+            # Profile route. Explicit task overrides still pin the requested route.
+            account_proxy = resolve_proxy(
+                proxy if proxy is not None else saved_account_proxy(account)
+            )
             result = run_codex_oauth(
                 account["email"],
+                proxy=account_proxy,
                 otp_provider=email_provider,
                 force=True,
                 login_password=account.get("chatgpt_password") or None,
@@ -3782,6 +3951,21 @@ def _run_job(
                 )
             _update_job(job_id, stage=_oauth_failure_stage(failure), message="Codex 授权失败")
             raise RuntimeError(failure)
+        # Roxy returns the exact Profile route used for the PKCE exchange.
+        # Prefer that private in-process value so the callback and live check
+        # cannot silently use different network exits.
+        verification_proxy = result.pop("_verification_proxy", None)
+        if verification_proxy is not None:
+            if not isinstance(verification_proxy, str):
+                raise RuntimeError("授权流程未返回有效的已确认网络线路")
+            account_proxy = verification_proxy.strip()
+        profile_id = str(result.pop("_profile_id", "") or "").strip()
+        _update_job(job_id, stage="token_exchange", message="正在读取并在线验证 Codex 凭证")
+        credential_path, credential, usage = _validate_saved_codex_credential(
+            result,
+            account,
+            proxy=account_proxy,
+        )
         phone_verified = bool(result.get("phone_verified"))
         _update_account(
             account_id,
@@ -3789,7 +3973,21 @@ def _run_job(
             last_job_id=job_id,
             codex_status="authorized",
             codex_authorized_at=_now(),
-            result_file=result.get("file_path") or "",
+            result_file=str(credential_path),
+            codex_profile_id=profile_id,
+            # A temporary Roxy Profile can be deleted by OAuth cleanup. Keep
+            # its confirmed route in private storage, never in public records.
+            _codex_verified_proxy=account_proxy,
+            liveness_status="alive",
+            liveness_checked_at=usage.get("checked_at") or _now(),
+            quota_status="available" if usage.get("ok") else "error",
+            quota_checked_at=usage.get("checked_at") or _now(),
+            quota_plan=usage.get("plan_type") or "",
+            quota_summary=json.dumps(_safe_quota_result(usage), ensure_ascii=False, separators=(",", ":")),
+            quota_weekly_used_percent=usage.get("weekly_used_percent"),
+            quota_weekly_reset_at=usage.get("weekly_reset_at"),
+            quota_monthly_used_percent=usage.get("monthly_used_percent"),
+            quota_monthly_reset_at=usage.get("monthly_reset_at"),
         )
         if phone_verified and str(override.get("source_type") or "") == "platform":
             # Dynamic provider numbers are external resources; do not create
@@ -3797,8 +3995,7 @@ def _run_job(
             # audit fields while the provider owns release/usage accounting.
             _update_account(
                 account_id,
-                last_sms_phone=phone_state.get("phone") or "",
-                last_sms_provider=_SMS_PROVIDER_LABELS.get(str(override.get("platform_provider") or ""), str(override.get("platform_provider") or "")),
+                phone=phone_state.get("phone") or "",
                 phone_verified_at=_now(),
             )
         elif phone_verified:
@@ -3857,6 +4054,11 @@ def _run_job(
             _stop_events.pop(job_id, None)
 
 
+def _account_effective_proxy(account: dict) -> str:
+    """Saved account route wins; no binding means local network, never the pool."""
+    return saved_account_proxy(account)
+
+
 def _run_maintenance_job(job_id: str, account_id: str, action: str) -> None:
     account = _get_account(account_id)
     if not account:
@@ -3890,39 +4092,68 @@ def _run_maintenance_job(job_id: str, account_id: str, action: str) -> None:
             from core.chatgpt_plan import check_codex_usage
             from core.codex_oauth import CodexTokenRefreshError, refresh_codex_credential
 
+            account_proxy = _account_effective_proxy(account)
             credential_path = _credential_path_for_account(account)
             if not credential_path:
                 _update_account(
-                    account_id,
-                    liveness_status="error",
-                    liveness_checked_at=_now(),
-                    maintenance_status="failed",
-                    maintenance_action=action,
+                    account_id, codex_status="reauthorize", liveness_status="error",
+                    liveness_checked_at=_now(), maintenance_status="failed", maintenance_action=action,
                 )
                 raise RuntimeError("未找到本地 Codex 凭证，请先完成 Codex 授权")
             try:
-                credential = refresh_codex_credential(credential_path, proxy="")
+                credential = refresh_codex_credential(credential_path, proxy=account_proxy)
             except CodexTokenRefreshError as exc:
-                changes = {
-                    "liveness_status": "error",
-                    "liveness_checked_at": _now(),
-                    "maintenance_status": "failed",
-                    "maintenance_action": action,
-                }
+                _update_account(
+                    account_id,
+                    codex_status="reauthorize" if exc.reauthorization_required else "failed",
+                    liveness_status="error", liveness_checked_at=_now(),
+                    maintenance_status="failed", maintenance_action=action,
+                )
                 if exc.reauthorization_required:
-                    changes["codex_status"] = "reauthorize"
-                _update_account(account_id, **changes)
-                raise
+                    raise RuntimeError("Codex RT 已失效或被撤销，需要重新授权") from None
+                raise RuntimeError("Codex 凭证刷新失败") from None
+            except Exception:
+                _update_account(
+                    account_id, codex_status="failed", liveness_status="error",
+                    liveness_checked_at=_now(), maintenance_status="failed", maintenance_action=action,
+                )
+                raise RuntimeError("Codex 凭证刷新失败") from None
 
-            token = str(credential.get("access_token") or "").strip()
-            account_id_value = str(credential.get("account_id") or "").strip()
-            quota = check_codex_usage(token, account_id_value, proxy="")
+            try:
+                token, _refresh_token, account_id_value = _validated_codex_credential_fields(credential, account)
+            except RuntimeError:
+                _update_account(
+                    account_id, codex_status="reauthorize", liveness_status="error",
+                    liveness_checked_at=_now(), maintenance_status="failed", maintenance_action=action,
+                )
+                raise
+            try:
+                quota = check_codex_usage(token, account_id_value, proxy=account_proxy)
+            except Exception:
+                _update_account(
+                    account_id, codex_status="failed", liveness_status="error",
+                    liveness_checked_at=_now(), quota_status="error",
+                    maintenance_status="failed", maintenance_action=action,
+                )
+                raise RuntimeError("Codex 凭证在线验证失败") from None
+            if not isinstance(quota, dict) or not quota.get("ok"):
+                quota = quota if isinstance(quota, dict) else {}
+                _update_account(
+                    account_id,
+                    codex_status="reauthorize" if quota.get("needs_live_check") or quota.get("token_expired") else "failed",
+                    liveness_status="error", liveness_checked_at=_now(),
+                    quota_status="error", quota_checked_at=quota.get("checked_at") or _now(),
+                    quota_summary=json.dumps(_safe_quota_result(quota), ensure_ascii=False, separators=(",", ":")),
+                    maintenance_status="failed", maintenance_action=action,
+                )
+                raise RuntimeError("Codex 凭证在线验证失败")
+
             safe = _safe_quota_result(quota)
             _update_account(
                 account_id,
                 codex_status="authorized", liveness_status="alive", liveness_checked_at=_now(),
                 gpt_access_token=token, result_file=str(credential_path),
-                quota_status="available" if quota.get("ok") else "error",
+                quota_status="available",
                 quota_checked_at=quota.get("checked_at") or _now(),
                 quota_plan=quota.get("plan_type") or "",
                 quota_summary=json.dumps(safe, ensure_ascii=False, separators=(",", ":")),
@@ -3932,15 +4163,12 @@ def _run_maintenance_job(job_id: str, account_id: str, action: str) -> None:
                 quota_monthly_reset_at=quota.get("monthly_reset_at"),
                 maintenance_status="success", maintenance_action=action,
             )
-            if quota.get("ok"):
-                plan = quota.get("plan_type") or "未知套餐"
-                weekly = quota.get("weekly_used_percent")
-                monthly = quota.get("monthly_used_percent")
-                weekly_label = f"{float(weekly):g}%" if weekly is not None else "-"
-                monthly_label = f"-月{float(monthly):g}%" if monthly is not None else ""
-                message = f"GPT 账号存活：{plan}-周{weekly_label}{monthly_label}"
-            else:
-                message = "GPT 账号存活，套餐与限额查询失败"
+            plan = quota.get("plan_type") or "未知套餐"
+            weekly = quota.get("weekly_used_percent")
+            monthly = quota.get("monthly_used_percent")
+            weekly_label = f"{float(weekly):g}%" if weekly is not None else "-"
+            monthly_label = f"-月{float(monthly):g}%" if monthly is not None else ""
+            message = f"GPT 账号存活：{plan}-周{weekly_label}{monthly_label}"
             _update_job(
                 job_id,
                 status="success",
@@ -3961,15 +4189,16 @@ def _run_maintenance_job(job_id: str, account_id: str, action: str) -> None:
                 credential = json.loads(sqlite_store.read_text_file(credential_path, category="codex_credentials"))
             except Exception as exc:
                 raise RuntimeError(f"无法读取 Codex 凭证：{type(exc).__name__}") from exc
+            account_proxy = _account_effective_proxy(account)
             token = str(credential.get("access_token") or account.get("gpt_access_token") or "").strip()
             account_id_value = str(credential.get("account_id") or "").strip()
-            result = check_codex_usage(token, account_id_value, proxy="")
+            result = check_codex_usage(token, account_id_value, proxy=account_proxy)
             if result.get("needs_live_check"):
-                credential = refresh_codex_credential(credential_path, proxy="")
+                credential = refresh_codex_credential(credential_path, proxy=account_proxy)
                 token = str(credential.get("access_token") or "").strip()
                 account_id_value = str(credential.get("account_id") or account_id_value).strip()
                 _update_account(account_id, gpt_access_token=token, codex_status="authorized")
-                result = check_codex_usage(token, account_id_value, proxy="")
+                result = check_codex_usage(token, account_id_value, proxy=account_proxy)
             safe = _safe_quota_result(result)
             _update_account(
                 account_id,
@@ -4081,6 +4310,18 @@ def _run_maintenance_job(job_id: str, account_id: str, action: str) -> None:
     except RelayStopped:
         _update_job(job_id, status="stopped", stage="stopped", message="任务已停止", completed_at=_now(), waiting_since="")
         _update_account(account_id, maintenance_status="stopped", maintenance_action=action)
+    except RoxyProfileRouteError as exc:
+        # No network request was made; mark only this check as inconclusive and
+        # preserve the saved credential/authorization until its route returns.
+        changes = {"maintenance_status": "failed", "maintenance_action": action}
+        if action == "check_gpt_liveness":
+            changes.update(liveness_status="error", liveness_checked_at=_now())
+        elif action == "check_quota":
+            changes.update(quota_status="error", quota_checked_at=_now())
+        _update_account(account_id, **changes)
+        message = _redact(f"{type(exc).__name__}: {exc}")
+        _update_job(job_id, status="failed", stage="failed", message="账号维护失败", error=message, completed_at=_now(), waiting_since="")
+        _append_log(job_id, message)
     except Exception as exc:
         message = _redact(f"{type(exc).__name__}: {exc}")
         _update_job(job_id, status="failed", stage="failed", message="账号维护失败", error=message, completed_at=_now(), waiting_since="")
@@ -4110,10 +4351,6 @@ def start_account_actions(account_ids: list[str], action: str, workers: int = 1)
     with _LOCK:
         accounts = _read(_ACCOUNTS_PATH)
         phones = _read(_PHONES_PATH)
-        _assigned, changed = _ensure_assignments_locked(accounts, phones)
-        if changed:
-            _write(_ACCOUNTS_PATH, accounts)
-            _write(_PHONES_PATH, phones)
         known = {str(x.get("id")): x for x in accounts}
         if any(account_id not in known for account_id in ids):
             raise ValueError("包含不存在的账号")
@@ -4137,7 +4374,7 @@ def start_account_actions(account_ids: list[str], action: str, workers: int = 1)
             _active_accounts.add(account_id)
             _stop_events[job["id"]] = threading.Event()
             path = _log_path(job["id"])
-            sqlite_store.write_file(path, b"", category="relay_logs", mode=0o600, mirror=sqlite_store.legacy_mirror_allowed(path))
+            sqlite_store.write_file(path, b"", category="relay_logs")
         _write(_JOBS_PATH, rows)
         _write(_ACCOUNTS_PATH, accounts)
         _write(_PHONES_PATH, phones)
@@ -4164,10 +4401,6 @@ def start_jobs(account_ids: list[str], workers: int = 1, phone_ids: list[str] | 
     with _LOCK:
         accounts = _read(_ACCOUNTS_PATH)
         phones = _read(_PHONES_PATH)
-        _assigned, changed = _ensure_assignments_locked(accounts, phones)
-        if changed:
-            _write(_ACCOUNTS_PATH, accounts)
-            _write(_PHONES_PATH, phones)
         known = {x.get("id"): x for x in accounts}
         unknown = [x for x in ids if x not in known]
         if unknown:
@@ -4235,6 +4468,9 @@ def start_jobs(account_ids: list[str], workers: int = 1, phone_ids: list[str] | 
                 "stage": "queued",
                 "message": "等待执行",
                 "created_at": _now(),
+                # Keep the route only in the private job record; _public_job
+                # intentionally omits it so credentials never reach the UI.
+                "proxy": str(known[account_id].get("proxy") or "").strip() or None,
             }
             bound_key = _phone_key(known[account_id].get("phone")) if known[account_id].get("phone_verified_at") else ""
             # Keep a hint only for an explicitly selected phone or a ready
@@ -4264,7 +4500,7 @@ def start_jobs(account_ids: list[str], workers: int = 1, phone_ids: list[str] | 
             _active_accounts.add(account_id)
             _stop_events[job["id"]] = threading.Event()
             path = _log_path(job["id"])
-            sqlite_store.write_file(path, b"", category="relay_logs", mode=0o600, mirror=sqlite_store.legacy_mirror_allowed(path))
+            sqlite_store.write_file(path, b"", category="relay_logs")
         _write(_JOBS_PATH, rows)
         _write(_ACCOUNTS_PATH, accounts)
         _write(_PHONES_PATH, phones)
@@ -4282,6 +4518,7 @@ def start_jobs(account_ids: list[str], workers: int = 1, phone_ids: list[str] | 
                     job["account_id"],
                     job.get("phone_override"),
                     slots[job["id"]],
+                    job.get("proxy"),
                 )
                 for job in jobs
             ]
@@ -4347,7 +4584,7 @@ def delete_jobs(job_ids) -> dict:
 
     for job_id in deleted_ids:
         _release_phone_reservation(job_id)
-        sqlite_store.delete_file(_log_path(job_id), category="relay_logs", delete_mirror=True)
+        sqlite_store.delete_file(_log_path(job_id), category="relay_logs")
     return {
         "ok": True,
         "deleted": len(deleted_ids),

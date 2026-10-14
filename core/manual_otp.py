@@ -69,11 +69,11 @@ def submit_manual_otp(email: str, code: str) -> dict:
         raise ValueError("验证码为空")
     if not code.isdigit() or len(code) not in (4, 5, 6, 7, 8):
         # OpenAI 通常 6 位；放宽一点兼容
-        raise ValueError(f"验证码格式看起来不对: {code!r}")
+        raise ValueError("验证码格式看起来不对")
     with _lock:
         _codes[key].append(code)
         _event_for(key).set()
-    logger.info("[ManualOTP] 已提交验证码：email=%s code=%s", email, code)
+    logger.info("[ManualOTP] 已提交验证码：email=%s", email)
     return {"ok": True, "email": email, "code": code}
 
 

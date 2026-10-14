@@ -12,21 +12,20 @@ Flask 本地控制台。
 默认绑定 127.0.0.1，仅本地访问。
 """
 import logging
-import threading
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 
-from core import codex_retry_service, codex_relay_service, gpt_account_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service, sqlite_store
+from core import (
+    codex_retry_service, codex_relay_service, gpt_account_service, db,
+    plan_check_service, extract_link_service, codex_agent_service,
+    live_check_service, sqlite_store,
+)
 from core.import_parser import (
     clean_import_value,
     is_email,
-    is_http_url,
-    looks_like_access_token,
-    looks_like_totp,
     parse_account_material_line,
     split_import_line,
 )
@@ -82,72 +81,39 @@ def _paginate_items(items: list[dict], *, page: int, page_size: int) -> dict:
     }
 
 
-def _compact_account_for_list(row: dict) -> dict:
-    """账号列表轻量对象：只返回当前表格渲染和按钮判断必需字段。
-
-    原则：
-    - 不返回完整 Token / Token 预览 / TOTP Secret / Agent Token。
-    - 时间戳、错误原因、提链详情等只在前端确实要展示时返回；空值不返回。
-    - 复制/下载敏感内容时再通过 /secret 接口按需读取。
-    """
-    out = {
-        "id": row.get("id"),
-        "email": row.get("email"),
-        "has_access_token": bool(str(row.get("access_token") or "").strip()),
-        "totp_enabled": bool(row.get("totp_secret")),
-        "codex_agent_has_token": bool(str(row.get("codex_agent_token") or "").strip()),
-    }
-
-    # 这些是列表固定列直接展示字段。
-    for key in (
-        "user_name", "email_source", "note", "archived", "created_at",
-        "plan_type", "current_plan_type", "plus_trial_eligible",
-        "plan_check_status", "codex_status", "codex_agent_status",
-    ):
-        if key in row:
-            out[key] = row.get(key)
-
-    if row.get("plan_check_status") in ("queued", "running") or row.get("plan_check_ok") is False:
-        out["plan_check_ok"] = row.get("plan_check_ok")
-
-    # 下面字段仅在有值时返回，避免每行堆满 null/空字符串/内部状态。
-    optional_keys = (
-        # 套餐展示补充：付费到期/折扣/失败原因。
-        "plan_check_error", "plan_expires_at", "plan_renews_at", "renews_at",
-        "billing_period", "billing_currency", "discount_amount", "discount_type",
-        "discount_expires_at", "discount_promo_campaign_id",
-        "token_expired", "token_expires_at",
-        # 查活状态。
-        "live_check_status", "live_check_error", "live_checked_at",
-        # 提链成功/失败时才需要。
-        "extract_link_status", "extract_link_type", "extract_link_message", "extract_link_error",
-        "extract_link_long_url", "extract_link_copy_paste", "extract_link_image_url_png",
-        "extract_link_image_url_svg", "extract_link_expires_at",
-        # Codex / Agent 状态提示。
-        "codex_error", "codex_agent_message", "codex_agent_runtime_id",
-        "codex_agent_sub2api_url", "codex_agent_sub2api_mode", "codex_agent_sub2api_total",
-    )
-    for key in optional_keys:
-        value = row.get(key)
-        if value is not None and value != "":
-            out[key] = value
-    plan = str(row.get("current_plan_type") or row.get("plan_type") or "").lower()
-    if any(x in plan for x in ("plus", "pro", "team", "go")):
-        expire = row.get("expires_at")
-        if expire:
-            out["expires_at"] = expire
-    return out
+# The GPT account row is also the durable credential record. List/edit
+# responses only expose fields used for the workspace display; a new stored
+# field must not silently become part of the HTTP response.
+_PUBLIC_GPT_ACCOUNT_FIELDS = frozenset({
+    "id", "email", "registration_status", "registration_status_raw",
+    "codex_status", "codex_status_raw", "phone_status", "phone", "phone_number",
+    "sms_code_url", "sms_provider", "phone_verified_at", "password",
+    "chatgpt_password", "totp_secret", "email_code_url", "login_method",
+    "has_password", "has_totp", "has_email_code_url", "has_phone",
+    "has_sms_code_url", "has_proxy", "proxy_source", "proxy_display", "email_provider",
+    "email_provider_label", "gpt_status", "liveness_status", "quota_plan",
+    "plan", "quota_status", "note", "created_at", "updated_at",
+    "password_changed_at", "twofa_enabled_at", "codex_authorized_at",
+    "registration_job_id", "codex_job_id", "codex_job_kind",
+    "registration_job", "codex_job", "maintenance_job", "latest_log",
+    "logs", "log_count", "active_operation", "active_operation_label",
+    "sub2_service_id", "sub2_account_id", "sub2_status", "sub2_checked_at",
+    "sub2_deleted_at", "sub2_liveness_status", "sub2_account_status",
+    "sub2_schedulable", "sub2_quota_plan", "sub2_quota_allowed",
+    "sub2_quota_limit_reached", "sub2_quota_primary_used_percent",
+    "sub2_quota_primary_window_seconds", "sub2_quota_primary_reset_at",
+    "sub2_quota_primary_reset_after_seconds", "sub2_five_hour_utilization",
+    "sub2_five_hour_resets_at", "sub2_five_hour_remaining_seconds",
+    "sub2_five_hour_stats", "sub2_seven_day_utilization",
+    "sub2_seven_day_resets_at", "sub2_seven_day_remaining_seconds",
+    "sub2_seven_day_stats", "sub2_credentials_update_status",
+    "sub2_credentials_updated_at", "sub2_refresh_status", "sub2_refresh_at",
+    "sub2_refresh_error", "sub2_status_error", "sub2_synced_at",
+})
 
 
-def _account_secret_value(row: dict, field: str) -> str:
-    field = (field or "").strip()
-    if field == "access_token":
-        return str(row.get("access_token") or "")
-    if field == "copy_line":
-        return str(row.get("copy_line") or "")
-    if field == "codex_agent_token":
-        return str(row.get("codex_agent_token") or "")
-    raise ValueError("field 仅支持 access_token/copy_line/codex_agent_token")
+def _public_gpt_account(row: dict) -> dict:
+    return {key: value for key, value in row.items() if key in _PUBLIC_GPT_ACCOUNT_FIELDS}
 
 
 def _compact_job_for_list(row: dict) -> dict:
@@ -179,6 +145,39 @@ def _job_status_counts(rows: list[dict]) -> dict:
     counts["active"] = sum(int(counts.get(s, 0) or 0) for s in ("pending", "running", "stopping"))
     return counts
 
+
+def _select_gpt_accounts(requested_ids: list) -> dict:
+    """Resolve selected rows from the canonical GPT account collection."""
+    requested = [str(value).strip() for value in (requested_ids or []) if str(value).strip()]
+    if not requested:
+        raise ValueError("请先选择 GPT 账号")
+
+    rows = gpt_account_service.list_accounts()
+    by_id = {str(row.get("id") or ""): row for row in rows}
+    selected = []
+    missing = []
+    seen = set()
+    for account_id in requested:
+        row = by_id.get(account_id)
+        if row is None:
+            missing.append(account_id)
+            continue
+        row_id = str(row.get("id") or "")
+        if row_id and row_id not in seen:
+            selected.append(row)
+            seen.add(row_id)
+    if missing:
+        raise LookupError(f"找不到 GPT 账号：{', '.join(missing[:3])}")
+
+    not_registered = [str(row.get("email") or "") for row in selected if row.get("registration_status") != "registered"]
+    if not_registered:
+        raise RuntimeError(f"以下账号尚未完成 GPT 注册：{', '.join(not_registered[:3])}")
+    return {
+        "selected": selected,
+        "account_ids": [str(row.get("id")) for row in selected],
+    }
+
+
 def create_app() -> Flask:
     project_root = Path(__file__).resolve().parents[2]
     react_dist = project_root / "web" / "dist"
@@ -191,10 +190,9 @@ def create_app() -> Flask:
 
     def _put_prepared_download(content: bytes, filename: str, mimetype: str = "application/zip") -> str:
         now = time.time()
-        # 顺手清理 10 分钟前的临时下载，避免内存堆积。
-        for k, v in list(_prepared_downloads.items()):
-            if now - float(v.get("created_at") or 0) > 600:
-                _prepared_downloads.pop(k, None)
+        for key, value in list(_prepared_downloads.items()):
+            if now - float(value.get("created_at") or 0) > 600:
+                _prepared_downloads.pop(key, None)
         download_id = uuid.uuid4().hex
         _prepared_downloads[download_id] = {
             "content": bytes(content),
@@ -218,16 +216,14 @@ def create_app() -> Flask:
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "Content-Length": str(len(content)),
-                "Cache-Control": "no-store, max-age=0",
+                "Cache-Control": "no-store",
                 "Pragma": "no-cache",
                 "X-Content-Type-Options": "nosniff",
                 "X-Download-Options": "noopen",
             },
         )
 
-    # Import any still-present legacy input before recovery workers inspect it.
-    # SQLite is authoritative after this idempotent migration; normal runtime
-    # writes never create JSON/TXT/HTML mirrors in the repository.
+    # Initialize current collections and recover interrupted in-flight work.
     try:
         storage_info = db.initialize_storage()
         relay_storage_info = codex_relay_service.initialize_storage()
@@ -253,13 +249,9 @@ def create_app() -> Flask:
     recovered_codex_agents = db.recover_interrupted_codex_agents()
     if recovered_codex_agents:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的 Codex Agent Token 状态", recovered_codex_agents)
-    recovered_codex_relay = codex_relay_service.recover_interrupted_jobs()
-    if recovered_codex_relay:
-        logger.warning("已停止 %s 个因 WebUI 重启中断的 GPT 账号 Codex 接码任务", recovered_codex_relay)
-
-    # ----------------------------------------------------------
-    # 页面
-    # ----------------------------------------------------------
+    recovered_codex_jobs = codex_relay_service.recover_interrupted_jobs()
+    if recovered_codex_jobs:
+        logger.warning("已停止 %s 个因 WebUI 重启中断的 GPT 账号 Codex 接码任务", recovered_codex_jobs)
     @app.get("/")
     def index():
         if not (react_dist / "index.html").is_file():
@@ -293,11 +285,6 @@ def create_app() -> Flask:
         domain_pool = db.domain_email_pool_summary()
         gpt_accounts = gpt_account_service.list_accounts()
         email_runtime = registration_email_status()
-        # Kept for older WebUI bundles during a rolling local restart.
-        email_runtime["mailnest_configured"] = any(
-            item["id"] == "mailnest" and item["configured"]
-            for item in email_runtime["channels"]
-        )
         return jsonify({
             "accounts": len(gpt_accounts),
             "outlook_total": pool.get("total", 0),
@@ -310,1005 +297,6 @@ def create_app() -> Flask:
             "domain_failed": domain_pool.get("failed", 0),
             "registration_email": email_runtime,
         })
-
-    # ----------------------------------------------------------
-    # 已注册账号
-    # ----------------------------------------------------------
-    @app.get("/api/accounts")
-    def api_accounts():
-        limit = request.args.get("limit", default=500, type=int)
-        archived = str(request.args.get("archived", default="0") or "0").lower()
-        plan_filter = str(request.args.get("plan", default="") or "").lower()
-        q = str(request.args.get("q", default="") or "").strip()
-        # 新分页接口：传 page/page_size 或 paged=1 时返回 {items,total,page,page_size,...}
-        paged = str(request.args.get("paged", default="") or "").lower() in {"1", "true", "yes"}
-        page_arg = request.args.get("page", default=None, type=int)
-        page_size_arg = request.args.get("page_size", default=None, type=int)
-        if paged or page_arg is not None or page_size_arg is not None:
-            page = max(1, int(page_arg or 1))
-            page_size = max(1, min(500, int(page_size_arg or limit or 50)))
-            offset = (page - 1) * page_size
-            result = db.list_accounts_page(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, q=q)
-            result["items"] = [_compact_account_for_list(r) for r in (result.get("items") or [])]
-            result.update({"ok": True, "page": page, "page_size": page_size, "compact": True})
-            return jsonify(result)
-        return jsonify(db.list_accounts(limit=limit, archived=archived, plan_filter=plan_filter, q=q))
-
-    @app.get("/api/accounts/plan-check-status")
-    def api_account_plan_check_status():
-        """套餐查询轻量状态，不返回 Token、邮箱密码等敏感字段。"""
-        limit = request.args.get("limit", default=5000, type=int)
-        archived = str(request.args.get("archived", default="0") or "0").lower()
-        plan_filter = str(request.args.get("plan", default="") or "").lower()
-        q = str(request.args.get("q", default="") or "").strip()
-        page_arg = request.args.get("page", default=None, type=int)
-        page_size_arg = request.args.get("page_size", default=None, type=int)
-        if page_arg is not None or page_size_arg is not None:
-            page = max(1, int(page_arg or 1))
-            page_size = max(1, min(500, int(page_size_arg or limit or 50)))
-            offset = (page - 1) * page_size
-            snapshot = db.list_account_plan_check_statuses(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, q=q)
-            snapshot.update({"page": page, "page_size": page_size})
-        else:
-            snapshot = db.list_account_plan_check_statuses(limit=max(1, min(5000, limit)), archived=archived, plan_filter=plan_filter, q=q)
-        snapshot["queue"] = plan_check_service.queue_settings()
-        return jsonify(snapshot)
-
-
-    @app.get("/api/accounts/<int:acc_id>/secret")
-    def api_account_secret(acc_id: int):
-        """按需读取单账号敏感值，避免账号列表一次性下发完整 Token/整行。"""
-        field = str(request.args.get("field") or "").strip()
-        acc = db.get_account(acc_id)
-        if not acc:
-            return jsonify({"ok": False, "error": "账号不存在"}), 404
-        try:
-            value = _account_secret_value(acc, field)
-        except ValueError as exc:
-            return jsonify({"ok": False, "error": str(exc)}), 400
-        return jsonify({"ok": True, "id": acc_id, "field": field, "value": value})
-
-    @app.post("/api/accounts/secret-bulk")
-    def api_accounts_secret_bulk():
-        """按需批量读取账号敏感值。Body {account_ids:[...], field}."""
-        data = request.get_json(silent=True) or {}
-        ids = data.get("account_ids") or data.get("ids") or []
-        field = str(data.get("field") or "").strip()
-        if not isinstance(ids, list) or not ids:
-            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
-        if len(ids) > 5000:
-            return jsonify({"ok": False, "error": "单次最多读取 5000 个账号"}), 400
-        values = []
-        skipped = []
-        seen = set()
-        for raw in ids:
-            try:
-                acc_id = int(raw)
-            except (TypeError, ValueError):
-                skipped.append({"id": raw, "reason": "ID 非法"})
-                continue
-            if acc_id in seen:
-                continue
-            seen.add(acc_id)
-            acc = db.get_account(acc_id)
-            if not acc:
-                skipped.append({"id": acc_id, "reason": "账号不存在"})
-                continue
-            try:
-                value = _account_secret_value(acc, field)
-            except ValueError as exc:
-                return jsonify({"ok": False, "error": str(exc)}), 400
-            if value:
-                values.append({"id": acc_id, "email": acc.get("email"), "value": value})
-            else:
-                skipped.append({"id": acc_id, "email": acc.get("email"), "reason": "值为空"})
-        return jsonify({"ok": True, "field": field, "values": values, "count": len(values), "skipped": skipped})
-
-    @app.post("/api/accounts/<int:acc_id>/archive")
-    def api_account_archive(acc_id: int):
-        """归档/取消归档一个账号。Body {archived: true|false}。"""
-        data = request.get_json(silent=True) or {}
-        archived = bool(data.get("archived", True))
-        updated = db.archive_account(acc_id=acc_id, archived=archived)
-        if not updated:
-            return jsonify({"ok": False, "error": "账号不存在"}), 404
-        return jsonify({"ok": True, "updated": True, "id": acc_id, "archived": archived})
-
-    @app.post("/api/accounts/archive-bulk")
-    def api_accounts_archive_bulk():
-        """批量归档/取消归档账号。Body {account_ids:[...], archived:true|false}。"""
-        data = request.get_json(silent=True) or {}
-        ids = data.get("account_ids") or data.get("ids") or []
-        archived = bool(data.get("archived", True))
-        if not isinstance(ids, list) or not ids:
-            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
-        if len(ids) > 5000:
-            return jsonify({"ok": False, "error": "单次最多归档 5000 个账号"}), 400
-        account_ids = []
-        skipped = []
-        seen = set()
-        for raw in ids:
-            try:
-                acc_id = int(raw)
-            except (TypeError, ValueError):
-                skipped.append({"id": raw, "reason": "ID 非法"})
-                continue
-            if acc_id in seen:
-                continue
-            seen.add(acc_id)
-            account_ids.append(acc_id)
-        updated, db_skipped = db.archive_accounts(account_ids=account_ids, archived=archived)
-        skipped.extend(db_skipped)
-        return jsonify({"ok": True, "updated": updated, "updated_count": len(updated), "archived": archived, "skipped": skipped})
-
-    @app.post("/api/accounts/<int:acc_id>/delete")
-    def api_account_delete(acc_id: int):
-        """删除一个已注册账号记录。只删除本地保存的账号/token记录，不改邮箱池状态。"""
-        deleted = db.delete_account(acc_id=acc_id)
-        if not deleted:
-            return jsonify({"ok": False, "error": "账号不存在"}), 404
-        return jsonify({"ok": True, "deleted": True})
-
-    @app.post("/api/accounts/delete-bulk")
-    def api_accounts_delete_bulk():
-        """批量删除已注册账号记录。Body {account_ids: [...]} 或 {ids: [...]}。"""
-        data = request.get_json(silent=True) or {}
-        ids = data.get("account_ids") or data.get("ids") or []
-        if not isinstance(ids, list) or not ids:
-            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
-        if len(ids) > 5000:
-            return jsonify({"ok": False, "error": "单次最多删除 5000 个账号"}), 400
-        account_ids = []
-        skipped = []
-        seen = set()
-        for raw in ids:
-            try:
-                acc_id = int(raw)
-            except (TypeError, ValueError):
-                skipped.append({"id": raw, "reason": "ID 非法"})
-                continue
-            if acc_id in seen:
-                continue
-            seen.add(acc_id)
-            account_ids.append(acc_id)
-        deleted, db_skipped = db.delete_accounts(account_ids=account_ids)
-        skipped.extend(db_skipped)
-        return jsonify({
-            "ok": True,
-            "deleted": deleted,
-            "deleted_count": len(deleted),
-            "skipped": skipped,
-        })
-
-    @app.post("/api/accounts/<int:acc_id>/note")
-    def api_account_note(acc_id: int):
-        """更新单个已注册账号备注。Body {note: "..."}，空字符串表示清空。"""
-        data = request.get_json(silent=True) or {}
-        note = str(data.get("note") or "")
-        if len(note) > 2000:
-            return jsonify({"ok": False, "error": "备注最多 2000 个字符"}), 400
-        updated = db.update_account_note(acc_id=acc_id, note=note)
-        if not updated:
-            return jsonify({"ok": False, "error": "账号不存在"}), 404
-        return jsonify({"ok": True, "updated": True, "id": acc_id, "note": note})
-
-    @app.post("/api/accounts/note-bulk")
-    def api_accounts_note_bulk():
-        """批量更新已注册账号备注。Body {account_ids: [...], note: "..."}，空字符串表示清空。"""
-        data = request.get_json(silent=True) or {}
-        ids = data.get("account_ids") or data.get("ids") or []
-        note = str(data.get("note") or "")
-        if not isinstance(ids, list) or not ids:
-            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
-        if len(ids) > 5000:
-            return jsonify({"ok": False, "error": "单次最多备注 5000 个账号"}), 400
-        if len(note) > 2000:
-            return jsonify({"ok": False, "error": "备注最多 2000 个字符"}), 400
-
-        account_ids = []
-        skipped = []
-        seen = set()
-        for raw in ids:
-            try:
-                acc_id = int(raw)
-            except (TypeError, ValueError):
-                skipped.append({"id": raw, "reason": "ID 非法"})
-                continue
-            if acc_id in seen:
-                continue
-            seen.add(acc_id)
-            account_ids.append(acc_id)
-        updated, db_skipped = db.update_accounts_note(account_ids=account_ids, note=note)
-        skipped.extend(db_skipped)
-        return jsonify({
-            "ok": True,
-            "updated": updated,
-            "updated_count": len(updated),
-            "skipped": skipped,
-            "skipped_count": len(skipped),
-        })
-
-    @app.post("/api/accounts/check-live-bulk")
-    def api_accounts_check_live_bulk():
-        """批量查活：加入后台队列；协议 BrowserSession 指纹环境重新登录并刷新最新 AT。"""
-        data = request.get_json(silent=True) or {}
-        ids = data.get("account_ids") or data.get("ids") or []
-        if not isinstance(ids, list) or not ids:
-            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
-        if len(ids) > 500:
-            return jsonify({"ok": False, "error": "单次最多查活 500 个账号"}), 400
-
-        account_ids: list[int] = []
-        skipped: list[dict] = []
-        seen = set()
-        for raw in ids:
-            try:
-                acc_id = int(raw)
-            except (TypeError, ValueError):
-                skipped.append({"id": raw, "reason": "ID 非法"})
-                continue
-            if acc_id in seen:
-                continue
-            seen.add(acc_id)
-            account_ids.append(acc_id)
-
-        accounts = []
-        for acc_id in account_ids:
-            acc = db.get_account(acc_id)
-            if not acc:
-                skipped.append({"id": acc_id, "reason": "账号不存在"})
-                continue
-            email = str(acc.get("email") or "").strip()
-            if not email:
-                skipped.append({"id": acc_id, "reason": "邮箱为空"})
-                continue
-            accounts.append(acc)
-
-        started = []
-        busy_count = 0
-        failed = []
-        for acc in accounts:
-            acc_id = int(acc.get("id") or 0)
-            email = str(acc.get("email") or "")
-            queued = live_check_service.enqueue_account_live_check(
-                account_id=acc_id,
-                email=email,
-                trigger="manual",
-                # 查活按“查套餐”同一套网络选路：
-                # PLAN_CHECK_PROXY_MODE / PLAN_CHECK_PROXY / PROXY_POOL。
-                # 不复用账号注册时的 proxy_used，避免旧注册出口被 CF 403 后一直失败。
-                proxy=None,
-            )
-            if queued.get("accepted"):
-                started.append({"id": acc_id, "email": email, "status": "queued"})
-            elif queued.get("busy"):
-                busy_count += 1
-                skipped.append({"id": acc_id, "email": email, "reason": queued.get("error") or "正在查活"})
-            else:
-                failed.append({"id": acc_id, "email": email, "error": queued.get("error") or "入队失败"})
-
-        return jsonify({
-            "ok": True,
-            "message": f"已入队 {len(started)} 个查活任务",
-            "started": started,
-            "started_count": len(started),
-            "busy_count": busy_count,
-            "failed": failed,
-            "failed_count": len(failed),
-            "skipped": skipped,
-            "queue": live_check_service.queue_settings(),
-        }), 202
-
-
-    @app.post("/api/accounts/check-plan")
-    def api_account_check_plan():
-        """把单账号套餐查询加入后台队列。Body {account_id|email, proxy?, timezone_offset_min?}"""
-        data = request.get_json(silent=True) or {}
-        acc_id = data.get("account_id") or data.get("id")
-        email = (data.get("email") or "").strip()
-        acc = None
-        if acc_id is not None:
-            try:
-                acc = db.get_account(int(acc_id))
-            except Exception:
-                acc = None
-        if acc is None and email:
-            acc = db.get_account_by_email(email)
-        if not acc:
-            return jsonify({"ok": False, "error": "账号不存在"}), 404
-        token = (acc.get("access_token") or "").strip()
-        if not token:
-            return jsonify({"ok": False, "error": "该账号没有 access_token"}), 400
-        account_id = int(acc.get("id"))
-        queued = plan_check_service.enqueue_account_plan_check(
-            account_id=account_id,
-            email=acc.get("email") or "",
-            access_token=token,
-            trigger="manual",
-            proxy=data.get("proxy") if "proxy" in data else None,
-            timezone_offset_min=str(data.get("timezone_offset_min") or "-"),
-        )
-        if queued.get("busy"):
-            return jsonify({"ok": False, **queued}), 409
-        if not queued.get("accepted"):
-            return jsonify({"ok": False, **queued}), 503
-        return jsonify({"ok": True, "started": True, **queued}), 202
-
-    @app.post("/api/accounts/check-plan-bulk")
-    def api_accounts_check_plan_bulk():
-        """批量把套餐查询加入统一后台队列。Body {account_ids:[...], proxy?, timezone_offset_min?}"""
-        data = request.get_json(silent=True) or {}
-        ids = data.get("account_ids") or data.get("ids") or []
-        if not isinstance(ids, list) or not ids:
-            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
-        if len(ids) > 500:
-            return jsonify({"ok": False, "error": "单次最多查询 500 个账号"}), 400
-        # 与单账号查询保持一致：未传时使用独立网络策略。
-        proxy = data.get("proxy") if "proxy" in data else None
-        timezone_offset_min = str(data.get("timezone_offset_min") or "-")
-
-        items = []
-        skipped = []
-        seen = set()
-        for raw in ids:
-            try:
-                acc_id = int(raw)
-            except Exception:
-                skipped.append({"id": raw, "reason": "ID 非法"})
-                continue
-            if acc_id in seen:
-                continue
-            seen.add(acc_id)
-            acc = db.get_account(acc_id)
-            if not acc:
-                skipped.append({"id": acc_id, "reason": "账号不存在"})
-                continue
-            if not (acc.get("access_token") or "").strip():
-                skipped.append({"id": acc_id, "email": acc.get("email"), "reason": "缺少 access_token"})
-                continue
-            items.append(acc)
-
-        started = []
-        busy = []
-        failed = []
-        for acc in items:
-            queued = plan_check_service.enqueue_account_plan_check(
-                account_id=int(acc.get("id")),
-                email=acc.get("email") or "",
-                access_token=acc.get("access_token") or "",
-                trigger="manual_bulk",
-                proxy=proxy,
-                timezone_offset_min=timezone_offset_min,
-            )
-            item = {"id": acc.get("id"), "email": acc.get("email"), **queued}
-            if queued.get("accepted"):
-                started.append(item)
-            elif queued.get("busy"):
-                busy.append(item)
-            else:
-                failed.append(item)
-        return jsonify({
-            "ok": True,
-            "started": started,
-            "started_count": len(started),
-            "busy": busy,
-            "busy_count": len(busy),
-            "failed": failed,
-            "failed_count": len(failed),
-            "skipped": skipped,
-            "skipped_count": len(skipped),
-        }), 202
-
-    @app.get("/api/extract-link/cdk")
-    def api_extract_link_cdk():
-        """查询当前配置或传入 CDK 的剩余次数。"""
-        code = (request.args.get("code") or "").strip() or None
-        try:
-            return jsonify({"ok": True, **extract_link_service.query_cdk(cdk=code)})
-        except Exception as exc:
-            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
-
-    def _is_extract_eligible(acc: dict) -> bool:
-        plan = str(acc.get("current_plan_type") or acc.get("plan_type") or "").lower()
-        return plan == "free" and bool(acc.get("plus_trial_eligible"))
-
-    @app.post("/api/accounts/extract-link")
-    def api_account_extract_link():
-        """单账号提链。Body {account_id|id, link_type?, cdk?}。"""
-        data = request.get_json(silent=True) or {}
-        acc_id = data.get("account_id") or data.get("id")
-        try:
-            acc = db.get_account(int(acc_id))
-        except Exception:
-            acc = None
-        if not acc:
-            return jsonify({"ok": False, "error": "账号不存在"}), 404
-        if not _is_extract_eligible(acc):
-            return jsonify({"ok": False, "error": "仅支持 free(可Plus试用) 账号提链；请先查询套餐确认资格"}), 400
-        token = (acc.get("access_token") or "").strip()
-        if not token:
-            return jsonify({"ok": False, "error": "该账号没有 access_token"}), 400
-        try:
-            queued = extract_link_service.enqueue_account_extract(
-                account_id=int(acc.get("id")),
-                email=acc.get("email") or "",
-                access_token=token,
-                trigger="manual",
-                link_type=data.get("link_type"),
-                cdk=data.get("cdk"),
-            )
-        except Exception as exc:
-            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
-        if queued.get("busy"):
-            return jsonify({"ok": False, **queued}), 409
-        if not queued.get("accepted"):
-            return jsonify({"ok": False, **queued}), 503
-        return jsonify({"ok": True, "started": True, **{k: v for k, v in queued.items() if k != "future"}}), 202
-
-    @app.post("/api/accounts/extract-link-bulk")
-    def api_accounts_extract_link_bulk():
-        """批量提链。Body {account_ids:[...], link_type?, cdk?}。"""
-        data = request.get_json(silent=True) or {}
-        ids = data.get("account_ids") or data.get("ids") or []
-        if not isinstance(ids, list) or not ids:
-            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
-        if len(ids) > 500:
-            return jsonify({"ok": False, "error": "单次最多提链 500 个账号"}), 400
-
-        started = []
-        busy = []
-        failed = []
-        skipped = []
-        seen = set()
-        for raw in ids:
-            try:
-                acc_id = int(raw)
-            except Exception:
-                skipped.append({"id": raw, "reason": "ID 非法"})
-                continue
-            if acc_id in seen:
-                continue
-            seen.add(acc_id)
-            acc = db.get_account(acc_id)
-            if not acc:
-                skipped.append({"id": acc_id, "reason": "账号不存在"})
-                continue
-            email = acc.get("email")
-            if not _is_extract_eligible(acc):
-                skipped.append({"id": acc_id, "email": email, "reason": "不是 free(可Plus试用)"})
-                continue
-            token = (acc.get("access_token") or "").strip()
-            if not token:
-                skipped.append({"id": acc_id, "email": email, "reason": "缺少 access_token"})
-                continue
-            try:
-                queued = extract_link_service.enqueue_account_extract(
-                    account_id=acc_id,
-                    email=email or "",
-                    access_token=token,
-                    trigger="manual_bulk",
-                    link_type=data.get("link_type"),
-                    cdk=data.get("cdk"),
-                )
-            except Exception as exc:
-                failed.append({"id": acc_id, "email": email, "error": f"{type(exc).__name__}: {exc}"})
-                continue
-            item = {"id": acc_id, "email": email, **{k: v for k, v in queued.items() if k != "future"}}
-            if queued.get("accepted"):
-                started.append(item)
-            elif queued.get("busy"):
-                busy.append(item)
-            else:
-                failed.append(item)
-        return jsonify({
-            "ok": True,
-            "started": started,
-            "started_count": len(started),
-            "busy": busy,
-            "busy_count": len(busy),
-            "failed": failed,
-            "failed_count": len(failed),
-            "skipped": skipped,
-            "skipped_count": len(skipped),
-        }), 202
-
-    @app.post("/api/accounts/codex-agent")
-    def api_account_codex_agent():
-        """单账号生成 Codex Agent Token。Body {account_id|id, verify_task?}。"""
-        data = request.get_json(silent=True) or {}
-        acc_id = data.get("account_id") or data.get("id")
-        try:
-            acc = db.get_account(int(acc_id))
-        except Exception:
-            acc = None
-        if not acc:
-            return jsonify({"ok": False, "error": "账号不存在"}), 404
-        token = (acc.get("access_token") or "").strip()
-        if not token:
-            return jsonify({"ok": False, "error": "该账号没有 access_token"}), 400
-        try:
-            queued = codex_agent_service.enqueue_account_codex_agent(
-                account_id=int(acc.get("id")),
-                email=acc.get("email") or "",
-                access_token=token,
-                trigger="manual",
-                verify_task=bool(data.get("verify_task", True)),
-            )
-        except Exception as exc:
-            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
-        if queued.get("busy"):
-            return jsonify({"ok": False, **queued}), 409
-        if not queued.get("accepted"):
-            return jsonify({"ok": False, **queued}), 503
-        return jsonify({"ok": True, "started": True, **{k: v for k, v in queued.items() if k != "future"}}), 202
-
-    @app.post("/api/accounts/codex-agent-bulk")
-    def api_accounts_codex_agent_bulk():
-        """批量生成 Codex Agent Token。Body {account_ids:[...], verify_task?}。"""
-        data = request.get_json(silent=True) or {}
-        ids = data.get("account_ids") or data.get("ids") or []
-        if not isinstance(ids, list) or not ids:
-            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
-        if len(ids) > 500:
-            return jsonify({"ok": False, "error": "单次最多提交 500 个账号"}), 400
-
-        started = []
-        busy = []
-        failed = []
-        skipped = []
-        seen = set()
-        for raw in ids:
-            try:
-                acc_id = int(raw)
-            except Exception:
-                skipped.append({"id": raw, "reason": "ID 非法"})
-                continue
-            if acc_id in seen:
-                continue
-            seen.add(acc_id)
-            acc = db.get_account(acc_id)
-            if not acc:
-                skipped.append({"id": acc_id, "reason": "账号不存在"})
-                continue
-            email = acc.get("email")
-            token = (acc.get("access_token") or "").strip()
-            if not token:
-                skipped.append({"id": acc_id, "email": email, "reason": "缺少 access_token"})
-                continue
-            try:
-                queued = codex_agent_service.enqueue_account_codex_agent(
-                    account_id=acc_id,
-                    email=email or "",
-                    access_token=token,
-                    trigger="manual_bulk",
-                    verify_task=bool(data.get("verify_task", True)),
-                )
-            except Exception as exc:
-                failed.append({"id": acc_id, "email": email, "error": f"{type(exc).__name__}: {exc}"})
-                continue
-            item = {"id": acc_id, "email": email, **{k: v for k, v in queued.items() if k != "future"}}
-            if queued.get("accepted"):
-                started.append(item)
-            elif queued.get("busy"):
-                busy.append(item)
-            else:
-                failed.append(item)
-        return jsonify({
-            "ok": True,
-            "started": started,
-            "started_count": len(started),
-            "busy": busy,
-            "busy_count": len(busy),
-            "failed": failed,
-            "failed_count": len(failed),
-            "skipped": skipped,
-            "skipped_count": len(skipped),
-        }), 202
-
-    def _codex_agent_auth_for_account(acc: dict) -> tuple[str, str]:
-        """返回账号已生成的 Codex Agent auth.json 文本与下载文件名。"""
-        import json as _json
-        from pathlib import Path as _Path
-
-        email = str(acc.get("email") or "").strip()
-        safe_email = "".join(ch if ch.isalnum() or ch in ("@", ".", "-", "_") else "_" for ch in (email or f"account-{acc.get('id')}"))
-        filename = f"codex-agent-{safe_email}.json"
-        token_text = str(acc.get("codex_agent_token") or "").strip()
-        if token_text:
-            try:
-                payload = _json.loads(token_text)
-                token_text = _json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-            except Exception:
-                token_text = token_text + ("\n" if not token_text.endswith("\n") else "")
-            return token_text, filename
-
-        auth_path = str(acc.get("codex_agent_auth_path") or "").strip()
-        if auth_path:
-            p = _Path(auth_path)
-            if sqlite_store.file_exists(p, category="agent_credentials"):
-                return sqlite_store.read_text_file(p, category="agent_credentials"), p.name or filename
-
-        raise RuntimeError("该账号还没有生成 Codex Agent Token")
-
-    def _join_sub2_url(base: str, path: str) -> str:
-        base = str(base or "").strip().rstrip("/")
-        path = str(path or "").strip()
-        if not base or not path:
-            return ""
-        parsed = urlparse(path)
-        if parsed.scheme in ("http", "https") and parsed.netloc:
-            return path
-        return f"{base}/{path.lstrip('/')}"
-
-    def _sub2_codex_session_import_url() -> str:
-        from config import sub2api as sub2api_cfg
-        api_base = str(getattr(sub2api_cfg, "SUB2API_API_BASE", "") or "").strip()
-        if api_base:
-            return _join_sub2_url(api_base, "/api/v1/admin/accounts/import/codex-session")
-        # 兼容旧配置：之前 SUB2API_API_URL 是完整上传接口 URL。
-        return str(getattr(sub2api_cfg, "SUB2API_API_URL", "") or "").strip()
-
-    def _upload_account_codex_agent_to_sub2(acc: dict) -> dict:
-        """把账号已生成的 Codex Agent auth.json 上传到 sub2api。"""
-        import json as _json
-        from config import sub2api as sub2api_cfg
-        from core.codex_agent import upload_sub2api_account
-
-        text, _filename = _codex_agent_auth_for_account(acc)
-        try:
-            auth_json = _json.loads(text)
-        except Exception as exc:
-            raise RuntimeError(f"Agent Token JSON 无效: {exc}") from exc
-
-        api_url = _sub2_codex_session_import_url()
-        api_token = str(getattr(sub2api_cfg, "SUB2API_API_KEY", "") or getattr(sub2api_cfg, "SUB2API_API_TOKEN", "") or "").strip()
-        auth_header = str(getattr(sub2api_cfg, "SUB2API_API_AUTH_HEADER", "x-api-key") or "x-api-key").strip()
-        auth_prefix = str(getattr(sub2api_cfg, "SUB2API_API_AUTH_PREFIX", "") or "").strip()
-        payload_mode = "codex_session_import"
-        proxy_key = str(getattr(sub2api_cfg, "SUB2API_PROXY_KEY", "") or "").strip() or None
-        timeout = float(getattr(sub2api_cfg, "SUB2API_API_TIMEOUT", 20) or 20)
-
-        result = upload_sub2api_account(
-            auth_json,
-            api_url,
-            api_token=api_token,
-            auth_header=auth_header,
-            auth_prefix=auth_prefix,
-            payload_mode=payload_mode,
-            proxy_key=proxy_key,
-            timeout=timeout,
-        )
-        try:
-            db.update_account_codex_agent(int(acc.get("id")), {
-                "ok": True,
-                "status": "success",
-                "message": "Agent Token 已上传 sub2api",
-                "sub2api_url": result.get("url"),
-                "sub2api_mode": result.get("payload_mode"),
-                "sub2api_total": result.get("total"),
-            })
-        except Exception:
-            logger.exception("更新账号 sub2api 上传状态失败: account_id=%s", acc.get("id"))
-        return result
-
-    @app.post("/api/accounts/<int:acc_id>/codex-agent/upload-sub2")
-    def api_account_codex_agent_upload_sub2(acc_id: int):
-        """单账号把已生成的 Codex Agent Token 上传到 sub2api。"""
-        acc = db.get_account(acc_id)
-        if not acc:
-            return jsonify({"ok": False, "error": "账号不存在"}), 404
-        try:
-            result = _upload_account_codex_agent_to_sub2(acc)
-        except Exception as exc:
-            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
-        return jsonify({"ok": True, "account_id": acc_id, "email": acc.get("email"), "result": result})
-
-    @app.post("/api/accounts/codex-agent/upload-sub2-bulk")
-    def api_accounts_codex_agent_upload_sub2_bulk():
-        """批量把已生成的 Codex Agent Token 上传到 sub2api。Body {account_ids:[...]}。"""
-        data = request.get_json(silent=True) or {}
-        ids = data.get("account_ids") or data.get("ids") or []
-        if not isinstance(ids, list) or not ids:
-            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
-        if len(ids) > 500:
-            return jsonify({"ok": False, "error": "单次最多提交 500 个账号"}), 400
-
-        uploaded, failed, skipped = [], [], []
-        seen = set()
-        for raw in ids:
-            try:
-                acc_id = int(raw)
-            except Exception:
-                skipped.append({"id": raw, "reason": "ID 非法"})
-                continue
-            if acc_id in seen:
-                continue
-            seen.add(acc_id)
-            acc = db.get_account(acc_id)
-            if not acc:
-                skipped.append({"id": acc_id, "reason": "账号不存在"})
-                continue
-            email = acc.get("email")
-            if (acc.get("codex_agent_status") or "") != "success" and not (acc.get("codex_agent_token") or acc.get("codex_agent_auth_path")):
-                skipped.append({"id": acc_id, "email": email, "reason": "未生成 Agent Token"})
-                continue
-            try:
-                result = _upload_account_codex_agent_to_sub2(acc)
-                uploaded.append({"id": acc_id, "email": email, "url": result.get("url"), "status_code": result.get("status_code")})
-            except Exception as exc:
-                failed.append({"id": acc_id, "email": email, "error": f"{type(exc).__name__}: {exc}"})
-        return jsonify({
-            "ok": True,
-            "uploaded": uploaded,
-            "uploaded_count": len(uploaded),
-            "failed": failed,
-            "failed_count": len(failed),
-            "skipped": skipped,
-            "skipped_count": len(skipped),
-        })
-
-    @app.get("/api/accounts/<int:acc_id>/codex-agent/download")
-    def api_account_codex_agent_download(acc_id: int):
-        """下载单个账号的 Codex Agent auth.json。"""
-        acc = db.get_account(acc_id)
-        if not acc:
-            return jsonify({"ok": False, "error": "账号不存在"}), 404
-        try:
-            content, filename = _codex_agent_auth_for_account(acc)
-        except Exception as exc:
-            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 404
-        data = content.encode("utf-8")
-        return Response(
-            data,
-            mimetype="application/json",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Content-Length": str(len(data)),
-                "Cache-Control": "no-store",
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
-
-    @app.post("/api/accounts/codex-agent/download-bulk")
-    def api_accounts_codex_agent_download_bulk():
-        """下载选中账号已生成的 Codex Agent Token，打包 ZIP。"""
-        import io
-        import json as _json
-        import zipfile
-        from datetime import datetime as _dt
-
-        data = request.get_json(silent=True) or {}
-        if not data and request.form:
-            ids_text = (request.form.get("account_ids") or request.form.get("ids") or "").strip()
-            try:
-                ids = _json.loads(ids_text) if ids_text else []
-            except Exception:
-                ids = [x.strip() for x in ids_text.split(",") if x.strip()]
-        else:
-            ids = data.get("account_ids") or data.get("ids") or []
-        if not isinstance(ids, list) or not ids:
-            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
-        if len(ids) > 1000:
-            return jsonify({"ok": False, "error": "单次最多下载 1000 个账号"}), 400
-
-        added = []
-        errors = []
-        used_names = set()
-        seen = set()
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for raw in ids:
-                try:
-                    acc_id = int(raw)
-                except Exception:
-                    errors.append({"id": raw, "error": "ID 非法"})
-                    continue
-                if acc_id in seen:
-                    continue
-                seen.add(acc_id)
-                acc = db.get_account(acc_id)
-                if not acc:
-                    errors.append({"id": acc_id, "error": "账号不存在"})
-                    continue
-                try:
-                    content, filename = _codex_agent_auth_for_account(acc)
-                    arcname = filename
-                    if arcname in used_names:
-                        stem, dot, ext = arcname.rpartition(".")
-                        arcname = f"{stem or arcname}-{len(used_names)+1}{dot}{ext}" if dot else f"{arcname}-{len(used_names)+1}"
-                    used_names.add(arcname)
-                    zf.writestr(arcname, content)
-                    added.append({"id": acc_id, "email": acc.get("email"), "filename": arcname})
-                except Exception as exc:
-                    errors.append({"id": acc_id, "email": acc.get("email"), "error": f"{type(exc).__name__}: {exc}"})
-            manifest = {
-                "exported_at": _dt.now().isoformat(timespec="seconds"),
-                "source": "accounts-codex-agent",
-                "count": len(added),
-                "files": added,
-                "errors": errors,
-            }
-            zf.writestr("manifest.json", _json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
-
-        if not added:
-            return jsonify({"ok": False, "error": "没有可下载的 Codex Agent Token", "errors": errors}), 404
-        now = _dt.now()
-        dl_name = f"accounts-codex-agent-{now.strftime('%Y%m%d-%H%M%S')}.zip"
-        buf.seek(0)
-        zip_bytes = buf.getvalue()
-        return Response(
-            zip_bytes,
-            mimetype="application/zip",
-            headers={
-                "Content-Disposition": f'attachment; filename="{dl_name}"',
-                "Content-Length": str(len(zip_bytes)),
-                "Cache-Control": "no-store",
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
-
-    @app.post("/api/accounts/download-cpa-bulk")
-    def api_accounts_download_cpa_bulk():
-        """
-        从账号列表选中的账号直接到 CPA auth-files 下载 Codex CPA JSON，并打包为 ZIP。
-        Body: {"account_ids": [1,2,...]} 或 {"ids": [...]}
-        """
-        import io
-        import json as _json
-        import zipfile
-        from datetime import datetime as _dt
-        from core.codex_oauth import download_cpa_codex_auth_text, list_cpa_codex_auth_files
-
-        data = request.get_json(silent=True) or {}
-        if not data and request.form:
-            ids_text = (request.form.get("account_ids") or request.form.get("ids") or "").strip()
-            try:
-                ids = _json.loads(ids_text) if ids_text else []
-            except Exception:
-                ids = [x.strip() for x in ids_text.split(",") if x.strip()]
-        else:
-            ids = data.get("account_ids") or data.get("ids") or []
-        if not isinstance(ids, list) or not ids:
-            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
-        if len(ids) > 1000:
-            return jsonify({"ok": False, "error": "单次最多下载 1000 个账号"}), 400
-
-        try:
-            cpa_files = list_cpa_codex_auth_files()
-        except Exception as exc:
-            return jsonify({"ok": False, "error": f"读取 CPA auth-files 失败: {type(exc).__name__}: {exc}"}), 502
-
-        def _match_cpa_file(email: str, local_filename: str = "") -> dict | None:
-            """在已缓存的 CPA 文件列表中匹配，避免每个账号都重新请求 auth-files。"""
-            email_l = str(email or "").strip().lower()
-            local_name_l = str(local_filename or "").strip().lower()
-            local_stem_l = local_name_l[:-5] if local_name_l.endswith(".json") else local_name_l
-
-            def score(item: dict) -> int:
-                name_l = str(item.get("name") or "").lower()
-                item_email_l = str(item.get("email") or "").lower()
-                s = 0
-                if local_name_l and name_l == local_name_l:
-                    s = max(s, 100)
-                if local_stem_l and name_l.startswith(local_stem_l):
-                    s = max(s, 80)
-                if email_l and item_email_l == email_l:
-                    s = max(s, 70)
-                if email_l and email_l in name_l:
-                    s = max(s, 60)
-                if local_stem_l.endswith("-cpa-callback"):
-                    base = local_stem_l[:-len("-cpa-callback")]
-                    if base and name_l.startswith(base + "-"):
-                        s = max(s, 75)
-                return s
-
-            ranked = sorted(((score(item), item) for item in cpa_files), key=lambda x: x[0], reverse=True)
-            return ranked[0][1] if ranked and ranked[0][0] > 0 else None
-
-        # 建立 email -> 本地 codex 文件名索引；有本地文件名时传给 CPA 匹配逻辑可提升命中率。
-        local_by_email: dict[str, str] = {}
-        try:
-            for item in db.list_codex_accounts():
-                email_key = str(item.get("email") or "").strip().lower()
-                fname = str(item.get("filename") or "").strip()
-                if email_key and fname and email_key not in local_by_email:
-                    local_by_email[email_key] = fname
-        except Exception:
-            local_by_email = {}
-
-        errors = []
-        added = []
-        used_names = set()
-        seen_ids = set()
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for raw_id in ids:
-                try:
-                    acc_id = int(raw_id)
-                except (TypeError, ValueError):
-                    errors.append({"id": raw_id, "error": "ID 非法"})
-                    continue
-                if acc_id in seen_ids:
-                    continue
-                seen_ids.add(acc_id)
-
-                acc = db.get_account(acc_id)
-                if not acc:
-                    errors.append({"id": acc_id, "error": "账号不存在"})
-                    continue
-                email = str(acc.get("email") or "").strip()
-                if not email:
-                    errors.append({"id": acc_id, "error": "账号缺少 email"})
-                    continue
-
-                local_filename = local_by_email.get(email.lower(), "")
-                try:
-                    meta = _match_cpa_file(email=email, local_filename=local_filename)
-                    cpa_name_hint = str((meta or {}).get("name") or "").strip()
-                    if not cpa_name_hint:
-                        raise RuntimeError(f"[Codex][CPA] 未在 CPA auth-files 中找到匹配的 Codex 凭证: {email}")
-                    cpa_text, cpa_name, meta = download_cpa_codex_auth_text(
-                        cpa_name=cpa_name_hint,
-                    )
-                    arcname = cpa_name
-                    if arcname in used_names:
-                        stem, dot, ext = arcname.rpartition(".")
-                        arcname = f"{stem or arcname}-{len(used_names)+1}{dot}{ext}" if dot else f"{arcname}-{len(used_names)+1}"
-                    used_names.add(arcname)
-                    zf.writestr(arcname, cpa_text)
-                    added.append({
-                        "id": acc_id,
-                        "email": email,
-                        "local_filename": local_filename,
-                        "cpa_filename": cpa_name,
-                        "cpa_meta": meta,
-                    })
-                    if local_filename:
-                        try:
-                            db.mark_codex_exported(local_filename)
-                        except Exception:
-                            pass
-                except Exception as exc:
-                    errors.append({"id": acc_id, "email": email, "error": f"{type(exc).__name__}: {exc}"})
-
-            manifest = {
-                "exported_at": _dt.now().isoformat(timespec="seconds"),
-                "source": "accounts-cpa",
-                "count": len(added),
-                "files": added,
-                "errors": errors,
-            }
-            zf.writestr("manifest.json", _json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
-
-        if not added:
-            return jsonify({"ok": False, "error": "没有成功从 CPA 下载任何凭证", "errors": errors}), 502
-        now = _dt.now()
-        dl_name = f"accounts-cpa-bulk-{now.strftime('%Y%m%d-%H%M%S')}.zip"
-        buf.seek(0)
-        zip_bytes = buf.getvalue()
-        if isinstance(data, dict) and data.get("prepare"):
-            download_id = _put_prepared_download(zip_bytes, dl_name, "application/zip")
-            return jsonify({
-                "ok": True,
-                "prepared": True,
-                "download_id": download_id,
-                "download_url": f"/api/downloads/{download_id}",
-                "filename": dl_name,
-                "added_count": len(added),
-                "error_count": len(errors),
-            })
-        return Response(
-            zip_bytes,
-            mimetype="application/zip",
-            headers={
-                "Content-Disposition": f'attachment; filename="{dl_name}"',
-                "Content-Length": str(len(zip_bytes)),
-                "Cache-Control": "no-store, max-age=0",
-                "Pragma": "no-cache",
-                "X-Content-Type-Options": "nosniff",
-                "X-Download-Options": "noopen",
-            },
-        )
 
     # ----------------------------------------------------------
     # 邮箱池
@@ -1327,16 +315,21 @@ def create_app() -> Flask:
             rows = []
             rows += _with_pool_source(db.list_outlook_pool(status=status, limit=fetch_limit), "outlook")
             rows += _with_pool_source(db.list_generic_api_email_pool(status=status, limit=fetch_limit), "generic_api")
+            rows += _with_pool_source(db.list_domain_email_pool(status=status, limit=fetch_limit), "cloudflare_domain")
             rows = sorted(rows, key=lambda x: str(x.get("created_at") or x.get("imported_at") or x.get("used_at") or ""), reverse=True)
         elif source == "generic_api":
             rows = _with_pool_source(db.list_generic_api_email_pool(status=status, limit=fetch_limit), "generic_api")
         elif source == "cloudflare_domain":
-            # Keep the explicit legacy endpoint available for diagnostics;
-            # the user-facing `source=all` workspace below intentionally omits
-            # generated domain/alias addresses.
             rows = _with_pool_source(db.list_domain_email_pool(status=status, limit=fetch_limit), "cloudflare_domain")
         else:
             rows = _with_pool_source(db.list_outlook_pool(status=status, limit=fetch_limit), "outlook")
+        # The mailbox workspace contains only addresses without a GPT account.
+        registered_emails = {
+            str(row.get("email") or "").strip().lower()
+            for row in gpt_account_service.list_accounts()
+            if row.get("registration_status") == "registered"
+        }
+        rows = [r for r in rows if str(r.get("email") or "").strip().lower() not in registered_emails]
         if q:
             rows = [r for r in rows if _matches_query(r, q)]
         if paged or page_arg is not None or page_size_arg is not None:
@@ -1365,30 +358,6 @@ def create_app() -> Flask:
             if not line or line.startswith("#"):
                 continue
             if source == "generic_api":
-                legacy_parts = split_import_line(line, max_fields=4)
-                legacy_prefix = (
-                    3 <= len(legacy_parts) <= 4
-                    and is_email(legacy_parts[0])
-                    and is_http_url(legacy_parts[1])
-                )
-                legacy_shape = (
-                    legacy_prefix
-                    and looks_like_access_token(legacy_parts[2])
-                    and (len(legacy_parts) == 3 or looks_like_totp(legacy_parts[3]))
-                )
-                if legacy_shape:
-                    # Former fixed-position API: email, code_url,
-                    # access_token, optional totp_secret.
-                    record = {
-                        "email": clean_import_value(legacy_parts[0]).lower(),
-                        "code_url": clean_import_value(legacy_parts[1]),
-                        "access_token": clean_import_value(legacy_parts[2]),
-                    }
-                    if len(legacy_parts) == 4:
-                        record["totp_secret"] = clean_import_value(legacy_parts[3])
-                    records.append(record)
-                    continue
-
                 material = parse_account_material_line(line)
                 if not material or not material.get("email_code_url"):
                     continue
@@ -1397,6 +366,7 @@ def create_app() -> Flask:
                 records.append({
                     "email": material["email"],
                     "code_url": material["email_code_url"],
+                    "chatgpt_password": material.get("chatgpt_password") or "",
                     "totp_secret": material.get("totp_secret") or "",
                 })
                 continue
@@ -1930,7 +900,6 @@ def create_app() -> Flask:
                 log_path,
                 f"{ts} [WARNING] [Codex 补跑] 用户手动重置补跑中状态，当前状态={shown}\n",
                 category="codex_retry_logs",
-                mirror=False,
             )
         except Exception:
             logger.exception("写入 Codex 补跑重置日志失败")
@@ -1968,24 +937,6 @@ def create_app() -> Flask:
             "ok": True,
             "log": content,
             "running": codex_retry_service.is_retrying(email),
-        })
-
-    @app.get("/api/accounts/live-check-log")
-    def api_account_live_check_log():
-        """读取某邮箱最近一次查活日志。?email=xxx"""
-        from core import account_liveness
-        email = (request.args.get("email") or "").strip()
-        if not email:
-            return jsonify({"ok": False, "error": "email 为空"}), 400
-        p = account_liveness.log_path(email)
-        if not sqlite_store.file_exists(p, category="liveness_logs"):
-            return jsonify({"ok": True, "log": "", "running": live_check_service.is_checking(email)})
-        max_bytes = 80_000
-        content = sqlite_store.read_file(p, category="liveness_logs")[-max_bytes:].decode("utf-8", errors="replace")
-        return jsonify({
-            "ok": True,
-            "log": content,
-            "running": live_check_service.is_checking(email),
         })
 
     # ----------------------------------------------------------
@@ -2134,7 +1085,7 @@ def create_app() -> Flask:
         })
 
     # ----------------------------------------------------------
-    # 已有 GPT 账号 -> Codex OAuth 接码工作台
+    # GPT 账号与 Codex OAuth 接码工作台
     # ----------------------------------------------------------
     @app.get("/api/gpt-accounts")
     def api_gpt_accounts():
@@ -2147,6 +1098,7 @@ def create_app() -> Flask:
             gpt_status=request.args.get("gpt_status") or "",
             provider=request.args.get("provider") or "",
         )
+        rows = [_public_gpt_account(row) for row in rows]
         paged = str(request.args.get("paged", default="") or "").lower() in {"1", "true", "yes"}
         page_arg = request.args.get("page", default=None, type=int)
         page_size_arg = request.args.get("page_size", default=None, type=int)
@@ -2156,10 +1108,48 @@ def create_app() -> Flask:
             result = {"ok": True, "items": rows, "total": len(rows)}
         result["status_counts"] = {
             "registration": {key: sum(1 for row in rows if row.get("registration_status") == key) for key in ("registered", "unregistered", "registering", "failed")},
-            "codex": {key: sum(1 for row in rows if row.get("codex_status") == key) for key in ("authorized", "unauthorized", "authorizing", "failed")},
+            "codex": {key: sum(1 for row in rows if row.get("codex_status") == key) for key in ("authorized", "unauthorized", "authorizing", "failed", "deactivated")},
             "phone": {key: sum(1 for row in rows if row.get("phone_status") == key) for key in ("verified", "unverified", "verifying", "failed")},
         }
         return jsonify(result)
+
+    @app.put("/api/gpt-accounts/<account_id>")
+    def api_gpt_account_update(account_id: str):
+        """Edit the selected row in the canonical GPT account collection."""
+        data = request.get_json(silent=True) or {}
+        try:
+            account = gpt_account_service.update_account(account_id, data)
+            return jsonify({"ok": True, "account": _public_gpt_account(account)})
+        except gpt_account_service.AccountBusyError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 409
+        except LookupError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.post("/api/gpt-accounts/<account_id>/proxy/test")
+    def api_gpt_account_proxy_test(account_id: str):
+        from core.account_proxy import account_proxy
+        from core.proxy_test_service import test_proxies
+        # Read server-side; never send the stored authenticated URL to the UI.
+        row = codex_relay_service._get_account(account_id)
+        if row is None:
+            return jsonify({"ok": False, "error": "GPT账号不存在或已删除"}), 404
+        try:
+            return jsonify({"ok": True, "items": test_proxies([account_proxy(row)])})
+        except ValueError:
+            return jsonify({"ok": False, "error": "账号代理配置无效，请编辑后重试"}), 400
+
+    @app.post("/api/proxies/test")
+    def api_proxy_test():
+        from core.proxy_test_service import test_proxies
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请提交代理列表"}), 400
+        try:
+            return jsonify({"ok": True, "items": test_proxies(data.get("proxies"))})
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
 
     @app.get("/api/gpt-accounts/<account_id>/log")
     def api_gpt_account_log(account_id: str):
@@ -2180,8 +1170,8 @@ def create_app() -> Flask:
         return jsonify({"ok": True, "account_id": account_id, "kind": ref.get("kind"), "job_id": ref.get("id"), "log": log, "job": ref})
 
     @app.delete("/api/gpt-accounts")
-    def api_gpt_accounts_soft_delete():
-        """Soft-delete unified rows without removing source accounts or logs."""
+    def api_gpt_accounts_delete():
+        """Permanently delete selected GPT account rows."""
         data = request.get_json(silent=True) or {}
         account_ids = data.get("account_ids") or []
         if not isinstance(account_ids, list) or not account_ids:
@@ -2189,7 +1179,7 @@ def create_app() -> Flask:
         if len(account_ids) > 5000:
             return jsonify({"ok": False, "error": "单次最多删除 5000 个 GPT 账号"}), 400
         try:
-            return jsonify(gpt_account_service.soft_delete_accounts(account_ids))
+            return jsonify(gpt_account_service.delete_accounts(account_ids))
         except gpt_account_service.AccountBusyError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 409
         except LookupError as exc:
@@ -2208,7 +1198,30 @@ def create_app() -> Flask:
         """
         data = request.get_json(silent=True) or {}
         requested_ids = [str(value) for value in (data.get("account_ids") or []) if value]
-        if requested_ids:
+        requested_emails = list(dict.fromkeys(
+            str(value or "").strip().lower() for value in (data.get("emails") or []) if str(value or "").strip()
+        ))
+        if requested_emails:
+            if len(requested_emails) > 200:
+                return jsonify({"ok": False, "error": "单次最多注册 200 个邮箱"}), 400
+            already_registered = {
+                str(row.get("email") or "").strip().lower()
+                for row in gpt_account_service.list_accounts()
+                if row.get("registration_status") == "registered"
+            }
+            if any(email in already_registered for email in requested_emails):
+                return jsonify({"ok": False, "error": "所选邮箱中存在已注册 GPT 账号，请刷新邮箱列表"}), 409
+            pool = {
+                str(row.get("email") or "").strip().lower(): row
+                for rows in (db.list_outlook_pool(limit=1_000_000), db.list_generic_api_email_pool(limit=1_000_000))
+                for row in rows
+            }
+            unavailable = [email for email in requested_emails if email not in pool or pool[email].get("status") != "available"]
+            if unavailable:
+                return jsonify({"ok": False, "error": f"邮箱不可用或不存在：{', '.join(unavailable[:3])}"}), 400
+            target_emails = requested_emails
+            count = len(target_emails)
+        elif requested_ids:
             rows = gpt_account_service.list_accounts()
             selected = [row for row in rows if str(row.get("id") or "") in requested_ids and row.get("registration_status") not in {"registered", "registering"}]
             if any(str(row.get("id") or "") in requested_ids and row.get("registration_status") == "registering" for row in rows):
@@ -2254,104 +1267,67 @@ def create_app() -> Flask:
 
     @app.post("/api/gpt-accounts/authorize")
     def api_gpt_accounts_authorize():
-        """Ensure selected unified rows have Relay records, then start OAuth.
-
-        A registered account can predate the Codex Relay collection.  The
-        bridge is intentionally lazy: it copies only the login/mailbox
-        material needed by the Relay worker and is idempotent by normalized
-        email.  This keeps the two SQLite collections compatible while making
-        the GPT账号 page the single user-facing workflow.
-        """
+        """Start Codex OAuth for selected canonical GPT accounts."""
         data = request.get_json(silent=True) or {}
-        requested_ids = [str(value).strip() for value in (data.get("account_ids") or []) if str(value).strip()]
-        if not requested_ids:
-            return jsonify({"ok": False, "error": "请先选择 GPT 账号"}), 400
         try:
             workers = max(1, min(8, int(data.get("workers", 1))))
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "workers 非法"}), 400
-        rows = gpt_account_service.list_accounts()
-        selected = []
-        missing = []
-        seen_emails = set()
-        for requested in requested_ids:
-            row = next(
-                (
-                    candidate for candidate in rows
-                    if str(candidate.get("id") or "") == requested
-                    or str(candidate.get("relay_account_id") or "") == requested
-                    or str(candidate.get("email") or "").strip().lower() == requested.lower()
-                ),
-                None,
-            )
-            if row is None:
-                missing.append(requested)
-                continue
-            email = str(row.get("email") or "").strip().lower()
-            if email and email not in seen_emails:
-                selected.append(row)
-                seen_emails.add(email)
-        if missing:
-            return jsonify({"ok": False, "error": f"找不到账号：{', '.join(missing[:3])}"}), 404
-        not_registered = [row.get("email") or "" for row in selected if row.get("registration_status") != "registered"]
-        if not_registered:
-            return jsonify({"ok": False, "error": f"以下账号尚未完成 GPT 注册：{', '.join(not_registered[:3])}"}), 409
-
-        materials = []
         try:
-            for row in selected:
-                material = gpt_account_service.authorization_material(row)
-                # Validate the complete batch before creating any Relay rows;
-                # one malformed account must not leave earlier rows half-bridged.
-                materials.append(codex_relay_service.validate_account_material(material))
-        except Exception as exc:
-            return jsonify({"ok": False, "error": str(exc)}), 400
-
-        relay_ids = []
-        created = []
-        try:
-            for row, material in zip(selected, materials):
-                ensured = codex_relay_service.ensure_account_material(material)
-                relay_id = str(ensured.get("id") or "")
-                if not relay_id:
-                    raise ValueError(f"账号 {row.get('email') or ''} 未生成 Relay ID")
-                relay_ids.append(relay_id)
-                if ensured.get("created"):
-                    created.append(relay_id)
+            selected = _select_gpt_accounts(data.get("account_ids") or [])
             result = codex_relay_service.start_jobs(
-                relay_ids,
+                selected["account_ids"],
                 workers=workers,
                 phone_ids=data.get("phone_ids") or [],
             )
         except Exception as exc:
-            return jsonify({"ok": False, "error": str(exc)}), 400
-        result.update({
-            "created_relay_account_ids": created,
-            "relay_account_ids": relay_ids,
-            "emails": [row.get("email") for row in selected],
-        })
+            status = 404 if isinstance(exc, LookupError) else 409 if isinstance(exc, RuntimeError) and "尚未完成" in str(exc) else 400
+            return jsonify({"ok": False, "error": str(exc)}), status
+        result["emails"] = [row.get("email") for row in selected["selected"]]
         return jsonify(result)
 
-    @app.post("/api/codex-relay/import")
+    @app.post("/api/gpt-accounts/actions")
+    def api_gpt_accounts_actions():
+        """Run maintenance actions for unified GPT account selections.
+
+        The GPT account page can contain registered rows without a Relay row.
+        Bridge those rows before dispatching the existing Relay maintenance
+        worker, so actions such as enabling 2FA work for freshly registered
+        accounts as well as imported Relay accounts.
+        """
+        data = request.get_json(silent=True) or {}
+        try:
+            workers = max(1, min(8, int(data.get("workers", 1))))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "workers 非法"}), 400
+        try:
+            selected = _select_gpt_accounts(data.get("account_ids") or [])
+            result = codex_relay_service.start_account_actions(
+                selected["account_ids"],
+                data.get("action") or "",
+                workers=workers,
+            )
+        except Exception as exc:
+            status = 404 if isinstance(exc, LookupError) else 409 if isinstance(exc, RuntimeError) and "尚未完成" in str(exc) else 400
+            return jsonify({"ok": False, "error": str(exc)}), status
+        result["emails"] = [row.get("email") for row in selected["selected"]]
+        return jsonify(result)
+
+    @app.post("/api/gpt-accounts/import")
     def api_codex_relay_import():
         data = request.get_json(silent=True) or {}
         try:
             result = codex_relay_service.import_accounts(
                 data.get("text") or "",
                 format_name=data.get("format") or "auto",
-                include_emails=True,
+                proxy=data.get("proxy"),
             )
-            restored = gpt_account_service.restore_deleted_accounts(result.pop("emails", []))
-            if restored["restored"]:
-                result["restored"] = restored["restored"]
-                result["message"] = f"导入完成，已恢复 {restored['restored']} 个 GPT 账号"
-            else:
-                result["message"] = "导入完成"
+            result["message"] = "导入完成"
             return jsonify(result)
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.post("/api/codex-relay/phones/import")
+    @app.post("/api/phones/import")
     def api_codex_relay_phone_import():
         data = request.get_json(silent=True) or {}
         try:
@@ -2359,52 +1335,12 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.get("/api/codex-relay/accounts")
-    def api_codex_relay_accounts():
-        rows = codex_relay_service.list_accounts(
-            q=request.args.get("q") or "",
-            status=request.args.get("status") or "",
-            provider=request.args.get("provider") or "",
-            codex_status=request.args.get("codex_status") or "",
-            liveness=request.args.get("liveness") or "",
-            email_liveness=request.args.get("email_liveness") or "",
-            quota_status=request.args.get("quota_status") or "",
-            phone_status=request.args.get("phone_status") or "",
-            twofa=request.args.get("twofa") or "",
-        )
-        paged = str(request.args.get("paged", default="") or "").lower() in {"1", "true", "yes"}
-        page_arg = request.args.get("page", default=None, type=int)
-        page_size_arg = request.args.get("page_size", default=None, type=int)
-        if paged or page_arg is not None or page_size_arg is not None:
-            return jsonify(_paginate_items(rows, page=max(1, int(page_arg or 1)), page_size=page_size_arg or 20))
-        return jsonify({"ok": True, "items": rows, "total": len(rows)})
-
-    @app.put("/api/codex-relay/accounts/<account_id>")
-    def api_codex_relay_update_account(account_id: str):
-        data = request.get_json(silent=True) or {}
-        try:
-            return jsonify({"ok": True, "account": codex_relay_service.update_account(account_id, data)})
-        except Exception as exc:
-            return jsonify({"ok": False, "error": str(exc)}), 400
-
-    @app.post("/api/codex-relay/accounts/actions")
-    def api_codex_relay_account_actions():
-        data = request.get_json(silent=True) or {}
-        try:
-            return jsonify(codex_relay_service.start_account_actions(
-                data.get("account_ids") or [],
-                data.get("action") or "",
-                workers=data.get("workers") or 1,
-            ))
-        except Exception as exc:
-            return jsonify({"ok": False, "error": str(exc)}), 400
-
-    @app.get("/api/codex-relay/sub2-services")
+    @app.get("/api/sub2-services")
     def api_codex_relay_sub2_services():
         rows = codex_relay_service.list_sub2_services()
         return jsonify({"ok": True, "items": rows, "total": len(rows)})
 
-    @app.post("/api/codex-relay/sub2-services")
+    @app.post("/api/sub2-services")
     def api_codex_relay_save_sub2_service():
         try:
             service = codex_relay_service.save_sub2_service(request.get_json(silent=True) or {})
@@ -2412,7 +1348,7 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.delete("/api/codex-relay/sub2-services/<service_id>")
+    @app.delete("/api/sub2-services/<service_id>")
     def api_codex_relay_delete_sub2_service(service_id: str):
         try:
             deleted = codex_relay_service.delete_sub2_service(service_id)
@@ -2420,7 +1356,7 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.post("/api/codex-relay/accounts/import-sub2")
+    @app.post("/api/gpt-accounts/sub2/import")
     def api_codex_relay_import_sub2():
         data = request.get_json(silent=True) or {}
         try:
@@ -2432,7 +1368,7 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.post("/api/codex-relay/accounts/sync-from-sub2")
+    @app.post("/api/gpt-accounts/sub2/sync")
     def api_codex_relay_sync_from_sub2():
         data = request.get_json(silent=True) or {}
         try:
@@ -2509,7 +1445,7 @@ def create_app() -> Flask:
         }
         return _json.dumps(payload, ensure_ascii=False, indent=2) + "\n", "application/json", "json", result
 
-    @app.post("/api/codex-relay/accounts/export/copy")
+    @app.post("/api/gpt-accounts/export/copy")
     def api_codex_relay_export_copy():
         data = request.get_json(silent=True) or {}
         format_name = str(data.get("format") or "rt").strip().lower()
@@ -2525,7 +1461,7 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.post("/api/codex-relay/accounts/export/download")
+    @app.post("/api/gpt-accounts/export/download")
     def api_codex_relay_export_download():
         data = request.get_json(silent=True) or {}
         account_ids = data.get("account_ids") or []
@@ -2542,7 +1478,7 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.get("/api/codex-relay/phones")
+    @app.get("/api/phones")
     def api_codex_relay_phones():
         rows = codex_relay_service.list_phones(
             q=request.args.get("q") or "",
@@ -2555,7 +1491,7 @@ def create_app() -> Flask:
             return jsonify(_paginate_items(rows, page=max(1, int(page_arg or 1)), page_size=page_size_arg or 20))
         return jsonify({"ok": True, "items": rows, "total": len(rows)})
 
-    @app.delete("/api/codex-relay/phones")
+    @app.delete("/api/phones")
     def api_codex_relay_delete_phones():
         data = request.get_json(silent=True) or {}
         try:
@@ -2564,7 +1500,7 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.patch("/api/codex-relay/phones/available-uses")
+    @app.patch("/api/phones/available-uses")
     def api_codex_relay_adjust_phone_available_uses():
         data = request.get_json(silent=True) or {}
         try:
@@ -2575,16 +1511,18 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.delete("/api/codex-relay/accounts")
-    def api_codex_relay_delete_accounts():
-        data = request.get_json(silent=True) or {}
+    @app.patch("/api/phones/settings")
+    def api_codex_relay_update_phone_settings():
+        data = request.get_json(silent=True)
         try:
-            deleted = codex_relay_service.delete_accounts(data.get("account_ids") or [])
-            return jsonify({"ok": True, "deleted": deleted})
-        except Exception as exc:
+            if not isinstance(data, dict):
+                raise ValueError("请求必须是 JSON 对象")
+            settings = {key: data[key] for key in ("available_uses", "expiration_days") if key in data}
+            return jsonify(codex_relay_service.update_phone_settings(data.get("phone_ids"), **settings))
+        except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.post("/api/codex-relay/jobs")
+    @app.post("/api/codex-jobs")
     def api_codex_relay_start_jobs():
         data = request.get_json(silent=True) or {}
         try:
@@ -2597,7 +1535,7 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.get("/api/codex-relay/jobs")
+    @app.get("/api/codex-jobs")
     def api_codex_relay_jobs():
         rows = codex_relay_service.list_jobs(
             q=request.args.get("q") or "",
@@ -2611,7 +1549,7 @@ def create_app() -> Flask:
             return jsonify(_paginate_items(rows, page=max(1, int(page_arg or 1)), page_size=page_size_arg or 20))
         return jsonify({"ok": True, "items": rows, "total": len(rows)})
 
-    @app.post("/api/codex-relay/jobs/<job_id>/verification")
+    @app.post("/api/codex-jobs/<job_id>/verification")
     def api_codex_relay_verification(job_id: str):
         data = request.get_json(silent=True) or {}
         try:
@@ -2624,28 +1562,28 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.post("/api/codex-relay/jobs/<job_id>/browser-assist")
+    @app.post("/api/codex-jobs/<job_id>/browser-assist")
     def api_codex_relay_browser_assist(job_id: str):
         try:
             return jsonify(codex_relay_service.submit_browser_assist(job_id))
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.post("/api/codex-relay/jobs/<job_id>/browser-focus")
+    @app.post("/api/codex-jobs/<job_id>/browser-focus")
     def api_codex_relay_browser_focus(job_id: str):
         try:
             return jsonify(codex_relay_service.focus_browser_assist(job_id))
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.post("/api/codex-relay/jobs/<job_id>/stop")
+    @app.post("/api/codex-jobs/<job_id>/stop")
     def api_codex_relay_stop(job_id: str):
         try:
             return jsonify(codex_relay_service.stop_job(job_id))
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.delete("/api/codex-relay/jobs")
+    @app.delete("/api/codex-jobs")
     def api_codex_relay_delete_jobs():
         data = request.get_json(silent=True) or {}
         try:
@@ -2653,7 +1591,7 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.delete("/api/codex-relay/jobs/<job_id>")
+    @app.delete("/api/codex-jobs/<job_id>")
     def api_codex_relay_delete_job(job_id: str):
         try:
             deleted = codex_relay_service.delete_job(job_id)
@@ -2661,7 +1599,7 @@ def create_app() -> Flask:
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-    @app.get("/api/codex-relay/jobs/<job_id>/log")
+    @app.get("/api/codex-jobs/<job_id>/log")
     def api_codex_relay_log(job_id: str):
         return jsonify({"ok": True, "job_id": job_id, "log": codex_relay_service.read_log(job_id)})
 
