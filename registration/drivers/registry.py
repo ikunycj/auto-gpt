@@ -1,8 +1,8 @@
 """Lazy registry for protocol and optional browser drivers.
 
-The registry is deliberately free of imports from Selenium, Playwright, Roxy,
-Browser Use or Skyvern.  Those dependencies are loaded only after a caller
-selects the corresponding driver, making each integration detachable.
+The registry is deliberately free of imports from Selenium, Playwright or Roxy.
+Those dependencies are loaded only after a caller selects the corresponding
+driver, making each integration detachable.
 """
 from __future__ import annotations
 
@@ -41,10 +41,6 @@ _ALIASES: dict[str, str] = {
     "fingerprint": "roxy",
     "browser": "roxy",
     "cloakbrowser": "cloak",
-    "browseruse": "browser_use",
-    "browser-use": "browser_use",
-    "bu": "browser_use",
-    "sv": "skyvern",
     "chrome-cdp": "chrome_cdp",
     "chrome": "chrome_cdp",
     "local_chrome": "chrome_cdp",
@@ -55,10 +51,6 @@ _DRIVERS: dict[str, RegistrationDriver] = {
     "protocol": LazyFunctionDriver("protocol", "registration.drivers.protocol", "run"),
     "roxy": LazyFunctionDriver("roxy", "registration.drivers.roxy", "run"),
     "cloak": LazyFunctionDriver("cloak", "registration.drivers.cloak", "run"),
-    "browser_use": LazyFunctionDriver(
-        "browser_use", "registration.drivers.browser_use", "run"
-    ),
-    "skyvern": LazyFunctionDriver("skyvern", "registration.drivers.skyvern", "run"),
     "chrome_cdp": LazyFunctionDriver(
         "chrome_cdp", "registration.drivers.chrome_cdp", "run"
     ),

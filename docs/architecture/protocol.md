@@ -165,23 +165,14 @@ AUTO_BROWSER_LOCALE_FROM_IP="True"
    - HAR form body 为 `callbackUrl=https://chatgpt.com/`。
    - 已将 `core.chatgpt_auth.signin_openai()` 从 `/login` 对齐为根路径 `/`。
 
-3. **email-otp/validate Sentinel 策略**
-   - HAR 样本中 `email-otp/validate` 未携带 `openai-sentinel-token`。
-   - 已新增开关：`config.openai_protocol.SEND_SENTINEL_ON_EMAIL_OTP_VALIDATE = False`。
-   - 默认按 HAR 不带 Sentinel；如后续服务端要求，可改为 `True` 回退旧逻辑。
-
-4. **timezone_offset_min 符号**
-   - ChatGPT `accounts/check` URL 使用 JS `Date.getTimezoneOffset()` 语义：东八区是 `-480`，日本是 `-540`。
-   - 已新增 `BrowserSession.js_timezone_offset_min()`，避免把内部 `timezone_offset_minutes`（东区为正）直接用于 URL。
-
-5. **兜底地区**
+3. **兜底地区**
    - 代理 GeoIP 检测失败时兜底日本：`BROWSER_LOCALE_PROFILE="jp"`。
    - GeoIP 成功时仍按出口 IP 自动设置语言/时区。
 
-### 当前仍未强制补的链路
+### 当前未纳入注册主链路的内容
 
 - `browser-intake-datadoghq.com` 的高频 RUM 批量上报：对注册业务不是必需链路，且会显著增加请求噪音，暂不强制模拟。
-- `chatgpt.com/backend-anon/sentinel/chat-requirements/prepare/finalize` 与登录态 `backend-api/sentinel/...`：文档已记录其顺序；当前注册核心仍使用 `sentinel.openai.com/backend-api/sentinel/req` 生成 create_account 所需头。若后续要做到“首页 bootstrap 全量同形态”，可单独加一个可开关的 `chatgpt_bootstrap()` 预热模块。
+- `chatgpt.com/backend-anon/sentinel/chat-requirements/prepare/finalize` 与登录态 `backend-api/sentinel/...`：文档记录了抓包中的首页链路，但附件兼容注册核心不执行这些预热请求，仅使用 `sentinel.openai.com/backend-api/sentinel/req` 生成 `create_account` 所需头。
 
 
 ## 10. 窗口/屏幕尺寸策略

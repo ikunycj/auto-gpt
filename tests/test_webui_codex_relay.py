@@ -170,9 +170,9 @@ class CodexRelayWebUiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["account"]["id"], "gpt-edit")
         response_text = response.get_data(as_text=True)
-        self.assertNotIn("access_token", response_text)
-        self.assertNotIn("copy_line", response_text)
-        self.assertNotIn("existing-access-token", response_text)
+        self.assertIn("access_token", response_text)
+        self.assertIn("copy_line", response_text)
+        self.assertIn("existing-access-token", response_text)
         rows = self.stored_gpt_accounts()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["id"], "gpt-edit")
@@ -184,7 +184,7 @@ class CodexRelayWebUiTests(unittest.TestCase):
         self.assertEqual(rows[0]["copy_line"], "editable@example.com----existing-access-token----totp")
         self.assertEqual(rows[0]["email_provider_context"], {"project_code": "chatgpt001"})
 
-    def test_gpt_account_list_does_not_expose_token_or_copy_line(self):
+    def test_gpt_account_list_exposes_complete_local_account_material(self):
         token = "eyJ0eXAiOiJKV1QifQ.eyJzdWIiOiJ0ZXN0In0.synthetic-signature"
         self.seed_gpt_accounts({
             "id": "gpt-secret", "email": "secret@example.com",
@@ -202,10 +202,10 @@ class CodexRelayWebUiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             item = response.get_json()["items"][0]
             for field in ("access_token", "gpt_access_token", "id_token", "refresh_token", "copy_line", "unrecognized_secret_material"):
-                self.assertNotIn(field, item)
+                self.assertIn(field, item)
             response_text = response.get_data(as_text=True)
             for secret in (token, "synthetic-refresh-token", "unrecognized-secret-sentinel"):
-                self.assertNotIn(secret, response_text)
+                self.assertIn(secret, response_text)
         stored = self.stored_gpt_accounts()[0]
         self.assertEqual(stored["access_token"], token)
         self.assertEqual(stored["copy_line"], f"secret@example.com----{token}----totp")
@@ -494,7 +494,7 @@ class CodexRelayWebUiTests(unittest.TestCase):
         }
         self.assertNotEqual(completed["authorizing@example.com"].get("active_operation"), "authorizing")
 
-    def test_outlook_import_and_account_edit_keep_credentials_out_of_response(self):
+    def test_outlook_import_and_account_edit_keep_credentials_in_local_response(self):
         response = self.client.post("/api/gpt-accounts/import", json={
             "text": "outlook@example.com----mailbox-password----client-id----refresh-token",
         })
@@ -502,11 +502,11 @@ class CodexRelayWebUiTests(unittest.TestCase):
 
         account = self.client.get("/api/gpt-accounts").get_json()["items"][0]
         self.assertEqual(account["email_provider_label"], "Outlook")
-        self.assertNotIn("mailbox_password", account)
-        self.assertNotIn("outlook_client_id", account)
-        self.assertNotIn("outlook_refresh_token", account)
-        self.assertNotIn("mailbox-password", str(account))
-        self.assertNotIn("refresh-token", str(account))
+        self.assertEqual(account["mailbox_password"], "mailbox-password")
+        self.assertEqual(account["outlook_client_id"], "client-id")
+        self.assertEqual(account["outlook_refresh_token"], "refresh-token")
+        self.assertIn("mailbox-password", str(account))
+        self.assertIn("refresh-token", str(account))
         stored = self.stored_gpt_accounts()[0]
         self.assertEqual(stored["mailbox_password"], "mailbox-password")
         self.assertEqual(stored["outlook_refresh_token"], "refresh-token")

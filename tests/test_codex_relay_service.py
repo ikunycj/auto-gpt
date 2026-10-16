@@ -427,7 +427,7 @@ def test_import_supports_chatgpt_password_and_email_code_url(relay_storage):
     assert stored.get("totp_secret") == ""
 
 
-def test_import_json_proxy_alias_normalizes_and_hides_proxy_from_public_account(relay_storage):
+def test_import_json_proxy_alias_normalizes_and_exposes_proxy_in_public_account(relay_storage):
     raw_proxy = "proxy.example:8080:proxy-user:proxy-pass"
     relay.import_accounts(json.dumps({
         "email": "proxy-import@example.com",
@@ -444,9 +444,8 @@ def test_import_json_proxy_alias_normalizes_and_hides_proxy_from_public_account(
     serialized = json.dumps(public)
     assert public["has_proxy"] is True
     assert public["proxy_source"] == "proxy_used"
-    assert "proxy" not in public
-    assert raw_proxy not in serialized
-    assert "proxy-pass" not in serialized
+    assert public["proxy"] == "http://proxy-user:proxy-pass@proxy.example:8080"
+    assert "proxy-pass" in serialized
 
 
 def test_ensure_account_material_persists_proxy_and_preserves_existing_relay_value(relay_storage):
@@ -1222,12 +1221,12 @@ def test_fixed_sms_context_is_thread_local(monkeypatch):
     assert seen["b"] == ("8613412345678", "https://sms.example/b")
 
 
-def test_task_logs_keep_phone_numbers_visible(relay_storage, monkeypatch):
+def test_task_logs_keep_complete_values_visible(relay_storage, monkeypatch):
     monkeypatch.delenv("CODEX_RELAY_SHOW_FULL_URLS", raising=False)
     relay._append_log("job-phone", "手机号 +14155550123 已提交，URL https://sms.example/code")
     log = relay.read_log("job-phone")
     assert "14155550123" in log
-    assert "https://sms.example/code" not in log
+    assert "https://sms.example/code" in log
     assert "手机号已隐藏" not in log
 
 
@@ -1236,7 +1235,7 @@ def test_redaction_keeps_phone_and_browser_diagnostics_readable():
         "phone=+14155550123 chrome=154.0.8037.44 "
         "debuggerAddress=127.0.0.1:51471 0 chromedriver 0x0000000102ca3884"
     )
-    redacted = relay._redact(text)
+    redacted = relay._diagnostic_text(text)
     assert "+14155550123" in redacted
     assert "手机号已隐藏" not in redacted
     assert "154.0.8037.44" in redacted
@@ -1244,7 +1243,7 @@ def test_redaction_keeps_phone_and_browser_diagnostics_readable():
     assert "0x0000000102ca3884" in redacted
 
 
-def test_task_logs_redact_otp_values_only_in_explicit_otp_context(relay_storage):
+def test_task_logs_keep_otp_values_in_every_context(relay_storage):
     otp = "654321"
     for message in (
         f"验证码：{otp}",
@@ -1252,10 +1251,10 @@ def test_task_logs_redact_otp_values_only_in_explicit_otp_context(relay_storage)
         f"提交手机验证码={otp}",
         f"code={otp}",
     ):
-        assert otp not in relay._redact(message)
+        assert otp in relay._diagnostic_text(message)
 
     # Ordinary numeric diagnostics remain useful to operators.
-    assert otp in relay._redact(f"任务已重试 {otp} 次")
+    assert otp in relay._diagnostic_text(f"任务已重试 {otp} 次")
 
 
 def test_browser_assist_wait_defaults_to_five_minutes(monkeypatch):
@@ -1394,5 +1393,4 @@ def test_oauth_route_is_selected_once_and_saved_privately(relay_storage, monkeyp
     assert stored["_codex_verified_proxy"] == route
     assert stored["codex_profile_id"] == "temporary-profile"
     assert relay._read(relay._JOBS_PATH)[0]["status"] == "success"
-    assert "_codex_verified_proxy" not in relay._public_account(stored)
-    assert "private" not in json.dumps(relay.list_jobs())
+    assert relay._public_account(stored)["_codex_verified_proxy"] == route

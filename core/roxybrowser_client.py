@@ -37,12 +37,7 @@ def _join_url(base: str, path: str) -> str:
     return urljoin(base.rstrip("/") + "/", path.lstrip("/"))
 
 
-def _mask_proxy(proxy_url: str) -> str:
-    parsed = urlparse(str(proxy_url or "").strip())
-    if parsed.username or parsed.password:
-        host = parsed.hostname or ""
-        port = f":{parsed.port}" if parsed.port else ""
-        return f"{parsed.scheme}://***:***@{host}{port}"
+def _proxy_value(proxy_url: str) -> str:
     return str(proxy_url or "").strip()
 
 
@@ -66,7 +61,7 @@ def _proxy_url_to_roxy_info(proxy_url: str) -> dict:
     if scheme not in ("http", "https", "socks5", "socks5h"):
         raise ValueError(f"Roxy 暂不支持该代理协议: {scheme or '-'}")
     if not parsed.hostname or not parsed.port:
-        raise ValueError(f"代理格式缺少 host/port: {_mask_proxy(text)}")
+        raise ValueError(f"代理格式缺少 host/port: {_proxy_value(text)}")
 
     protocol = {
         "http": "HTTP",
@@ -156,8 +151,8 @@ def _read_profile_proxy(client, profile_id: str) -> str:
         if len(matches) != 1:
             raise ValueError()
         return _proxy_info_to_url(matches[0].get("proxyInfo"))
-    except Exception:
-        raise RuntimeError("Roxy list_v3 无法确认当前 Profile 的代理或本机网络配置") from None
+    except Exception as exc:
+        raise RuntimeError(f"Roxy list_v3 无法确认当前 Profile 的代理或本机网络配置：{exc}") from exc
 
 
 def _dig(payload: dict, *keys: str):
@@ -273,14 +268,19 @@ class RoxyBrowserClient:
                 except Exception:
                     payload = {"raw": text}
                 if not (200 <= resp.status_code < 300):
-                    raise RuntimeError(f"Roxy API 请求失败 {method_u} {path} HTTP {resp.status_code}")
+                    raise RuntimeError(
+                        f"Roxy API 请求失败 {method_u} {path} HTTP {resp.status_code}; "
+                        f"payload={payload!r}; body={text}"
+                    )
                 if isinstance(payload, dict):
                     code = payload.get("code")
                     ok = payload.get("ok")
                     success = payload.get("success")
                     if code not in (None, 0, 200, "0", "200") and ok is not True and success is not True:
-                        safe_code = code if isinstance(code, int) else str(code) if str(code).isdigit() and len(str(code)) <= 6 else "unknown"
-                        raise RuntimeError(f"Roxy API 返回失败 {method_u} {path} code={safe_code}")
+                        raise RuntimeError(
+                            f"Roxy API 返回失败 {method_u} {path} code={code!r}; "
+                            f"payload={payload!r}; body={text}"
+                        )
                 if attempt > 1:
                     logger.info("[Roxy] API 重试成功：%s %s attempt=%s/%s", method_u, path, attempt, max_attempts)
                 return payload if isinstance(payload, dict) else {"data": payload}

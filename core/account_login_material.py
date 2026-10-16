@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Read and sanitize ChatGPT login material from a GPT account row."""
+"""Read ChatGPT login material from a GPT account row."""
 from __future__ import annotations
 
 from typing import Any

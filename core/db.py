@@ -137,7 +137,8 @@ def _sync_generic_api_email_txt(rows: list[dict]) -> None:
 
 
 def _sync_accounts_txt(rows: list[dict]) -> None:
-    lines = [_registered_email_line(r) for r in sorted(rows, key=lambda x: str(x.get("id") or ""))]
+    registered = [row for row in rows if not row.get("registration_pending")]
+    lines = [_registered_email_line(r) for r in sorted(registered, key=lambda x: str(x.get("id") or ""))]
     sqlite_store.write_file(
         _ACCOUNTS_TXT,
         "\n".join(lines) + ("\n" if lines else ""),
@@ -334,7 +335,6 @@ def _find_by_email(rows: list[dict], email: str) -> dict | None:
 
 def _decorate_account(row: dict) -> dict:
     out = dict(row)
-    out.pop("_codex_verified_proxy", None)
     out["note"] = out.get("note") or ""
     out["note_updated_at"] = out.get("note_updated_at") or ""
     plan_status = out.get("plan_check_status")
@@ -490,6 +490,7 @@ def _insert_account_locked(
         "codex_error": codex_error if codex_error is not None else row.get("codex_error"),
         "updated_at": _now(),
     })
+    row.pop("registration_pending", None)
 
     if mailbox:
         _mailbox_material(row, mailbox)
@@ -1895,6 +1896,56 @@ def update_job(
         if account_id is not None:
             row["account_id"] = account_id
         _save_jobs(rows)
+
+
+def ensure_registration_account(
+    email: str,
+    *,
+    source: str = "",
+    provider_context: dict | None = None,
+    job_id: int | None = None,
+) -> str:
+    """Persist a claimed registration mailbox in GPT accounts and link its job."""
+    normalized = str(email or "").strip().lower()
+    if not normalized or "@" not in normalized:
+        raise ValueError("注册邮箱格式无效")
+
+    now = _now()
+    with _LOCK, sqlite_store.write_transaction(_ACCOUNTS_JSON):
+        accounts = _load_accounts()
+        account = _find_by_email(accounts, normalized)
+        if account is None:
+            account = {
+                "id": uuid.uuid4().hex,
+                "email": normalized,
+                "created_at": now,
+                "updated_at": now,
+                "registration_pending": True,
+                "email_source": str(source or "").strip().lower(),
+                "email_provider": str(source or "").strip().lower(),
+                "email_provider_context": dict(provider_context or {}),
+            }
+            accounts.append(account)
+        elif not account.get("access_token"):
+            account["registration_pending"] = True
+            account["email_source"] = str(source or account.get("email_source") or "").strip().lower()
+            account["email_provider"] = account["email_source"]
+            if provider_context:
+                account["email_provider_context"] = dict(provider_context)
+            account["updated_at"] = now
+
+        account_id = str(account["id"])
+        _save_accounts(accounts)
+
+        if job_id is not None:
+            jobs = _load_jobs()
+            job = next((row for row in jobs if int(row.get("id") or 0) == int(job_id)), None)
+            if job is not None:
+                job["email"] = normalized
+                job["account_id"] = account_id
+                _save_jobs(jobs)
+
+    return account_id
 
 
 def list_jobs(limit: int = 100) -> list[dict]:

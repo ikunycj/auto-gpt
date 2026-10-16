@@ -31,6 +31,21 @@ class MailNestClientTests(unittest.TestCase):
         kwargs = request.call_args.kwargs
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer key-123")
         self.assertEqual(kwargs["json"], {"project_code": "chatgpt001", "count": 1})
+        self.assertIn("verify", kwargs)
+
+    @patch("core.mailnest_client.requests.request")
+    def test_mailnest_proxy_is_used_only_for_mailnest_api(self, request):
+        response = Mock(status_code=200)
+        response.json.return_value = {"code": "00000", "data": [{"email": "proxy@mailnest.test"}]}
+        request.return_value = response
+        with patch.object(mailnest_client._email_cfg, "MAIL_NEST_API_KEY", "key-123", create=True), patch.object(
+            mailnest_client._email_cfg, "MAIL_NEST_PROJECT_CODE", "chatgpt001", create=True
+        ), patch.dict("os.environ", {"MAIL_NEST_PROXY": "http://proxy.example:8080"}, clear=False):
+            mailnest_client.pick_account()
+        assert request.call_args.kwargs["proxies"] == {
+            "http": "http://proxy.example:8080",
+            "https": "http://proxy.example:8080",
+        }
 
     @patch("core.mailnest_client.time.sleep")
     @patch("core.mailnest_client.requests.request")

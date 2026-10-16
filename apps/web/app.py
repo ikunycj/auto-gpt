@@ -12,6 +12,7 @@ Flask 本地控制台。
 默认绑定 127.0.0.1，仅本地访问。
 """
 import logging
+import hashlib
 import time
 import uuid
 from pathlib import Path
@@ -81,39 +82,70 @@ def _paginate_items(items: list[dict], *, page: int, page_size: int) -> dict:
     }
 
 
-# The GPT account row is also the durable credential record. List/edit
-# responses only expose fields used for the workspace display; a new stored
-# field must not silently become part of the HTTP response.
-_PUBLIC_GPT_ACCOUNT_FIELDS = frozenset({
-    "id", "email", "registration_status", "registration_status_raw",
-    "codex_status", "codex_status_raw", "phone_status", "phone", "phone_number",
-    "sms_code_url", "sms_provider", "phone_verified_at", "password",
-    "chatgpt_password", "totp_secret", "email_code_url", "login_method",
-    "has_password", "has_totp", "has_email_code_url", "has_phone",
-    "has_sms_code_url", "has_proxy", "proxy_source", "proxy_display", "email_provider",
-    "email_provider_label", "gpt_status", "liveness_status", "quota_plan",
-    "plan", "quota_status", "note", "created_at", "updated_at",
-    "password_changed_at", "twofa_enabled_at", "codex_authorized_at",
-    "registration_job_id", "codex_job_id", "codex_job_kind",
-    "registration_job", "codex_job", "maintenance_job", "latest_log",
-    "logs", "log_count", "active_operation", "active_operation_label",
-    "sub2_service_id", "sub2_account_id", "sub2_status", "sub2_checked_at",
-    "sub2_deleted_at", "sub2_liveness_status", "sub2_account_status",
-    "sub2_schedulable", "sub2_quota_plan", "sub2_quota_allowed",
-    "sub2_quota_limit_reached", "sub2_quota_primary_used_percent",
-    "sub2_quota_primary_window_seconds", "sub2_quota_primary_reset_at",
-    "sub2_quota_primary_reset_after_seconds", "sub2_five_hour_utilization",
-    "sub2_five_hour_resets_at", "sub2_five_hour_remaining_seconds",
-    "sub2_five_hour_stats", "sub2_seven_day_utilization",
-    "sub2_seven_day_resets_at", "sub2_seven_day_remaining_seconds",
-    "sub2_seven_day_stats", "sub2_credentials_update_status",
-    "sub2_credentials_updated_at", "sub2_refresh_status", "sub2_refresh_at",
-    "sub2_refresh_error", "sub2_status_error", "sub2_synced_at",
-})
+def _proxy_pool_lists() -> tuple[list[str], list[str]]:
+    from config import proxy as proxy_config
+
+    enabled = [str(value).strip() for value in getattr(proxy_config, "PROXY_POOL", []) or [] if str(value or "").strip()]
+    disabled = [str(value).strip() for value in getattr(proxy_config, "PROXY_POOL_DISABLED", []) or [] if str(value or "").strip()]
+    return enabled, disabled
+
+
+def _proxy_record_id(value: str) -> str:
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:20]
+
+
+def _proxy_records() -> list[dict]:
+    enabled, disabled = _proxy_pool_lists()
+    records = []
+    seen = set()
+    for value, is_enabled in [*( (item, True) for item in enabled), *( (item, False) for item in disabled)]:
+        if value in seen:
+            continue
+        seen.add(value)
+        records.append({
+            "id": _proxy_record_id(value),
+            "proxy": value,
+            "enabled": is_enabled,
+        })
+    return records
+
+
+def _write_proxy_pool_lists(enabled: list[str], disabled: list[str]) -> None:
+    enabled = list(dict.fromkeys(str(value).strip() for value in enabled if str(value or "").strip()))
+    disabled = list(dict.fromkeys(str(value).strip() for value in disabled if str(value or "").strip() and str(value).strip() not in enabled))
+    result = config_editor.update_config({
+        "PROXY_POOL": enabled,
+        "PROXY_POOL_DISABLED": disabled,
+    })
+    if result.get("ignored"):
+        raise ValueError(f"代理配置字段未被接受：{', '.join(result['ignored'])}")
+    import config as config_package
+
+    config_package.reload_all()
+
+
+def _normalize_proxy_for_api(value: object) -> str:
+    from config.proxy import normalize_proxy_url
+
+    normalized = normalize_proxy_url(str(value or "").strip())
+    if not normalized:
+        raise ValueError("代理地址不能为空")
+    return normalized
+
+
+def _find_proxy_record(proxy_id: str) -> tuple[dict, list[str], list[str]]:
+    enabled, disabled = _proxy_pool_lists()
+    for value in enabled:
+        if _proxy_record_id(value) == proxy_id:
+            return {"id": proxy_id, "proxy": value, "enabled": True}, enabled, disabled
+    for value in disabled:
+        if _proxy_record_id(value) == proxy_id:
+            return {"id": proxy_id, "proxy": value, "enabled": False}, enabled, disabled
+    raise LookupError("代理IP不存在或已被删除")
 
 
 def _public_gpt_account(row: dict) -> dict:
-    return {key: value for key, value in row.items() if key in _PUBLIC_GPT_ACCOUNT_FIELDS}
+    return dict(row)
 
 
 def _compact_job_for_list(row: dict) -> dict:
@@ -1139,6 +1171,135 @@ def create_app() -> Flask:
             return jsonify({"ok": True, "items": test_proxies([account_proxy(row)])})
         except ValueError:
             return jsonify({"ok": False, "error": "账号代理配置无效，请编辑后重试"}), 400
+
+    @app.get("/api/proxies")
+    def api_proxies_list():
+        """List proxy records with server-side filtering and pagination."""
+        query = str(request.args.get("q") or "").strip().lower()
+        status_filter = str(request.args.get("status") or "").strip().lower()
+        page = max(1, request.args.get("page", default=1, type=int) or 1)
+        page_size = max(1, min(200, request.args.get("page_size", default=20, type=int) or 20))
+        rows = _proxy_records()
+        if query:
+            rows = [row for row in rows if query in row["proxy"].lower()]
+        if status_filter in {"enabled", "disabled"}:
+            expected = status_filter == "enabled"
+            rows = [row for row in rows if row["enabled"] is expected]
+        return jsonify(_paginate_items(rows, page=page, page_size=page_size))
+
+    @app.post("/api/proxies")
+    def api_proxy_create():
+        data = request.get_json(silent=True) or {}
+        try:
+            value = _normalize_proxy_for_api(data.get("proxy"))
+            enabled, disabled = _proxy_pool_lists()
+            if value in enabled or value in disabled:
+                return jsonify({"ok": False, "error": "代理IP已存在"}), 409
+            _write_proxy_pool_lists([*enabled, value], disabled)
+            record = {"id": _proxy_record_id(value), "proxy": value, "enabled": True}
+            return jsonify({"ok": True, "proxy": record}), 201
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:
+            logger.exception("新增代理IP失败")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
+    @app.patch("/api/proxies/<proxy_id>")
+    def api_proxy_update(proxy_id: str):
+        data = request.get_json(silent=True) or {}
+        try:
+            record, enabled, disabled = _find_proxy_record(proxy_id)
+            next_value = _normalize_proxy_for_api(data["proxy"]) if "proxy" in data else record["proxy"]
+            next_enabled = bool(data["enabled"]) if "enabled" in data else record["enabled"]
+            other_values = set(enabled + disabled) - {record["proxy"]}
+            if next_value in other_values:
+                return jsonify({"ok": False, "error": "代理IP已存在"}), 409
+            enabled = [value for value in enabled if value != record["proxy"]]
+            disabled = [value for value in disabled if value != record["proxy"]]
+            (enabled if next_enabled else disabled).append(next_value)
+            _write_proxy_pool_lists(enabled, disabled)
+            return jsonify({"ok": True, "proxy": {"id": _proxy_record_id(next_value), "proxy": next_value, "enabled": next_enabled}})
+        except LookupError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:
+            logger.exception("更新代理IP失败")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
+    @app.patch("/api/proxies/bulk")
+    def api_proxy_bulk_update():
+        data = request.get_json(silent=True) or {}
+        items = data.get("items")
+        if not isinstance(items, list) or not items:
+            return jsonify({"ok": False, "error": "items 必须是非空数组"}), 400
+        try:
+            enabled, disabled = _proxy_pool_lists()
+            records = {row["id"]: row for row in _proxy_records()}
+            replacements = {}
+            for item in items:
+                if not isinstance(item, dict) or not item.get("id"):
+                    raise ValueError("批量编辑项缺少代理ID")
+                old = records.get(str(item["id"]))
+                if old is None:
+                    raise LookupError("批量编辑包含已删除的代理IP，请刷新后重试")
+                replacements[old["proxy"]] = _normalize_proxy_for_api(item.get("proxy"))
+            remaining = [value for value in enabled + disabled if value not in replacements]
+            next_values = remaining + list(replacements.values())
+            if len(set(next_values)) != len(next_values):
+                return jsonify({"ok": False, "error": "批量编辑后存在重复代理IP"}), 409
+            next_enabled = [replacements.get(value, value) for value in enabled if value not in replacements]
+            next_disabled = [replacements.get(value, value) for value in disabled if value not in replacements]
+            for item in items:
+                old = records[str(item["id"])]
+                new_value = replacements[old["proxy"]]
+                (next_enabled if old["enabled"] else next_disabled).append(new_value)
+            _write_proxy_pool_lists(next_enabled, next_disabled)
+            return jsonify({"ok": True, "updated": len(items)})
+        except LookupError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:
+            logger.exception("批量更新代理IP失败")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
+    @app.delete("/api/proxies/<proxy_id>")
+    def api_proxy_delete_one(proxy_id: str):
+        try:
+            record, enabled, disabled = _find_proxy_record(proxy_id)
+            _write_proxy_pool_lists(
+                [value for value in enabled if value != record["proxy"]],
+                [value for value in disabled if value != record["proxy"]],
+            )
+            return jsonify({"ok": True, "deleted": 1})
+        except LookupError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
+        except Exception as exc:
+            logger.exception("删除代理IP失败")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
+    @app.delete("/api/proxies")
+    def api_proxy_delete_bulk():
+        data = request.get_json(silent=True) or {}
+        ids = [str(value) for value in (data.get("ids") or []) if value]
+        if not ids:
+            return jsonify({"ok": False, "error": "ids 必须是非空数组"}), 400
+        try:
+            enabled, disabled = _proxy_pool_lists()
+            records = {row["id"]: row for row in _proxy_records()}
+            missing = [proxy_id for proxy_id in ids if proxy_id not in records]
+            if missing:
+                return jsonify({"ok": False, "error": "部分代理IP已不存在，请刷新后重试"}), 404
+            removed = {records[proxy_id]["proxy"] for proxy_id in ids}
+            _write_proxy_pool_lists(
+                [value for value in enabled if value not in removed],
+                [value for value in disabled if value not in removed],
+            )
+            return jsonify({"ok": True, "deleted": len(removed)})
+        except Exception as exc:
+            logger.exception("批量删除代理IP失败")
+            return jsonify({"ok": False, "error": str(exc)}), 500
 
     @app.post("/api/proxies/test")
     def api_proxy_test():

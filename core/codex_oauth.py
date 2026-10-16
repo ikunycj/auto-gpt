@@ -62,7 +62,7 @@ _NET_BACKOFF_BASE = 2.0
 
 
 class CodexTokenRefreshError(RuntimeError):
-    """A sanitized Codex OAuth refresh failure.
+    """A Codex OAuth refresh failure with the complete local diagnostic.
 
     ``reauthorization_required`` is only set for OAuth errors which establish
     that the refresh credential is no longer usable. Network/WAF failures must
@@ -1094,7 +1094,7 @@ def _follow_until_callback(session: BrowserSession, url: str, state: str) -> str
 # ============================================================
 
 def _require_oauth_token_pair(token_resp: object, *, context: str = "token") -> dict:
-    """Validate the credential pair without ever including token values in errors."""
+    """Validate the credential pair and preserve the complete response context."""
     if not isinstance(token_resp, dict):
         raise RuntimeError(f"[Codex] {context}响应格式无效")
     missing = []
@@ -1200,9 +1200,6 @@ def refresh_codex_token(
     if not 200 <= http_status < 300:
         error_code = str(payload.get("error") or "").strip().lower()
         description = str(payload.get("error_description") or payload.get("message") or "").strip()
-        # Never echo credentials if an upstream happens to reflect request data.
-        if refresh_token and description:
-            description = description.replace(refresh_token, "[RT已隐藏]")
         reauthorization_required = error_code in {
             "invalid_grant", "invalid_token", "token_expired", "token_revoked",
         }
@@ -1503,7 +1500,7 @@ def run_codex_oauth(
         return _codex_result(status="skipped", message="email 为空")
 
     # Codex OAuth 支持多种驱动：
-    # protocol：原纯协议；roxy/cloak/chrome_cdp/browser_use：用真实浏览器跑页面并捕获 localhost callback。
+    # protocol：原纯协议；roxy/cloak/chrome_cdp：用真实浏览器跑页面并捕获 localhost callback。
     try:
         from config import codex as _codex_cfg
         from config import roxybrowser as _roxy_cfg
@@ -1520,26 +1517,6 @@ def run_codex_oauth(
                 login_password=login_password,
                 totp_provider=totp_provider,
                 browser_assist_provider=browser_assist_provider,
-                proxy=proxy,
-                force=True,
-            )
-        if oauth_driver in ("browser_use", "browseruse", "browser-use", "bu"):
-            from core.browser_use_codex_oauth import run_browser_use_codex_oauth
-            return run_browser_use_codex_oauth(
-                email,
-                otp_provider=otp_provider,
-                login_password=login_password,
-                totp_provider=totp_provider,
-                proxy=proxy,
-                force=True,
-            )
-        if oauth_driver in ("skyvern", "sv"):
-            from core.skyvern_codex_oauth import run_skyvern_codex_oauth
-            return run_skyvern_codex_oauth(
-                email,
-                otp_provider=otp_provider,
-                login_password=login_password,
-                totp_provider=totp_provider,
                 proxy=proxy,
                 force=True,
             )
@@ -1598,7 +1575,7 @@ def run_codex_oauth(
                     except Exception:
                         pass
         if oauth_driver not in ("protocol", "api", "http"):
-            raise RuntimeError(f"[Codex] 不支持的 CODEX_OAUTH_DRIVER={oauth_driver!r}，可选 protocol / roxy / cloak / chrome_cdp / browser_use / skyvern")
+            raise RuntimeError(f"[Codex] 不支持的 CODEX_OAUTH_DRIVER={oauth_driver!r}，可选 protocol / roxy / cloak / chrome_cdp")
     except ImportError:
         if require_browser:
             return _codex_result(
@@ -1614,7 +1591,7 @@ def run_codex_oauth(
         return _codex_result(
             status="failed",
             email=email,
-            message="当前 Codex 授权驱动不支持密码登录，请切换到浏览器驱动（Chrome/Roxy/Cloak/Browser Use/Skyvern）",
+            message="当前 Codex 授权驱动不支持密码登录，请切换到浏览器驱动（Chrome/Roxy/Cloak）",
         )
 
     if otp_provider is None:

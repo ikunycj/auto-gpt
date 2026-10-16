@@ -64,8 +64,8 @@ class ConfigDefaultFallbackTests(unittest.TestCase):
 
     def test_config_editor_blank_env_value_falls_back_to_source_default(self):
         self.assertEqual(
-            config_editor._coerce_raw_value("", "wss://connect.browser-use.com", "str"),
-            "wss://connect.browser-use.com",
+            config_editor._coerce_raw_value("", "http://127.0.0.1:50000", "str"),
+            "http://127.0.0.1:50000",
         )
         self.assertTrue(config_editor._coerce_raw_value("", True, "bool"))
 
@@ -83,11 +83,9 @@ class ConfigDefaultFallbackTests(unittest.TestCase):
         self.assertEqual(
             counts,
             {
-                "general": 1,
+                "workspace": 1,
                 "roxy": 33,
                 "cloak": 12,
-                "browser_use": 14,
-                "skyvern": 10,
                 "system_chrome": 4,
                 "locale": 4,
             },

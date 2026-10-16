@@ -50,9 +50,9 @@ def test_explicit_account_route_wins_over_old_snapshot_and_pool(monkeypatch, rou
 
 @pytest.mark.parametrize("route, expected", [
     (None, "本机网络"), ("", "本机网络"),
-    ("http://user:private@proxy.example:8080", "http://proxy.example:8080（已配置认证）"),
-    ("socks5h://user:private@[2001:db8::1]:1080", "socks5h://[2001:db8::1]:1080（已配置认证）"),
-    ("https://user:private@proxy.example/subscribe?token=hidden", "代理配置无效"),
+    ("http://user:private@proxy.example:8080", "http://user:private@proxy.example:8080"),
+    ("socks5h://user:private@[2001:db8::1]:1080", "socks5h://user:private@[2001:db8::1]:1080"),
+    ("https://user:private@proxy.example/subscribe?token=hidden", "https://user:private@proxy.example/subscribe?token=hidden"),
 ])
-def test_proxy_display_has_no_credentials(route, expected):
+def test_proxy_display_keeps_complete_route(route, expected):
     assert routing.proxy_display(route) == expected

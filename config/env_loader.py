@@ -18,12 +18,10 @@ _LOADED = False
 
 # 这些多行列表字段允许用空值显式覆盖为 []。
 # 例如 WebUI 清空代理池后会写入 PROXY_POOL="" / PROXY_POOL="[]"，不能再回退到源码默认本地代理。
-EXPLICIT_EMPTY_LIST_ENV_KEYS = {"PROXY_POOL"}
+EXPLICIT_EMPTY_LIST_ENV_KEYS = {"PROXY_POOL", "PROXY_POOL_DISABLED"}
 
 # 统一管理：env key -> 说明（.env.example 用）
 SECRET_ENV_KEYS: dict[str, str] = {
-    "BROWSER_USE_API_KEY": "Browser Use Cloud API Key",
-    "SKYVERN_API_KEY": "Skyvern API Key",
     "ROXY_API_TOKEN": "RoxyBrowser 本地 API Token",
     "PLAN_CHECK_PROXY": "套餐查询专用代理（可能包含认证信息）",
     "QQ_IMAP_PASSWORD": "QQ 邮箱 IMAP 授权码（不是 QQ 密码）",

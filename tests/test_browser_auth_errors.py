@@ -107,23 +107,21 @@ def test_cdp_unavailable_body_has_bounded_retries():
     "ERR_TUNNEL_CONNECTION_FAILED", "ERR_PROXY_CONNECTION_FAILED",
     "ERR_SOCKS_CONNECTION_FAILED", "ERR_SSL_PROTOCOL_ERROR",
 ])
-@pytest.mark.parametrize("formatter", [oauth._redact_diagnostic_text, registration._safe_exception_text])
-def test_network_error_keeps_actionable_code_without_secrets(code, formatter):
+@pytest.mark.parametrize("formatter", [oauth._diagnostic_text, registration._diagnostic_text])
+def test_network_error_keeps_complete_diagnostic(code, formatter):
     message = formatter(f"Message: net::{code} https://user:proxy-secret@proxy.example/?token=oauth-secret Stacktrace: 0 chromedriver")
     assert code in message
-    assert "未自动切换为直连" in message
-    assert "不能用于判断账号是否停用" in message
-    for secret in ("proxy-secret", "oauth-secret", "proxy.example", "Stacktrace", "chromedriver"):
-        assert secret not in message
+    for value in ("proxy-secret", "oauth-secret", "proxy.example", "Stacktrace", "chromedriver"):
+        assert value in message
 
 
-@pytest.mark.parametrize("formatter", [oauth._redact_diagnostic_text, registration._safe_exception_text])
+@pytest.mark.parametrize("formatter", [oauth._diagnostic_text, registration._diagnostic_text])
 def test_phone_ip_and_browser_version_are_not_masked(formatter):
     message = formatter("phone=+8613812345678 debugger=127.0.0.1:51471 chrome=154.0.8037.44 token=private-value")
     assert "+8613812345678" in message
     assert "127.0.0.1:51471" in message
     assert "154.0.8037.44" in message
-    assert "private-value" not in message
+    assert "private-value" in message
 
 
 def test_javascript_observer_preserves_fetch_xhr_and_only_saves_whitelisted_code():
@@ -169,7 +167,7 @@ async function check(url, status, body, expected, brokenClone = false) {
   xhr.open('POST', AUTH); xhr.status = 403; xhr.responseText = '{"code":"account_banned","token":"private-token"}';
   xhr.send();
   assert.equal(context.__accountAuthError, 'account_banned');
-  assert.deepEqual(Object.keys(context).filter(k => k.startsWith('__account')).sort(), ['__accountAuthError', '__accountErrorObserverInstalled']);
+    assert.deepEqual(Object.keys(context).filter(k => k.startsWith('__account')).sort(), ['__accountAuthError', '__accountAuthErrorDetails', '__accountErrorObserverInstalled']);
   response = rejection;
   await assert.rejects(context.fetch(AUTH), error => error === rejection);
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -9,7 +9,7 @@ def test_normalize_proxy_preserves_url_format():
     assert normalize_proxy_url("socks5h://user:pass@proxy.example:5782") == "socks5h://user:pass@proxy.example:5782"
 
 
-def test_normalize_proxy_errors_do_not_echo_credentials():
+def test_normalize_proxy_errors_keep_complete_input_for_local_audit():
     value = "proxy.example:not-a-port:secret-user:secret-password"
     try:
         normalize_proxy_url(value)
@@ -17,5 +17,5 @@ def test_normalize_proxy_errors_do_not_echo_credentials():
         message = str(exc)
     else:
         raise AssertionError("expected invalid proxy to raise")
-    assert "secret-user" not in message
-    assert "secret-password" not in message
+    assert "secret-user" in message
+    assert "secret-password" in message

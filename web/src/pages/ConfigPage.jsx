@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ArrowDown, ArrowUp, AtSign, Cloud, CloudCog, Database, Info, KeyRound,
-  Fingerprint, Globe2, Link2, Mail, MailPlus, Monitor, PanelsTopLeft, RefreshCw,
+  ArrowDown, ArrowUp, AtSign, Cloud, Database, Info, KeyRound,
+  Fingerprint, Globe2, Link2, Mail, MailPlus, Monitor, RefreshCw,
   Save, Settings2, ShieldCheck, Smartphone, Terminal, Upload, WandSparkles,
 } from 'lucide-react';
 import { get, post } from '../api';
-import ProxyTest from '../components/ProxyTest';
-import {
-  Button, Card, ErrorState, IconButton, InlineNotice, SectionHeader, Select,
+import { ActionButton, Input, Textarea, CheckboxControl, SelectInput, AdvancedFields, Switch,
+  useConfirm, ChoiceTabs, ChoiceTab, Button, Card, ErrorState, IconButton, InlineNotice, SectionHeader, Select,
 } from '../components/ui';
 
 const EMAIL_CHANNELS = [
@@ -59,7 +58,7 @@ const EMAIL_CHANNELS = [
     id: 'cloudflare',
     label: 'Cloudflare Worker',
     title: 'Cloudflare Worker 临时邮箱',
-    icon: CloudCog,
+    icon: Cloud,
     description: '连接 Cloudflare 临时邮箱服务。',
     tooltip: '如果你没有服务地址或不知道鉴权方式，请先不要启用该渠道。',
     navHint: '连接已有 Worker 邮箱服务',
@@ -181,15 +180,6 @@ const SMS_CHANNELS = [
 
 const BROWSER_MODULES = [
   {
-    id: 'general',
-    label: '总览与驱动',
-    title: '浏览器总览与驱动',
-    icon: Settings2,
-    description: '选择注册流程默认使用的浏览器驱动。各驱动的凭证、会话和指纹参数在对应模块中单独配置。',
-    tooltip: '先在这里选择注册驱动；选择后只需要配置对应驱动模块，其他浏览器的设置不会参与当前流程。',
-    setup: '需要：选择一个注册驱动。授权驱动在“Codex”模块中单独设置。',
-  },
-  {
     id: 'roxy',
     label: 'RoxyBrowser',
     title: 'RoxyBrowser',
@@ -206,24 +196,6 @@ const BROWSER_MODULES = [
     description: '配置 Cloak 无头模式、人工行为、出口地区、指纹和用户目录。',
     tooltip: '填写 Cloak License（如有）；通常先配置是否无头、是否使用代理，再按需要固定地区或指纹。',
     setup: '需要：已安装 CloakBrowser；License 可选，免费 binary 可留空。',
-  },
-  {
-    id: 'browser_use',
-    label: 'Browser Use',
-    title: 'Browser Use Cloud',
-    icon: PanelsTopLeft,
-    description: '配置 Browser Use Cloud 的 API、CDP、代理国家、Profile 和会话超时。',
-    tooltip: '填写 Browser Use API Key 和 CDP 地址；启用内置代理时填写两位国家码，例如 jp 或 us。',
-    setup: '需要：Browser Use API Key；官方 CDP 模式通常保持默认地址。',
-  },
-  {
-    id: 'skyvern',
-    label: 'Skyvern',
-    title: 'Skyvern Cloud Browser',
-    icon: CloudCog,
-    description: '配置 Skyvern Session、Profile、代理地区、浏览器类型和会话保留策略。',
-    tooltip: '填写 Skyvern API Key 和 API 地址；代理地区使用 jp/us 等简写，系统会转换为 Skyvern 参数。',
-    setup: '需要：Skyvern API Key 和可用 API 地址；Profile、代理地区均可选。',
   },
   {
     id: 'system_chrome',
@@ -286,7 +258,7 @@ const ADVANCED_EMAIL_FIELD_KEYS = new Set([
 
 // Older WebUI processes may not return browser_module metadata until restarted.
 const BROWSER_MODULE_BY_KEY = {
-  REGISTRATION_DRIVER: 'general',
+  REGISTRATION_DRIVER: 'workspace',
   BROWSER_LOCALE_PROFILE: 'locale', AUTO_BROWSER_LOCALE_FROM_IP: 'locale',
   IP_GEO_TIMEOUT: 'locale', REJECT_CLOUD_PROXY: 'locale',
 };
@@ -294,8 +266,6 @@ const BROWSER_MODULE_BY_KEY = {
 const BROWSER_LEGACY_KEYS = {
   RoxyBrowser: 'roxy',
   CloakBrowser: 'cloak',
-  'Browser Use': 'browser_use',
-  Skyvern: 'skyvern',
   '系统 Chrome': 'system_chrome',
   '地区与指纹': 'locale',
 };
@@ -310,13 +280,15 @@ const SMS_LEGACY_KEYS = {
 const GROUP_META = {
   '功能开关': '决定哪些自动流程运行',
   '代理浏览器': '浏览器驱动、指纹和运行参数', '人工节奏': '注册操作之间的随机等待',
-  '代理池': '注册和查询使用的网络代理', '提链': '支付链接提取服务',
+  '代理IP设置': '套餐查询和 Token 生成的网络参数', '代理池': '注册使用的代理池', '提链': '支付链接提取服务',
   Codex: '授权、Token 和同步服务', '接码平台': '手机号接码平台接口', 'Flow Trigger': '注册成功后的回调接口',
 };
 
+const HIDDEN_WORKSPACE_GROUPS = new Set(['代理池']);
+
 const SETTINGS_SECTIONS = [
   { label: '运行与安全', groups: ['功能开关', '人工节奏'] },
-  { label: '浏览器与网络', groups: ['代理池'] },
+  { label: '浏览器与网络', groups: ['代理IP设置'] },
   { label: '外部服务', groups: ['Codex', 'Flow Trigger', '提链'] },
 ];
 
@@ -345,8 +317,6 @@ function browserModuleForField(field) {
   const key = String(field.key || '');
   if (key.startsWith('ROXY_')) return 'roxy';
   if (key.startsWith('CLOAK_')) return 'cloak';
-  if (key.startsWith('BROWSER_USE_')) return 'browser_use';
-  if (key.startsWith('SKYVERN_')) return 'skyvern';
   if (key.startsWith('CHROME_CDP_')) return 'system_chrome';
   return '';
 }
@@ -360,9 +330,9 @@ function normalizeActiveKey(value) {
     const groupId = EMAIL_CHANNEL_TO_GROUP[id];
     return groupId ? `email:${groupId}` : 'email:general';
   }
-  if (raw === '代理浏览器' || raw === 'browser') return 'browser:general';
+  if (raw === '代理浏览器' || raw === 'browser') return 'browser:roxy';
   if (BROWSER_LEGACY_KEYS[raw]) return `browser:${BROWSER_LEGACY_KEYS[raw]}`;
-  if (raw.startsWith('browser:')) return BROWSER_MODULES.some((item) => `browser:${item.id}` === raw) ? raw : 'browser:general';
+  if (raw.startsWith('browser:')) return BROWSER_MODULES.some((item) => `browser:${item.id}` === raw) ? raw : 'browser:roxy';
   if (raw === '接码平台' || raw === '手机接码' || raw === 'sms') return 'sms:general';
   if (SMS_LEGACY_KEYS[raw]) return `sms:${SMS_LEGACY_KEYS[raw]}`;
   if (raw.startsWith('sms:')) return SMS_CHANNELS.some((item) => `sms:${item.id}` === raw) ? raw : 'sms:general';
@@ -388,7 +358,8 @@ function groupIcon(name) {
   return Settings2;
 }
 
-export default function ConfigPage({ notify, summary, initialGroup = '', onOpenEmail, onOpenGptRegistration, onSummaryRefresh, onDirtyChange }) {
+export default function ConfigPage({ notify, summary, initialGroup = '', onOpenEmail, onOpenGptRegistration, onSummaryRefresh, onDirtyChange, onConfigSaved, configRevision = 0 }) {
+  const confirm = useConfirm();
   const [fields, setFields] = useState([]);
   const [draft, setDraft] = useState({});
   const [activeKey, setActiveKey] = useState(() => normalizeActiveKey(initialGroup));
@@ -423,7 +394,7 @@ export default function ConfigPage({ notify, summary, initialGroup = '', onOpenE
         const emailValid = normalized.startsWith('email:') && EMAIL_SETTING_GROUPS.some((group) => `email:${group.id}` === normalized);
         const browserValid = normalized.startsWith('browser:') && BROWSER_MODULES.some((item) => `browser:${item.id}` === normalized);
         const smsValid = normalized.startsWith('sms:') && SMS_CHANNELS.some((item) => `sms:${item.id}` === normalized);
-        const groupValid = list.some((field) => !channelForField(field) && !smsChannelForField(field) && !browserModuleForField(field) && (field.group || '其他') === normalized);
+        const groupValid = list.some((field) => !channelForField(field) && !smsChannelForField(field) && !browserModuleForField(field) && !HIDDEN_WORKSPACE_GROUPS.has(field.group || '其他') && (field.group || '其他') === normalized);
         if (emailValid || browserValid || smsValid || groupValid) return normalized;
         return 'email:general';
       });
@@ -436,7 +407,7 @@ export default function ConfigPage({ notify, summary, initialGroup = '', onOpenE
     }
   }, [initialGroup]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { load(); }, [load, configRevision]);
 
   const isDirty = useMemo(() => draftSnapshot(draft) !== draftSnapshot(savedDraft), [draft, savedDraft]);
   useEffect(() => {
@@ -453,14 +424,14 @@ export default function ConfigPage({ notify, summary, initialGroup = '', onOpenE
     return () => window.removeEventListener('beforeunload', onBeforeUnload);
   }, [isDirty]);
 
-  function selectSettingsKey(key) {
-    if (key !== activeKey && isDirty && !window.confirm('设置有未保存修改，确定切换吗？')) return;
+  async function selectSettingsKey(key) {
+    if (key !== activeKey && isDirty && !await confirm('设置有未保存修改，确定切换吗？')) return;
     setActiveKey(key);
     setToolResult('');
   }
 
-  function reloadConfig() {
-    if (isDirty && !window.confirm('设置有未保存修改，重新读取会丢失这些修改，继续吗？')) return;
+  async function reloadConfig() {
+    if (isDirty && !await confirm('设置有未保存修改，重新读取会丢失这些修改，继续吗？')) return;
     load();
   }
 
@@ -470,8 +441,8 @@ export default function ConfigPage({ notify, summary, initialGroup = '', onOpenE
 
   const emailFields = useMemo(() => fields.filter((field) => channelForField(field)), [fields]);
   const smsFields = useMemo(() => fields.filter((field) => smsChannelForField(field)), [fields]);
-  const browserFields = useMemo(() => fields.filter((field) => browserModuleForField(field)), [fields]);
-  const groups = useMemo(() => [...new Set(fields.filter((field) => !channelForField(field) && !smsChannelForField(field) && !browserModuleForField(field)).map((field) => field.group || '其他'))], [fields]);
+  const browserFields = useMemo(() => fields.filter((field) => browserModuleForField(field) && field.key !== 'REGISTRATION_DRIVER'), [fields]);
+  const groups = useMemo(() => [...new Set(fields.filter((field) => !channelForField(field) && !smsChannelForField(field) && !browserModuleForField(field) && !HIDDEN_WORKSPACE_GROUPS.has(field.group || '其他')).map((field) => field.group || '其他'))], [fields]);
   const activeEmailGroupId = activeKey.startsWith('email:') ? activeKey.slice('email:'.length) : '';
   const activeEmailGroup = EMAIL_SETTING_GROUPS.find((group) => group.id === activeEmailGroupId) || null;
   const activeChannelId = activeEmailGroup?.channelIds.length === 1 ? activeEmailGroup.channelIds[0] : '';
@@ -521,6 +492,7 @@ export default function ConfigPage({ notify, summary, initialGroup = '', onOpenE
       setSavedAt(new Date());
       setSavedDraft(updates);
       await load();
+      await onConfigSaved?.();
       await onSummaryRefresh?.();
     } catch (saveError) { notify(saveError.message, 'error'); }
     finally { setSaving(false); }
@@ -575,11 +547,6 @@ export default function ConfigPage({ notify, summary, initialGroup = '', onOpenE
   }
 
   function renderField(field) {
-    if (field.key === 'PROXY_POOL') return <div key={field.key} className="config-field">
-      <ConfigField field={field} value={draft[field.key]} showKey disabled={formBusy} onChange={(value) => update(field.key, value)} />
-      <p className="field-help">测试当前输入，无需先保存；每行一个代理，最多 20 条。留空测试本机网络，测试不修改 Roxy 窗口。</p>
-      <ProxyTest proxies={String(draft[field.key] || '').split('\n').map((value) => value.trim()).filter(Boolean)} disabled={formBusy} label="测试代理 / 本机网络" />
-    </div>;
     return field.key === 'EMAIL_SOURCE'
       ? <EmailSourcePicker key={field.key} value={draft[field.key]} draft={draft} runtime={summary?.registration_email} disabled={formBusy} onChange={(value) => update(field.key, value)} />
       : <ConfigField key={field.key} field={field} value={draft[field.key]} showKey={!activeChannel} disabled={formBusy} onChange={(value) => update(field.key, value)} />;
@@ -614,7 +581,7 @@ export default function ConfigPage({ notify, summary, initialGroup = '', onOpenE
         {activeChannel?.id === 'cloudmail' ? <CloudmailTool toolBusy={toolBusy} disabled={formBusy} onRun={cloudmail} /> : null}
         {activeBrowser?.id === 'roxy' && hasRoxyFields ? <RoxyTool toolBusy={toolBusy} disabled={formBusy} roxyItems={roxyItems} roxySelection={roxySelection} onLoad={loadRoxy} onSelect={selectRoxy} /> : null}
         {toolResult ? <div className="config-tool-result">{toolResult}</div> : null}
-        {loading ? <div className="form-loading"><span /><span /><span /></div> : <div className="config-fields">{primaryVisible.map(renderField)}{advancedVisible.length ? <details className="config-advanced-fields"><summary><span>高级设置</span><small>一般不需要修改</small></summary><div className="config-advanced-grid">{advancedVisible.map(renderField)}</div></details> : null}{!visible.length && activeChannel?.id !== 'generic_api' ? <div className="empty-state"><WandSparkles size={20} /><strong>暂无可编辑字段</strong><span>{activeBrowser ? '该浏览器模块暂时没有可编辑字段。' : '该渠道通过“邮箱”页面或外部服务管理。'}</span></div> : null}</div>}
+        {loading ? <div className="form-loading"><span /><span /><span /></div> : <div className="config-fields">{primaryVisible.map(renderField)}{advancedVisible.length ? <AdvancedFields>{advancedVisible.map(renderField)}</AdvancedFields> : null}{!visible.length && activeChannel?.id !== 'generic_api' ? <div className="empty-state"><WandSparkles size={20} /><strong>暂无可编辑字段</strong><span>{activeBrowser ? '该浏览器模块暂时没有可编辑字段。' : '该渠道通过“邮箱”页面或外部服务管理。'}</span></div> : null}</div>}
       </>}
     </Card></div>
   </div>;
@@ -630,7 +597,7 @@ function EmailChannelGroup({ channels, emailFields, draft, runtime, loading, sav
         <div className="config-email-channel-card-heading"><strong>{channel.label}</strong><small>{channel.navHint || channel.description}</small></div>
         <EmailChannelAction channel={channel} draft={draft} runtime={runtime} disabled={saving} onOpenEmail={onOpenEmail} onOpenRegistration={onOpenRegistration} />
         {channel.id === 'cloudmail' ? <CloudmailTool toolBusy={toolBusy} disabled={saving} onRun={onCloudmail} /> : null}
-        {loading ? <div className="form-loading"><span /><span /><span /></div> : <div className="config-fields">{primaryFields.map((field) => <ConfigField key={field.key} field={field} value={draft[field.key]} showKey={false} disabled={saving} onChange={(value) => onChange(field.key, value)} />)}{advancedFields.length ? <details className="config-advanced-fields"><summary><span>高级设置</span><small>一般不需要修改</small></summary><div className="config-advanced-grid">{advancedFields.map((field) => <ConfigField key={field.key} field={field} value={draft[field.key]} showKey={false} disabled={saving} onChange={(value) => onChange(field.key, value)} />)}</div></details> : null}{!channelFields.length ? <div className="empty-state"><WandSparkles size={20} /><strong>暂无可编辑字段</strong><span>该渠道通过外部服务管理。</span></div> : null}</div>}
+        {loading ? <div className="form-loading"><span /><span /><span /></div> : <div className="config-fields">{primaryFields.map((field) => <ConfigField key={field.key} field={field} value={draft[field.key]} showKey={false} disabled={saving} onChange={(value) => onChange(field.key, value)} />)}{advancedFields.length ? <AdvancedFields>{advancedFields.map((field) => <ConfigField key={field.key} field={field} value={draft[field.key]} showKey={false} disabled={saving} onChange={(value) => onChange(field.key, value)} />)}</AdvancedFields> : null}{!channelFields.length ? <div className="empty-state"><WandSparkles size={20} /><strong>暂无可编辑字段</strong><span>该渠道通过外部服务管理。</span></div> : null}</div>}
       </section>;
     })}
     {toolResult ? <div className="config-tool-result">{toolResult}</div> : null}
@@ -650,38 +617,38 @@ function ConfigNavigation({ fields, groups, activeKey, onSelect }) {
     window.addEventListener('resize', revealActiveItem);
     return () => window.removeEventListener('resize', revealActiveItem);
   }, [activeKey, fields]);
-  const renderGroup = (group) => { const Icon = groupIcon(group); const count = fields.filter((field) => !channelForField(field) && !smsChannelForField(field) && !browserModuleForField(field) && (field.group || '其他') === group).length; return <button className={`config-nav-item ${activeKey === group ? 'is-active' : ''}`} key={group} title={GROUP_META[group] || group} onClick={() => onSelect(group)}><span className="config-nav-icon"><Icon size={15} /></span><span><strong>{group}</strong><small>{GROUP_META[group] || '运行参数'}</small></span><small>{count}</small></button>; };
+  const renderGroup = (group) => { const Icon = groupIcon(group); const count = fields.filter((field) => !channelForField(field) && !smsChannelForField(field) && !browserModuleForField(field) && (field.group || '其他') === group).length; return <ActionButton className={`config-nav-item ${activeKey === group ? 'is-active' : ''}`} key={group} title={GROUP_META[group] || group} onClick={() => onSelect(group)}><span className="config-nav-icon"><Icon size={15} /></span><span><strong>{group}</strong><small>{GROUP_META[group] || '运行参数'}</small></span><small>{count}</small></ActionButton>; };
   const renderBrowserNavigation = () => {
     const count = fields.filter((field) => browserModuleForField(field)).length;
-    return <button className={`config-nav-item config-browser-root-nav ${activeKey.startsWith('browser:') ? 'is-active' : ''}`} title="浏览器驱动、会话和指纹设置" onClick={() => onSelect('browser:general')}><span className="config-nav-icon"><Globe2 size={15} /></span><span><strong>代理浏览器</strong><small>驱动、会话和指纹</small></span><small>{count}</small></button>;
+    return <ActionButton className={`config-nav-item config-browser-root-nav ${activeKey.startsWith('browser:') ? 'is-active' : ''}`} title="浏览器驱动、会话和指纹设置" onClick={() => onSelect('browser:roxy')}><span className="config-nav-icon"><Globe2 size={15} /></span><span><strong>代理浏览器</strong><small>会话和指纹参数</small></span><small>{count}</small></ActionButton>;
   };
   const renderSmsNavigation = () => {
     const count = fields.filter((field) => smsChannelForField(field)).length;
-    return <button className={`config-nav-item config-sms-root-nav ${activeKey.startsWith('sms:') ? 'is-active' : ''}`} title="手机接码平台、开关和接口设置" onClick={() => onSelect('sms:general')}><span className="config-nav-icon"><Smartphone size={15} /></span><span><strong>手机接码</strong><small>平台、开关和接口</small></span><small>{count}</small></button>;
+    return <ActionButton className={`config-nav-item config-sms-root-nav ${activeKey.startsWith('sms:') ? 'is-active' : ''}`} title="手机接码平台、开关和接口设置" onClick={() => onSelect('sms:general')}><span className="config-nav-icon"><Smartphone size={15} /></span><span><strong>手机接码</strong><small>平台、开关和接口</small></span><small>{count}</small></ActionButton>;
   };
-  return <Card className="config-nav" ref={navRef}><div className="config-nav-heading"><ShieldCheck size={16} /><strong>配置目录</strong></div><div className="config-nav-label">邮箱</div><div className="config-channel-list">{EMAIL_SETTING_GROUPS.map((group) => { const Icon = group.icon; const count = group.channelIds.reduce((total, channelId) => total + fields.filter((field) => channelForField(field) === channelId).length, 0); return <button key={group.id} className={`config-nav-item config-channel-nav-item ${activeKey === `email:${group.id}` ? 'is-active' : ''}`} title={group.tooltip} data-tooltip={group.tooltip} onClick={() => onSelect(`email:${group.id}`)}><span className="config-nav-icon"><Icon size={15} /></span><span><strong>{group.label}</strong><small>{group.navHint || group.description}</small></span><small>{count || '—'}</small></button>; })}</div><div className="config-nav-section"><div className="config-nav-divider" /><div className="config-nav-label">手机接码</div>{renderSmsNavigation()}</div>{SETTINGS_SECTIONS.map((section) => <div className="config-nav-section" key={section.label}><div className="config-nav-divider" /><div className="config-nav-label">{section.label}</div>{section.label === '浏览器与网络' ? <>{renderBrowserNavigation()}{section.groups.filter((group) => groups.includes(group)).map(renderGroup)}</> : section.groups.filter((group) => groups.includes(group)).map(renderGroup)}</div>)}{extraGroups.length ? <div className="config-nav-section"><div className="config-nav-divider" /><div className="config-nav-label">其他设置</div>{extraGroups.map(renderGroup)}</div> : null}</Card>;
+  return <Card className="config-nav" ref={navRef}><div className="config-nav-heading"><ShieldCheck size={16} /><strong>配置目录</strong></div><div className="config-nav-label">邮箱</div><div className="config-channel-list">{EMAIL_SETTING_GROUPS.map((group) => { const Icon = group.icon; const count = group.channelIds.reduce((total, channelId) => total + fields.filter((field) => channelForField(field) === channelId).length, 0); return <ActionButton key={group.id} className={`config-nav-item config-channel-nav-item ${activeKey === `email:${group.id}` ? 'is-active' : ''}`} title={group.tooltip} data-tooltip={group.tooltip} onClick={() => onSelect(`email:${group.id}`)}><span className="config-nav-icon"><Icon size={15} /></span><span><strong>{group.label}</strong><small>{group.navHint || group.description}</small></span><small>{count || '—'}</small></ActionButton>; })}</div><div className="config-nav-section"><div className="config-nav-divider" /><div className="config-nav-label">手机接码</div>{renderSmsNavigation()}</div>{SETTINGS_SECTIONS.map((section) => <div className="config-nav-section" key={section.label}><div className="config-nav-divider" /><div className="config-nav-label">{section.label}</div>{section.label === '浏览器与网络' ? <>{renderBrowserNavigation()}{section.groups.filter((group) => groups.includes(group)).map(renderGroup)}</> : section.groups.filter((group) => groups.includes(group)).map(renderGroup)}</div>)}{extraGroups.length ? <div className="config-nav-section"><div className="config-nav-divider" /><div className="config-nav-label">其他设置</div>{extraGroups.map(renderGroup)}</div> : null}</Card>;
 }
 
 function BrowserModuleTabs({ activeId, fields, onSelect }) {
-  return <div className="config-browser-tabs" role="group" aria-label="代理浏览器设置">
+  return <ChoiceTabs value={activeId} onValueChange={(id) => onSelect(`browser:${id}`)} label="代理浏览器设置">
     {BROWSER_MODULES.map((module) => {
       const Icon = module.icon;
       const count = fields.filter((field) => browserModuleForField(field) === module.id).length;
       const selected = activeId === module.id;
-      return <button key={module.id} type="button" className={`config-browser-tab ${selected ? 'is-active' : ''}`} aria-pressed={selected} title={module.tooltip} onClick={() => onSelect(`browser:${module.id}`)}><Icon size={14} /><span>{module.label}</span><small>{count || '—'}</small></button>;
+      return <ChoiceTab key={module.id} value={module.id} type="button" className={`config-browser-tab ${selected ? 'is-active' : ''}`} aria-pressed={selected} title={module.tooltip}><Icon size={14} /><span>{module.label}</span><small>{count || '—'}</small></ChoiceTab>;
     })}
-  </div>;
+  </ChoiceTabs>;
 }
 
 function SmsChannelTabs({ activeId, fields, onSelect }) {
-  return <div className="config-browser-tabs config-sms-tabs" role="group" aria-label="手机接码设置">
+  return <ChoiceTabs value={activeId} onValueChange={(id) => onSelect(`sms:${id}`)} label="手机接码设置" className="config-sms-tabs">
     {SMS_CHANNELS.map((channel) => {
       const Icon = channel.icon;
       const count = fields.filter((field) => smsChannelForField(field) === channel.id).length;
       const selected = activeId === channel.id;
-      return <button key={channel.id} type="button" className={`config-browser-tab config-sms-tab ${selected ? 'is-active' : ''}`} aria-pressed={selected} title={channel.tooltip} onClick={() => onSelect(`sms:${channel.id}`)}><Icon size={14} /><span>{channel.label}</span><small>{count || '—'}</small></button>;
+      return <ChoiceTab key={channel.id} value={channel.id} type="button" className={`config-browser-tab config-sms-tab ${selected ? 'is-active' : ''}`} aria-pressed={selected} title={channel.tooltip}><Icon size={14} /><span>{channel.label}</span><small>{count || '—'}</small></ChoiceTab>;
     })}
-  </div>;
+  </ChoiceTabs>;
 }
 
 function ChannelGuide({ channel }) {
@@ -770,16 +737,15 @@ function EmailSourcePicker({ value, onChange, draft, runtime, disabled = false }
     onChange(sourceText(next.join(',')));
   }
   function move(id, direction) { const index = selected.indexOf(id); const nextIndex = index + direction; if (disabled || index < 0 || nextIndex < 0 || nextIndex >= selected.length) return; const next = [...selected]; [next[index], next[nextIndex]] = [next[nextIndex], next[index]]; onChange(next.join(',')); }
-  return <div className="config-field config-source-field"><span className="config-field-copy"><strong>默认邮箱来源</strong><small>这里只保存默认值；注册时可以临时更换。</small></span><div className="source-picker-options">{EMAIL_CHANNELS.filter((item) => item.id !== 'general').map((channel) => { const state = readiness[channel.id]; const selectedNow = selected.includes(channel.id); const message = state.ready ? (state.runtimeChannel?.message || '可用') : `需配置：${state.missing.join('、')}`; return <label key={channel.id} className={`source-option ${selectedNow ? 'is-selected' : ''} ${state.ready ? '' : 'is-disabled'}`} title={state.ready ? channel.tooltip : message}><input type="checkbox" checked={selectedNow} disabled={disabled || !state.ready} onChange={() => toggle(channel.id)} /><span><strong>{channel.label}{channel.id === 'outlook' || channel.id === 'generic_api' ? <em>导入</em> : null}</strong><small>{message}</small></span></label>; })}</div><div className="source-order"><div className="source-order-heading"><strong>默认顺序</strong><span>{selected.length ? '可调整' : '未选择'}</span></div>{selected.length ? selected.map((id, index) => { const channel = EMAIL_CHANNELS.find((item) => item.id === id); return <div className="source-order-row" key={id}><span className="source-order-number">{index + 1}</span><span>{channel?.label || id}</span><span className="source-order-actions"><IconButton label="上移" icon={ArrowUp} size={14} disabled={disabled || index === 0} onClick={() => move(id, -1)} /><IconButton label="下移" icon={ArrowDown} size={14} disabled={disabled || index === selected.length - 1} onClick={() => move(id, 1)} /></span></div>; }) : <span className="source-order-empty">先完成一个来源配置。</span>}</div></div>;
+  return <div className="config-field config-source-field"><span className="config-field-copy"><strong>默认邮箱来源</strong><small>这里只保存默认值；注册时可以临时更换。</small></span><div className="source-picker-options">{EMAIL_CHANNELS.filter((item) => item.id !== 'general').map((channel) => { const state = readiness[channel.id]; const selectedNow = selected.includes(channel.id); const message = state.ready ? (state.runtimeChannel?.message || '可用') : `需配置：${state.missing.join('、')}`; return <label key={channel.id} className={`source-option ${selectedNow ? 'is-selected' : ''} ${state.ready ? '' : 'is-disabled'}`} title={state.ready ? channel.tooltip : message}><CheckboxControl checked={selectedNow} disabled={disabled || !state.ready} onChange={() => toggle(channel.id)} /><span><strong>{channel.label}{channel.id === 'outlook' || channel.id === 'generic_api' ? <em>导入</em> : null}</strong><small>{message}</small></span></label>; })}</div><div className="source-order"><div className="source-order-heading"><strong>默认顺序</strong><span>{selected.length ? '可调整' : '未选择'}</span></div>{selected.length ? selected.map((id, index) => { const channel = EMAIL_CHANNELS.find((item) => item.id === id); return <div className="source-order-row" key={id}><span className="source-order-number">{index + 1}</span><span>{channel?.label || id}</span><span className="source-order-actions"><IconButton label="上移" icon={ArrowUp} size={14} disabled={disabled || index === 0} onClick={() => move(id, -1)} /><IconButton label="下移" icon={ArrowDown} size={14} disabled={disabled || index === selected.length - 1} onClick={() => move(id, 1)} /></span></div>; }) : <span className="source-order-empty">先完成一个来源配置。</span>}</div></div>;
 }
 
 function ConfigField({ field, value, onChange, showKey = true, disabled = false }) {
   const type = String(field.type || 'str').toLowerCase(); const secret = Boolean(field.secret); const label = field.label || field.key; const help = field.help || '';
   const copy = <span className="config-field-copy"><strong>{label}</strong><small>{help}</small>{showKey ? <code>{field.key}</code> : null}</span>;
-  if (type === 'bool' || type === 'boolean') return <label className="config-field config-switch" title={help}>{copy}<input type="checkbox" checked={Boolean(value)} disabled={disabled} onChange={(event) => onChange(event.target.checked)} /><span className="switch-track" /></label>;
-  if (field.key === 'REGISTRATION_DRIVER') return <label className="config-field" title={help}>{copy}<select value={value || 'protocol'} disabled={disabled} onChange={(event) => onChange(event.target.value)}><option value="chrome_cdp">系统 Chrome（本机推荐，邮箱 OTP 优先）</option><option value="roxy">RoxyBrowser（邮箱 OTP 优先）</option><option value="cloak">CloakBrowser（邮箱 OTP 优先）</option><option value="browser_use">Browser Use Cloud（邮箱 OTP 优先）</option><option value="skyvern">Skyvern（邮箱 OTP 优先）</option><option value="protocol">纯协议（仅邮箱 OTP）</option></select></label>;
-  if (field.key === 'SMS_PROVIDER') return <label className="config-field" title={help}>{copy}<select value={value || 'l'} disabled={disabled} onChange={(event) => onChange(event.target.value)}><option value="grizzly">GrizzlySMS</option><option value="l">L 接码服务</option><option value="h">H 接码服务</option></select></label>;
-  if (type === 'list_str_multiline' || type === 'list' || String(value || '').includes('\n')) return <label className="config-field" title={help}>{copy}<textarea rows="5" value={value ?? ''} disabled={disabled} onChange={(event) => onChange(event.target.value)} /></label>;
-  if (type === 'int' || type === 'float' || type === 'number') return <label className="config-field" title={help}>{copy}<input type="number" step={type === 'float' ? '0.1' : '1'} value={value ?? ''} disabled={disabled} onChange={(event) => onChange(event.target.value)} /></label>;
-  return <label className="config-field" title={help}>{copy}<input type={secret ? 'password' : 'text'} value={value ?? ''} disabled={disabled} onChange={(event) => onChange(event.target.value)} autoComplete="off" /></label>;
+  if (type === 'bool' || type === 'boolean') return <label className="config-field config-switch" title={help}>{copy}<Switch checked={Boolean(value)} disabled={disabled} label={label} onCheckedChange={onChange} /></label>;
+  if (field.key === 'SMS_PROVIDER') return <label className="config-field" title={help}>{copy}<SelectInput value={value || 'l'} disabled={disabled} onChange={(event) => onChange(event.target.value)}><option value="grizzly">GrizzlySMS</option><option value="l">L 接码服务</option><option value="h">H 接码服务</option></SelectInput></label>;
+  if (type === 'list_str_multiline' || type === 'list' || String(value || '').includes('\n')) return <label className="config-field" title={help}>{copy}<Textarea rows="5" value={value ?? ''} disabled={disabled} onChange={(event) => onChange(event.target.value)} /></label>;
+  if (type === 'int' || type === 'float' || type === 'number') return <label className="config-field" title={help}>{copy}<Input type="number" step={type === 'float' ? '0.1' : '1'} value={value ?? ''} disabled={disabled} onChange={(event) => onChange(event.target.value)} /></label>;
+  return <label className="config-field" title={help}>{copy}<Input type={secret ? 'password' : 'text'} value={value ?? ''} disabled={disabled} onChange={(event) => onChange(event.target.value)} autoComplete="off" /></label>;
 }

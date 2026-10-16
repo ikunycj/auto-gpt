@@ -89,8 +89,7 @@ def _is_sms_job(job: dict | None) -> bool:
 
 def _project(account: dict, registration_jobs: list[dict], relay_jobs: list[dict]) -> dict:
     row = dict(account)
-    # Internal route snapshots can contain proxy authentication credentials.
-    row.pop("_codex_verified_proxy", None)
+    registration_pending = bool(row.pop("registration_pending", False))
     account_id = str(row["id"])
     reg_job = _latest([job for job in registration_jobs if str(job.get("job_type") or "registration") == "registration"])
     retry_job = _latest([job for job in registration_jobs if job.get("job_type") == "codex_retry"])
@@ -101,6 +100,16 @@ def _project(account: dict, registration_jobs: list[dict], relay_jobs: list[dict
     codex_job = _latest([job for job in (auth_job, retry_job) if job])
     codex_kind = "codex" if codex_job is auth_job and auth_job else "codex_retry" if retry_job else ""
     codex_raw = str(row.get("codex_status") or "not_authorized").lower()
+    registration_status_raw = str((reg_job or {}).get("status") or "")
+    if registration_pending:
+        if registration_status_raw in _REG_ACTIVE:
+            registration_status = "registering"
+        elif registration_status_raw in {"failed", "stopped", "cancelled", "success"}:
+            registration_status = "failed"
+        else:
+            registration_status = "unregistered"
+    else:
+        registration_status = "registered"
     if codex_job and str(codex_job.get("status") or "") in _RELAY_ACTIVE:
         codex_status = "authorizing"
     elif codex_raw in {"deactivated", "deleted"}:
@@ -155,7 +164,7 @@ def _project(account: dict, registration_jobs: list[dict], relay_jobs: list[dict
     email_code_url = str(row.get("email_code_url") or "")
     row.update({
         "id": account_id, "email": _email(row.get("email")),
-        "registration_status": "registered", "registration_status_raw": str((reg_job or {}).get("status") or ""),
+        "registration_status": registration_status, "registration_status_raw": registration_status_raw,
         "codex_status": codex_status, "codex_status_raw": codex_raw,
         "phone_status": phone_status,
         "phone": f"{phone_number}----{sms_url or sms_source}" if phone_verified else "",

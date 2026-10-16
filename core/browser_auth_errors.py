@@ -1,4 +1,4 @@
-"""Observe terminal authentication errors without retaining credentials or OTPs."""
+"""Observe terminal authentication errors for local diagnosis."""
 from __future__ import annotations
 
 import base64
@@ -8,13 +8,14 @@ from urllib.parse import unquote_plus, urlsplit
 from core.openai_auth import detect_account_unusable_response_body, detect_account_unusable_text
 
 
-# Record only a whitelisted error code, never the response, URL, request body,
-# cookie or successful authentication response. Installed before form submit.
+# Install before form submit so the complete failing response can be inspected
+# in the local browser session when authentication fails.
 _AUTH_ERROR_SCRIPT = r"""
 (() => {
   if (window.__accountErrorObserverInstalled) return;
   window.__accountErrorObserverInstalled = true;
   window.__accountAuthError = '';
+  window.__accountAuthErrorDetails = null;
   const hit = url => {
     try {
       const u = new URL(url, location.href);
@@ -24,6 +25,7 @@ _AUTH_ERROR_SCRIPT = r"""
   };
   const save = (url, status, body) => {
     if (!hit(url) || status < 400) return;
+    window.__accountAuthErrorDetails = {url: String(url || ''), status, body: String(body || '')};
     const text = String(body || '').slice(0, 8192).toLowerCase().replace(/\s+/g, ' ');
     let code = '';
     try {
@@ -111,8 +113,8 @@ def _network_account_error(driver) -> str:
                     pending[request_id] = 0
         except (TypeError, ValueError, AttributeError):
             continue
-    # Retry briefly when responseReceived preceded loadingFinished. Bound both
-    # retained IDs and attempts; do not save bodies or log raw browser events.
+    # Retry briefly when responseReceived preceded loadingFinished while keeping
+    # the complete response body available for local diagnosis.
     pending = dict(list(pending.items())[-16:])
     for request_id, attempts in list(pending.items()):
         try:
@@ -120,6 +122,11 @@ def _network_account_error(driver) -> str:
             body = str(data.get('body') or '')
             if data.get('base64Encoded'):
                 body = base64.b64decode(body).decode('utf-8', errors='replace')
+            details = getattr(driver, '_account_error_details', [])
+            if not isinstance(details, list):
+                details = []
+            details.append({"request_id": request_id, "body": body})
+            driver._account_error_details = details[-16:]
             pending.pop(request_id, None)
             code = detect_account_unusable_response_body(body[:8192]) or detect_account_unusable_text(body[:8192])
             if code:
@@ -161,16 +168,18 @@ def read_account_error(driver) -> str:
     return _network_account_error(driver)
 
 
+def read_account_error_details(driver) -> list[dict]:
+    """Return complete captured authentication error responses for local review."""
+    details = getattr(driver, "_account_error_details", None)
+    if isinstance(details, list):
+        return details
+    try:
+        value = driver.execute_script("return window.__accountAuthErrorDetails || null")
+    except Exception:
+        value = None
+    return [value] if isinstance(value, dict) else []
+
+
 def describe_browser_network_error(error: object) -> str:
-    """Keep a useful Chrome error code without URLs, secrets or driver stacks."""
-    text = str(error or "")
-    messages = {
-        "ERR_TUNNEL_CONNECTION_FAILED": "代理隧道连接失败；请检查当前代理地址、端口、认证及 CONNECT 支持",
-        "ERR_PROXY_CONNECTION_FAILED": "无法连接代理服务器；请检查代理是否在线及地址、端口",
-        "ERR_SOCKS_CONNECTION_FAILED": "SOCKS 代理连接失败；请检查 SOCKS 协议、端口及认证",
-        "ERR_SSL_PROTOCOL_ERROR": "TLS 握手失败；请检查当前网络及代理协议/端口是否匹配（HTTP 代理不等于 HTTPS 代理）",
-    }
-    for code, message in messages.items():
-        if code in text:
-            return f"浏览器网络错误 {code}：{message}。未自动切换为直连；此错误不能用于判断账号是否停用"
-    return ""
+    """Return the complete browser network error for local auditing."""
+    return str(error or "")

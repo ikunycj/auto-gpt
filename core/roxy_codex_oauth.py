@@ -120,10 +120,10 @@ def _roxy_profile_token_proxy(opened, requested_proxy: str | None, client=None) 
         for expected in (getattr(opened, "proxy", None), requested_proxy):
             if expected is not None and not _same_proxy_route(endpoint, expected):
                 raise ValueError()
-    except Exception:
+    except Exception as exc:
         raise _RoxyProxyRouteError(
-            "Roxy Profile list_v3 网络配置读取失败或与当前任务不匹配，已停止本地 PKCE 换 token"
-        ) from None
+            f"Roxy Profile list_v3 网络配置读取失败或与当前任务不匹配，已停止本地 PKCE 换 token：{exc}"
+        ) from exc
     logger.info("[Codex][Browser] 本地 PKCE 使用已确认的 Profile 网络：%s",
                 "代理" if endpoint else "本机网络（无代理）")
     return endpoint
@@ -153,7 +153,7 @@ def _background_browser_window(driver) -> None:
     try:
         driver.minimize_window()
     except Exception as exc:
-        logger.debug("[Codex][Browser] 浏览器窗口转入后台失败：%s", _redact_diagnostic_text(exc, 160))
+        logger.debug("[Codex][Browser] 浏览器窗口转入后台失败：%s", _diagnostic_text(exc, 160))
 
 
 def _focus_browser_window(driver) -> None:
@@ -212,43 +212,13 @@ def _is_callback_url(url: str) -> bool:
 
 
 def _safe_diagnostic_url(url: str) -> str:
-    """Keep only non-secret URL location data in timeout errors."""
-    try:
-        raw = str(url or "")
-        if raw.lower().startswith("chrome-error://"):
-            return "chrome-error://chromewebdata/"
-        parsed = urlparse(raw)
-        host = (parsed.hostname or "").lower()
-        if host not in {"localhost", "127.0.0.1"} and not host.endswith(".openai.com"):
-            return "[URL已隐藏]"
-        if not parsed.path:
-            return "[URL已隐藏]"
-        netloc = host + (f":{parsed.port}" if parsed.port else "")
-        safe = f"{parsed.scheme}://{netloc}{parsed.path}"
-        return safe + ("?[参数已隐藏]" if parsed.query or parsed.fragment else "")
-    except Exception:
-        return "[URL已隐藏]"
+    """Return the complete URL for local auditing."""
+    return str(url or "")
 
 
-_DIAGNOSTIC_EMAIL_RE = re.compile(r"(?i)\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
-_DIAGNOSTIC_SECRET_RE = re.compile(
-    r"(?i)\b(password|passwd|token|secret|authorization|cookie|otp|code)\s*[:=]\s*[^\s,;]+"
-)
-_DIAGNOSTIC_LONG_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{40,}\b")
-
-
-def _redact_diagnostic_text(value: object, limit: int = 260) -> str:
-    """Normalize a short page fragment without logging credentials or OTPs."""
-    network_error = describe_browser_network_error(value)
-    if network_error:
-        return network_error[:limit]
-    text = " ".join(str(value or "").split())
-    if not text:
-        return "-"
-    text = _DIAGNOSTIC_EMAIL_RE.sub("[邮箱]", text)
-    text = _DIAGNOSTIC_SECRET_RE.sub(lambda match: f"{match.group(1)}=[已隐藏]", text)
-    text = _DIAGNOSTIC_LONG_TOKEN_RE.sub("[长令牌已隐藏]", text)
-    return text[:limit] + ("…" if len(text) > limit else "")
+def _diagnostic_text(value: object, limit: int = 260) -> str:
+    """Return the complete browser diagnostic text for local auditing."""
+    return str(value or "-")
 
 
 def _classify_browser_page(url: str, title: str, text: str) -> str:
@@ -281,7 +251,7 @@ def _classify_browser_page(url: str, title: str, text: str) -> str:
 
 
 def _browser_page_summary(driver, fallback_text: str = "") -> str:
-    """Return a short, redacted description of the currently visible browser page."""
+    """Return the complete visible browser page diagnostic for local auditing."""
     fallback_url = ""
     try:
         fallback_url = str(getattr(driver, "current_url", "") or "")
@@ -311,12 +281,12 @@ def _browser_page_summary(driver, fallback_text: str = "") -> str:
     if not isinstance(raw, dict):
         raw = {}
     url = str(raw.get("url") or fallback_url or "")
-    title = _redact_diagnostic_text(raw.get("title"), limit=100)
+    title = str(raw.get("title") or "")
     page_text = str(raw.get("text") or fallback_text or "")
-    body = _redact_diagnostic_text(page_text, limit=280)
+    body = page_text
     kind = _classify_browser_page(url, str(raw.get("title") or ""), page_text)
     buttons = [
-        _redact_diagnostic_text(item, limit=42)
+        str(item)
         for item in (raw.get("buttons") or [])
         if str(item or "").strip()
     ][:6]
@@ -330,7 +300,7 @@ def _browser_page_summary(driver, fallback_text: str = "") -> str:
             if str(item.get(key) or "").strip()
         )
         if marker:
-            inputs.append(_redact_diagnostic_text(marker, limit=60))
+            inputs.append(marker)
     summary = (
         f"页面类型={kind}；标题={title}；URL={_safe_diagnostic_url(url)}；"
         f"正文摘要={body}"
@@ -371,7 +341,7 @@ def _extract_callback_url_from_page(driver) -> str:
                 logger.info("[Codex][Browser] 已从浏览器性能记录提取 callback 路由：%s", _safe_diagnostic_url(str(url)))
                 return str(url)
     except Exception as exc:
-        logger.debug("[Codex][Browser] 从页面提取 callback URL 失败：%s", _redact_diagnostic_text(exc))
+        logger.debug("[Codex][Browser] 从页面提取 callback URL 失败：%s", _diagnostic_text(exc))
     return ""
 
 
@@ -448,7 +418,7 @@ def _maybe_click_passwordless_after_email(driver, email: str, timeout: int = 18)
                     human_delay("form")
                     continue
         except Exception as exc:
-            logger.debug("[Codex][Browser] 密码页一次性验证码入口探测失败：%s", _redact_diagnostic_text(exc, 140))
+            logger.debug("[Codex][Browser] 密码页一次性验证码入口探测失败：%s", _diagnostic_text(exc, 140))
         time.sleep(0.5)
     if clicked:
         logger.info("[Codex][Browser] 已点击一次性验证码入口，未立即检测到 OTP 页，继续后续 OTP 轮询")
@@ -479,7 +449,7 @@ def _wait_for_otp_input(driver, timeout: int = 30) -> None:
         "[Codex][Browser] 等待 OTP 输入框超时，页面 route=%s inputs=%s buttons=%s",
         _safe_diagnostic_url(str(state.get("url") or "")),
         len(state.get("inputs") or []),
-        [_redact_diagnostic_text(b.get("text"), limit=24) for b in (state.get("buttons") or [])][:8],
+        [_diagnostic_text(b.get("text"), limit=24) for b in (state.get("buttons") or [])][:8],
     )
     raise RuntimeError("等待 OTP 输入框超时，页面未出现验证码输入框")
 
@@ -524,7 +494,7 @@ def _raise_account_unusable_page_error(text: str, driver=None) -> None:
         dead_code = read_account_error(driver)
     if dead_code:
         reason = _account_unusable_message(dead_code)
-        summary = _browser_page_summary(driver, fallback_text=text) if driver is not None else f"正文摘要={_redact_diagnostic_text(text)}"
+        summary = _browser_page_summary(driver, fallback_text=text) if driver is not None else f"正文摘要={_diagnostic_text(text)}"
         logger.warning(
             "[Codex][Browser] 页面检测到%s；%s",
             reason,
@@ -858,7 +828,7 @@ def _fill_email_and_otp(
     try:
         _type_email_address(driver, email, timeout=12)
     except Exception as exc:
-        logger.info("[Codex][Browser] 未检测到邮箱输入框，可能已登录或进入下一步：%s", _redact_diagnostic_text(exc, 120))
+        logger.info("[Codex][Browser] 未检测到邮箱输入框，可能已登录或进入下一步：%s", _diagnostic_text(exc, 120))
         return
     logger.info("[Codex][Browser] 已填写邮箱：%s", email)
     human_delay("form")
@@ -905,7 +875,7 @@ def _fill_email_and_otp(
         except Exception as exc:
             # 如果重进授权地址后已经停在验证码/下一步页面，就不要再强行提交。
             if not _is_email_verification_page(driver):
-                logger.warning("[Codex][Browser] 重新提交邮箱失败，继续按当前页面轮询：%s", _redact_diagnostic_text(exc, 180))
+                logger.warning("[Codex][Browser] 重新提交邮箱失败，继续按当前页面轮询：%s", _diagnostic_text(exc, 180))
             else:
                 logger.info("[Codex][Browser] 重开授权后已在邮箱 OTP 页面")
         human_delay("api")
@@ -1061,7 +1031,7 @@ def _install_email_otp_validate_hook(driver) -> None:
     try:
         driver.execute_script(script)
     except Exception as exc:
-        logger.debug("[Codex][Browser] 注入 email-otp/validate 响应 hook 失败：%s", _redact_diagnostic_text(exc))
+        logger.debug("[Codex][Browser] 注入 email-otp/validate 响应 hook 失败：%s", _diagnostic_text(exc))
 
 
 def _read_email_otp_validate_dead_code(driver) -> str:
@@ -1129,7 +1099,7 @@ def _wait_after_email_otp_submit(driver, timeout: int = 45) -> str:
             if invalid or errors or error_hit:
                 logger.warning(
                     "[Codex][Browser] 邮箱 OTP 提交后检测到错误/仍需验证码：errors=%s invalid=%s url=%s",
-                    [_redact_diagnostic_text(item, limit=80) for item in errors[:3]],
+                    [_diagnostic_text(item, limit=80) for item in errors[:3]],
                     invalid,
                     _safe_diagnostic_url(url),
                 )
@@ -1484,7 +1454,7 @@ def _refresh_add_phone_for_retry(driver, *, reason: str = "") -> None:
         human_delay("navigate")
         _find_any(driver, _PHONE_INPUT_SELECTORS, timeout=8)
     except Exception as exc:
-        logger.info("[Codex][Browser] 刷新手机号页失败，下一轮会再次尝试回到 add-phone：%s", _redact_diagnostic_text(exc, 180))
+        logger.info("[Codex][Browser] 刷新手机号页失败，下一轮会再次尝试回到 add-phone：%s", _diagnostic_text(exc, 180))
 
 
 def _click_add_phone_continue_button(driver, *, timeout: int = 10) -> dict:
@@ -1756,7 +1726,7 @@ def _do_phone_verification_if_present(driver) -> bool:
                 return True
             except Exception as exc:
                 last_err = exc
-                logger.warning("[Codex][Browser] 手机验证尝试失败，换号：%s", _redact_diagnostic_text(exc, 240))
+                logger.warning("[Codex][Browser] 手机验证尝试失败，换号：%s", _diagnostic_text(exc, 240))
                 if activation_id:
                     try:
                         sms_provider.cancel(activation_id, http)
@@ -1836,12 +1806,12 @@ def clear_roxy_browser_auth_state(driver) -> None:
         driver.execute_cdp_cmd("Network.clearBrowserCookies", {})
         logger.info("[Codex][Browser] 已清理浏览器 Cookie")
     except Exception as exc:
-        logger.info("[Codex][Browser] 清理 Cookie 失败，继续尝试其它缓存：%s", _redact_diagnostic_text(exc, 160))
+        logger.info("[Codex][Browser] 清理 Cookie 失败，继续尝试其它缓存：%s", _diagnostic_text(exc, 160))
     try:
         driver.execute_cdp_cmd("Network.clearBrowserCache", {})
         logger.info("[Codex][Browser] 已清理浏览器 Cache")
     except Exception as exc:
-        logger.info("[Codex][Browser] 清理 Cache 失败，继续：%s", _redact_diagnostic_text(exc, 160))
+        logger.info("[Codex][Browser] 清理 Cache 失败，继续：%s", _diagnostic_text(exc, 160))
     for origin in origins:
         try:
             driver.execute_cdp_cmd("Storage.clearDataForOrigin", {
@@ -1850,7 +1820,7 @@ def clear_roxy_browser_auth_state(driver) -> None:
             })
             logger.info("[Codex][Browser] 已清理站点数据：%s", origin)
         except Exception as exc:
-            logger.debug("[Codex][Browser] 清理站点数据失败 %s: %s", origin, _redact_diagnostic_text(exc))
+            logger.debug("[Codex][Browser] 清理站点数据失败 %s: %s", origin, _diagnostic_text(exc))
     try:
         driver.get("about:blank")
     except Exception:
@@ -2056,9 +2026,8 @@ def _run_roxy_codex_oauth_once(
             callback_url=callback_url,
             message=f"{_codex_driver_name()} plan={id_claims.get('plan_type') or 'unknown'}",
         )
-        # Keep the verified route and Profile identity in process memory for
-        # the relay's immediate online check.  The relay consumes these
-        # private fields and never exposes the authenticated proxy URL.
+        # Keep the verified route and Profile identity for the relay's immediate
+        # online check and local audit output.
         result["_verification_proxy"] = exchange_proxy
         profile_id = str(getattr(opened, "profile_id", "") or "").strip()
         if profile_id:
@@ -2077,16 +2046,16 @@ def _run_roxy_codex_oauth_once(
         message = base_message
         if detail:
             message += f"；{detail[:620]}"
-        logger.warning("[Codex][Browser] %s：%s；%s", base_message, email, _redact_diagnostic_text(detail) if detail else "未获取页面摘要")
+        logger.warning("[Codex][Browser] %s：%s；%s", base_message, email, _diagnostic_text(detail) if detail else "未获取页面摘要")
         return proto._codex_result(
             status="deactivated",
             email=email,
             message=message,
         )
     except Exception as exc:
-        logger.warning("[Codex][Browser] 失败：%s，%s: %s", email, type(exc).__name__, _redact_diagnostic_text(exc))
+        logger.warning("[Codex][Browser] 失败：%s，%s: %s", email, type(exc).__name__, _diagnostic_text(exc))
         logger.debug("[Codex][Browser] 失败详情已省略敏感堆栈：%s", type(exc).__name__)
-        return proto._codex_result(status="failed", email=email, message=f"{type(exc).__name__}: {_redact_diagnostic_text(exc, 220)}")
+        return proto._codex_result(status="failed", email=email, message=f"{type(exc).__name__}: {_diagnostic_text(exc, 220)}")
     finally:
         # 注册后复用窗口时，driver/profile 生命周期由注册流程统一清理，
         # 这里不能 quit/delete，否则会提前销毁注册环境。

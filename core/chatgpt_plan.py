@@ -33,20 +33,9 @@ def normalize_token(token: str) -> str:
     return token
 
 
-def _mask_proxy(proxy: str) -> str:
-    """返回可用于日志/API 结果的代理摘要，不泄露用户名和密码。"""
-    value = str(proxy or "").strip()
-    if not value:
-        return ""
-    try:
-        parsed = urlparse(value if "://" in value else f"//{value}")
-        host = parsed.hostname or ""
-        port = f":{parsed.port}" if parsed.port else ""
-        scheme = f"{parsed.scheme}://" if parsed.scheme else ""
-        auth = "***:***@" if parsed.username or parsed.password else ""
-        return f"{scheme}{auth}{host}{port}" or "***"
-    except Exception:
-        return "***"
+def _proxy_value(proxy: str) -> str:
+    """Return the complete proxy URL for local auditing."""
+    return str(proxy or "").strip()
 
 
 def _local_proxy_status(proxy: str) -> tuple[bool, bool, str | None]:
@@ -87,7 +76,7 @@ def resolve_plan_check_route(explicit_proxy: Optional[str] = None) -> dict:
             "proxy": selected,
             "proxy_mode": "request",
             "network_route": "proxy" if selected else "direct",
-            "proxy_used": _mask_proxy(selected) or None,
+            "proxy_used": _proxy_value(selected) or None,
             "proxy_fallback_reason": None,
         }
 
@@ -125,14 +114,14 @@ def resolve_plan_check_route(explicit_proxy: Optional[str] = None) -> dict:
             "proxy": "",
             "proxy_mode": mode,
             "network_route": "direct_fallback",
-            "proxy_used": _mask_proxy(selected),
+            "proxy_used": _proxy_value(selected),
             "proxy_fallback_reason": reason,
         }
     return {
         "proxy": selected,
         "proxy_mode": mode,
         "network_route": "proxy",
-        "proxy_used": _mask_proxy(selected),
+        "proxy_used": _proxy_value(selected),
         "proxy_fallback_reason": None,
     }
 

@@ -6,15 +6,13 @@ import {
 import { copyText, del, download, get, patch, post, put } from '../api';
 import { useDebounced, usePolling } from '../hooks';
 import ProxyTest from '../components/ProxyTest';
-import {
-  Button, Card, Checkbox, EmptyState, ErrorState, IconButton, Modal, NumberField, Pager,
+import { ActionButton, Input, Textarea, CheckboxControl, SelectInput,
+  useConfirm, usePrompt, Button, Card, Checkbox, EmptyState, ErrorState, IconButton, Modal, NumberField, Pager,
   RefreshButton, SearchField, SectionHeader, Select, StatusPill, Table, Toolbar,
 } from '../components/ui';
 
 const PAGE_SIZES = [20, 50, 100];
 const ACTIVE_JOB_STATUSES = new Set(['pending', 'running', 'stopping', 'waiting_email', 'waiting_sms', 'waiting_totp', 'waiting_browser']);
-const EMAIL_PREVIEW_MAX_LENGTH = 20;
-
 const STATUS_TEXT = {
   registration: { registered: '已注册', unregistered: '未注册', registering: '注册中', failed: '注册失败' },
   codex: { authorized: '已授权', unauthorized: '未授权', authorizing: '授权中', failed: '授权失败', deactivated: '已删除/停用' },
@@ -29,33 +27,7 @@ const IMPORTED_EMAIL_SOURCES = new Set(['outlook', 'generic_api']);
 
 function idOf(row) { return String(row?.id || ''); }
 function pretty(value) { return value == null || value === '' ? '—' : String(value); }
-function maskedPreview(value) {
-  const text = value == null ? '' : String(value);
-  return text ? `${text.slice(0, 4)}...` : '—';
-}
-function emailPreview(value) {
-  const text = value == null ? '' : String(value);
-  const separator = text.lastIndexOf('@');
-  if (separator <= 0 || separator === text.length - 1) return maskedPreview(text);
-  const prefix = `${text.slice(0, Math.min(4, separator))}...@`;
-  const domain = text.slice(separator + 1);
-  const domainLimit = EMAIL_PREVIEW_MAX_LENGTH - prefix.length;
-  if (domain.length <= domainLimit) return `${prefix}${domain}`;
-  const tailLength = Math.min(7, Math.floor((domainLimit - 3) * 2 / 3));
-  const headLength = domainLimit - tailLength - 3;
-  return `${prefix}${domain.slice(0, headLength)}...${domain.slice(-tailLength)}`;
-}
-function urlHostPreview(value) {
-  const text = value == null ? '' : String(value);
-  if (!text) return '—';
-  try {
-    const hostname = new URL(text).hostname;
-    return hostname ? `...${hostname}...` : maskedPreview(text);
-  } catch (_) {
-    return maskedPreview(text);
-  }
-}
-function CopyValue({ value, label, notify, masked = false, preview, empty = '—' }) {
+function CopyValue({ value, label, notify, empty = '—' }) {
   const text = value == null ? '' : String(value);
   if (!text) return <span className="copy-cell-empty">{empty}</span>;
   const copy = async () => {
@@ -66,7 +38,7 @@ function CopyValue({ value, label, notify, masked = false, preview, empty = '—
       notify(error.message || `${label}复制失败`, 'error');
     }
   };
-  return <button type="button" className="copy-cell-button" title={`点击复制${label}`} aria-label={`复制${label}`} onClick={copy}>{preview ?? (masked ? maskedPreview(text) : text)}</button>;
+  return <ActionButton type="button" className="copy-cell-button" title={`点击复制${label}`} aria-label={`复制${label}`} onClick={copy}>{text}</ActionButton>;
 }
 function status(kind, value) {
   const normalized = String(value || 'unknown').toLowerCase();
@@ -95,9 +67,11 @@ function activeMaintenance(row) {
   return Boolean(job && ACTIVE_JOB_STATUSES.has(String(job.status || '').toLowerCase()));
 }
 
-export default function RelayPage({ notify, summary, mode = 'all', embedded = false, onOpenSettings, onOpenEmail, onSummaryRefresh, onRegistrationRequestHandled, registrationRequested = false }) {
+export default function RelayPage({ notify, summary, mode = 'all', embedded = false, onOpenSettings, onOpenProxy, onOpenEmail, onSummaryRefresh, onRegistrationRequestHandled, registrationRequested = false }) {
   const showPhones = mode === 'all' || mode === 'phones';
   const showAccounts = mode === 'all' || mode === 'accounts';
+  const confirm = useConfirm();
+  const prompt = usePrompt();
   const [accounts, setAccounts] = useState([]);
   const [phones, setPhones] = useState([]);
   const [accountTotal, setAccountTotal] = useState(0);
@@ -265,7 +239,6 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
     onSummaryRefresh?.();
     // Defaults are intentionally reset only when the dialog opens. Summary
     // polling must not overwrite a user's in-progress selection or ordering.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [batchRegisterOpen]);
   const toggle = (setter, id, checked) => setter((current) => {
     const next = new Set(current);
@@ -274,7 +247,7 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
   });
 
   async function runAction(path, body, message, method = 'post') {
-    if (method === 'delete' && !window.confirm('确定删除选中的数据吗？此操作不可恢复。')) return;
+    if (method === 'delete' && !await confirm('确定删除选中的数据吗？此操作不可恢复。')) return;
     try {
       const fn = method === 'delete' ? del : method === 'patch' ? patch : post;
       await fn(path, body);
@@ -422,7 +395,7 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
     const selectedIds = [...new Set(ids.map(String).filter(Boolean))];
     if (!selectedIds.length) return notify('请先选择 GPT 账号', 'warning');
     const label = selectedIds.length === 1 ? '这个 GPT 账号' : `选中的 ${selectedIds.length} 个 GPT 账号`;
-    if (!window.confirm(`确定彻底删除${label}吗？此操作不可恢复。`)) return;
+    if (!await confirm(`确定彻底删除${label}吗？此操作不可恢复。`)) return;
     try {
       const response = await del('/api/gpt-accounts', { account_ids: selectedIds });
       const deletedCount = Number(response.deleted_count ?? response.deleted ?? 0);
@@ -512,13 +485,13 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
   }
 
   async function submitVerification(job, stage) {
-    const code = window.prompt(`${stage === 'sms' ? '短信' : stage === 'totp' ? '2FA' : '邮箱'}验证码`);
+    const code = await prompt(`${stage === 'sms' ? '短信' : stage === 'totp' ? '2FA' : '邮箱'}验证码`);
     if (!code?.trim()) return;
     await runAction(`/api/codex-jobs/${encodeURIComponent(job.id)}/verification`, { stage, code: code.trim() }, '验证码已提交');
   }
 
   async function submitManualRegistrationOtp(waiting) {
-    const code = window.prompt(`请输入 ${waiting.email || '注册邮箱'} 收到的验证码`);
+    const code = await prompt(`请输入 ${waiting.email || '注册邮箱'} 收到的验证码`);
     if (!code?.trim()) return;
     try {
       await post('/api/manual-otp', { email: waiting.email, job_id: waiting.job_id, code: code.trim() });
@@ -574,7 +547,7 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
   }
 
   async function deleteSub2() {
-    if (!sub2ServiceId || !window.confirm('确定删除这个 sub2api 服务配置吗？')) return;
+    if (!sub2ServiceId || !await confirm('确定删除这个 sub2api 服务配置吗？')) return;
     try {
       await del(`/api/sub2-services/${encodeURIComponent(sub2ServiceId)}`);
       notify('sub2api 服务已删除', 'success');
@@ -614,15 +587,15 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
             <td className={special ? 'phone-special-source' : 'mono'}><strong>{special ? pretty(row.label || row.provider_label || '平台自动取号') : pretty(row.phone)}</strong>{special ? <small className="table-sub">{row.provider_label || row.provider || '接码平台'} · 动态号码</small> : null}</td>
             <td><StatusPill value={state}>{state === 'used' ? '已用尽' : undefined}</StatusPill></td>
             <td>{special ? <strong>动态</strong> : <>
-              <select className="phone-uses-select" aria-label={`手机号 ${row.phone} 可用次数`} aria-busy={savingUses} disabled={savingUses} value={phoneUsesSaving[id] ?? row.available_uses} onChange={(event) => savePhoneAvailableUses(row, event.target.value)}>
+              <SelectInput className="phone-uses-select" aria-label={`手机号 ${row.phone} 可用次数`} aria-busy={savingUses} disabled={savingUses} value={phoneUsesSaving[id] ?? row.available_uses} onChange={(event) => savePhoneAvailableUses(row, event.target.value)}>
                 {[0, 1, 2, 3].map((value) => <option key={value} value={value}>{value} 次</option>)}
-              </select>
+              </SelectInput>
               {savingUses ? <small className="table-sub" role="status">保存中…</small> : null}
             </>}{row.reserved_count ? <small className="table-sub">占用 {row.reserved_count} 个任务</small> : null}</td>
             <td className="phone-expiration-cell">{special ? '平台管理' : <>
-              <button type="button" className="phone-expiration-button" aria-label={`修改手机号 ${row.phone} 期限`} title="点击修改期限" onClick={() => openPhoneSettings(row)}>
+              <ActionButton type="button" className="phone-expiration-button" aria-label={`修改手机号 ${row.phone} 期限`} title="点击修改期限" onClick={() => openPhoneSettings(row)}>
                 <span>{phoneExpirationText(row)}</span><Pencil size={13} aria-hidden="true" />
-              </button>
+              </ActionButton>
               {row.expires_at ? <small className="table-sub">{row.expired ? '已过期 · 不再分配' : `剩余 ${row.expires_in_days} 天（向上取整）`}</small> : null}
             </>}</td>
             <td>{special ? pretty(row.message || '授权时自动取号') : pretty(row.assigned_account_email)}</td>
@@ -648,7 +621,7 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
       <Button icon={Settings2} size="sm" onClick={() => { setSub2Open(true); loadSub2(); }}>sub2 服务</Button>
       <Button icon={Trash2} variant="danger" size="sm" disabled={!accountIds.length} onClick={() => deleteAccounts()}>删除</Button>
     </>} />
-    <p className="gpt-account-auth-hint">账号已记录代理时优先使用该代理；未记录时使用本机网络，不会抽取全局代理池或沿用 Roxy 旧代理。注册仍可使用<button type="button" className="field-help-link" onClick={() => onOpenSettings?.('代理池')}>设置中的代理池</button>，非本机代理会自动记录。手机号仅在需要短信验证时分配。</p>
+    <p className="gpt-account-auth-hint">账号已记录代理时优先使用该代理；未记录时使用本机网络，不会抽取全局代理池或沿用 Roxy 旧代理。注册仍可使用<ActionButton type="button" className="field-help-link" onClick={() => onOpenProxy?.()}>代理IP工作区</ActionButton>，非本机代理会自动记录。手机号仅在需要短信验证时分配。</p>
     <Toolbar className="gpt-account-toolbar">
       <SearchField value={accountQuery} onChange={setAccountQuery} placeholder="搜索账号或备注…" />
       <Select value={providerFilter} onChange={setProviderFilter} options={[{ value: '', label: '邮箱来源' }, ...Object.entries(EMAIL_SOURCE_TEXT).map(([value, label]) => ({ value, label }))]} />
@@ -656,7 +629,7 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
       <Select value={phoneFilter} onChange={setPhoneFilter} options={[{ value: '', label: '手机接码状态' }, { value: 'verified', label: '已接码' }, { value: 'unverified', label: '未接码' }, { value: 'verifying', label: '接码中' }, { value: 'failed', label: '接码失败' }]} />
       <Select value={gptFilter} onChange={setGptFilter} options={[{ value: '', label: 'GPT状态' }, { value: 'alive', label: '存活' }, { value: 'dead', label: '失效' }, { value: 'unknown', label: '未验活' }]} />
       <span className="selection-note">已选 {accountIds.length}</span>
-      <label className="worker-control">并发<input type="number" min="1" max="8" value={workers} onChange={(event) => setWorkers(Math.max(1, Math.min(8, Number(event.target.value) || 1)))} /></label>
+      <label className="worker-control">并发<Input type="number" min="1" max="8" value={workers} onChange={(event) => setWorkers(Math.max(1, Math.min(8, Number(event.target.value) || 1)))} /></label>
       <RefreshButton onClick={refresh} loading={running} />
     </Toolbar>
     <Table className="relay-account-table gpt-account-table"><colgroup>
@@ -678,11 +651,11 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
         const manualOtp = manualOtpWaiting.find((item) => String(item.email || '').toLowerCase() === String(row.email || '').toLowerCase());
         return <tr key={id}>
           <td><Checkbox checked={accountSelected.has(id)} onChange={(checked) => toggle(setAccountSelected, id, checked)} /></td>
-          <td className="cell-nowrap"><strong><CopyValue value={row.email} label="账号" notify={notify} preview={emailPreview(row.email)} /></strong>{row.active_operation ? <small className="table-sub">{row.active_operation_label || '账号任务运行中'}</small> : null}</td>
-          <td className="mono cell-nowrap"><CopyValue value={row.password} label="密码" notify={notify} masked empty={row.login_method === 'email_otp' ? 'OTP 登录' : '—'} /></td>
-          <td className="mono cell-nowrap"><CopyValue value={row.totp_secret} label="2FA" notify={notify} masked /></td>
-          <td className="url-cell"><CopyValue value={row.email_code_url} label="邮箱接码 API" notify={notify} preview={urlHostPreview(row.email_code_url)} empty={row.email_provider_label || EMAIL_SOURCE_TEXT[row.email_provider] || '—'} /></td>
-          <td>{status('registration', row.registration_status)}</td>
+          <td className="cell-nowrap"><strong><CopyValue value={row.email} label="账号" notify={notify} /></strong>{row.active_operation ? <small className="table-sub">{row.active_operation_label || '账号任务运行中'}</small> : null}</td>
+          <td className="mono cell-nowrap"><CopyValue value={row.password} label="密码" notify={notify} empty={row.login_method === 'email_otp' ? 'OTP 登录' : '—'} /></td>
+          <td className="mono cell-nowrap"><CopyValue value={row.totp_secret} label="2FA" notify={notify} /></td>
+          <td className="url-cell"><CopyValue value={row.email_code_url} label="邮箱接码 API" notify={notify} empty={row.email_provider_label || EMAIL_SOURCE_TEXT[row.email_provider] || '—'} /></td>
+          <td>{status('registration', row.registration_status)}{row.registration_status === 'failed' && row.registration_job?.error ? <small className="table-sub codex-job-detail is-error" title={row.registration_job.error}>{row.registration_job.error}</small> : null}</td>
           <td>{status('codex', row.codex_status)}{codexJobDetail ? <small className={`table-sub codex-job-detail ${codexJob?.status === 'failed' ? 'is-error' : ''}`} title={codexJobDetail}>{codexJobDetail}</small> : null}</td>
           <td>{status('phone', row.phone_status)}</td>
           <td className="mono cell-nowrap"><CopyValue value={row.phone} label="手机" notify={notify} empty="" /></td>
@@ -710,7 +683,7 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
   return <div className="page-stack">
     {!embedded ? <div className="page-intro"><div><div className="eyebrow"><Smartphone size={14} /> {mode === 'phones' ? '号码资源' : '账号资源'}</div><h2>{mode === 'phones' ? '手机号池' : 'GPT账号'}</h2>{mode === 'phones' ? null : <p>已注册账号的资料、Codex 授权和手机验证统一保存在账号列表中。</p>}</div></div> : null}
     {error ? <ErrorState message={error} onRetry={load} /> : null}
-    {showAccounts && manualOtpWaiting.length ? <div className="manual-otp-strip"><div><strong>{manualOtpWaiting.length} 个注册任务正在等待邮箱验证码</strong><small>验证码提交后，注册任务会自动继续。</small></div><div className="manual-otp-actions">{manualOtpWaiting.map((item) => <Button key={`${item.job_id || ''}:${item.email}`} size="sm" variant="primary" onClick={() => submitManualRegistrationOtp(item)}>{emailPreview(item.email)} · 提交验证码</Button>)}</div></div> : null}
+    {showAccounts && manualOtpWaiting.length ? <div className="manual-otp-strip"><div><strong>{manualOtpWaiting.length} 个注册任务正在等待邮箱验证码</strong><small>验证码提交后，注册任务会自动继续。</small></div><div className="manual-otp-actions">{manualOtpWaiting.map((item) => <Button key={`${item.job_id || ''}:${item.email}`} size="sm" variant="primary" onClick={() => submitManualRegistrationOtp(item)}>{item.email} · 提交验证码</Button>)}</div></div> : null}
     {phonePanel}
     {accountPanel}
 
@@ -732,7 +705,7 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
     <Modal open={batchRegisterOpen} title="注册新 GPT 账号" wide onClose={() => setBatchRegisterOpen(false)} footer={<><Button onClick={() => setBatchRegisterOpen(false)}>取消</Button><Button icon={Settings2} onClick={() => { setBatchRegisterOpen(false); onOpenSettings?.('email:general'); }}>邮箱渠道设置</Button><Button icon={MailPlus} variant="primary" disabled={!registrationReady} loading={batchRegistering} onClick={registerNewAccounts}>开始注册</Button></>}>
       <div className="registration-channel-picker">
         <div className="registration-picker-heading"><div><strong>选择本次使用的邮箱渠道</strong><p>可以自由勾选；领取失败时按下方顺序尝试下一个渠道。</p></div><span>{selectedRegistrationChannels.length ? `已选 ${selectedRegistrationChannels.length} 个` : usingManualRegistration ? '手动邮箱' : '尚未选择'}</span></div>
-        <div className="source-picker-options registration-source-options">{registrationPickerChannels.map((channel) => { const selected = registrationEmailSources.includes(channel.id) && channel.ready; const imported = Boolean(channel.requires_import); const settingsGroup = channel.id === 'pool' ? 'email:general' : (channel.id === 'cloudflare_domain' ? 'email:domain' : 'email:temporary'); const configure = channel.id === 'pool' ? onOpenEmail : () => onOpenSettings?.(settingsGroup); return <div className="registration-source-row" key={channel.id}><label className={`source-option registration-source-option ${selected ? 'is-selected' : ''} ${channel.ready ? '' : 'is-disabled'}`} title={channel.message || (channel.ready ? '可以使用' : '尚未完成配置')}><input type="checkbox" checked={selected} disabled={!channel.ready} onChange={() => toggleRegistrationSource(channel.id)} /><span><strong>{channel.label || EMAIL_SOURCE_TEXT[channel.id] || channel.id}<em>{imported ? '导入邮箱' : '自动获取'}</em></strong><small>{channel.message || (channel.ready ? '配置完整，可以使用' : '尚未完成配置')}</small></span><b>{channel.ready ? '可用' : '需配置'}</b></label>{!channel.ready ? <Button size="sm" onClick={() => { setBatchRegisterOpen(false); configure?.(); }}>{channel.id === 'pool' ? '去导入' : '去配置'}</Button> : null}</div>; })}</div>
+        <div className="source-picker-options registration-source-options">{registrationPickerChannels.map((channel) => { const selected = registrationEmailSources.includes(channel.id) && channel.ready; const imported = Boolean(channel.requires_import); const settingsGroup = channel.id === 'pool' ? 'email:general' : (channel.id === 'cloudflare_domain' ? 'email:domain' : 'email:temporary'); const configure = channel.id === 'pool' ? onOpenEmail : () => onOpenSettings?.(settingsGroup); return <div className="registration-source-row" key={channel.id}><label className={`source-option registration-source-option ${selected ? 'is-selected' : ''} ${channel.ready ? '' : 'is-disabled'}`} title={channel.message || (channel.ready ? '可以使用' : '尚未完成配置')}><CheckboxControl checked={selected} disabled={!channel.ready} onChange={() => toggleRegistrationSource(channel.id)} /><span><strong>{channel.label || EMAIL_SOURCE_TEXT[channel.id] || channel.id}<em>{imported ? '导入邮箱' : '自动获取'}</em></strong><small>{channel.message || (channel.ready ? '配置完整，可以使用' : '尚未完成配置')}</small></span><b>{channel.ready ? '可用' : '需配置'}</b></label>{!channel.ready ? <Button size="sm" onClick={() => { setBatchRegisterOpen(false); configure?.(); }}>{channel.id === 'pool' ? '去导入' : '去配置'}</Button> : null}</div>; })}</div>
         <div className="source-order registration-source-order"><div className="source-order-heading"><strong>本次优先顺序</strong><span>{selectedRegistrationChannels.length ? '数字越靠前越优先' : '勾选渠道后可调整'}</span></div>{selectedRegistrationChannels.length ? selectedRegistrationChannels.map((channel, index) => <div className="source-order-row" key={channel.id}><span className="source-order-number">{index + 1}</span><span>{channel.label || EMAIL_SOURCE_TEXT[channel.id] || channel.id}</span><span className="source-order-actions"><IconButton label="上移" icon={ArrowUp} size={14} disabled={index === 0} onClick={() => moveRegistrationSource(channel.id, -1)} /><IconButton label="下移" icon={ArrowDown} size={14} disabled={index === selectedRegistrationChannels.length - 1} onClick={() => moveRegistrationSource(channel.id, 1)} /></span></div>) : <span className="source-order-empty">未就绪的渠道会保持灰色；请先导入邮箱或到设置页补全配置。</span>}</div>
         {usingManualRegistration ? <div className="registration-manual-note"><strong>当前使用设置中的手动邮箱</strong><span>本次只能注册 1 个账号，收到验证码后需在 GPT账号页面提交。</span></div> : null}
       </div>
@@ -744,12 +717,12 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
 
     <Modal open={Boolean(importMode)} title={importMode === 'phones' ? '导入手机号' : '导入 ChatGPT 账号'} onClose={() => setImportMode(null)} wide footer={<><Button onClick={() => setImportMode(null)}>取消</Button><Button icon={Upload} variant="primary" onClick={submitImport}>导入</Button></>}>
       {importMode !== 'phones' ? <>
-        <label className="field-label">本批账号代理（可选）<input value={importProxy} onChange={(event) => setImportProxy(event.target.value)} placeholder="http://host:port 或 socks5h://user:pass@host:port" autoComplete="off" /></label>
+        <label className="field-label">本批账号代理（可选）<Input value={importProxy} onChange={(event) => setImportProxy(event.target.value)} placeholder="http://host:port 或 socks5h://user:pass@host:port" autoComplete="off" /></label>
         <p className="field-help">JSON 每行可设置独立的 proxy，优先于本批代理；显式填写 "proxy": "" 表示本机网络。未填写代理的新账号默认本机网络；重复导入且没有填写代理时保留原记录。</p>
         <ProxyTest proxies={[importProxy.trim()]} label="测试导入代理 / 本机网络" />
       </> : null}
-      <label className="field-label">粘贴素材<textarea rows="12" value={importText} onChange={(event) => setImportText(event.target.value)} placeholder={importMode === 'phones' ? '手机号----取码 URL----可用次数' : '每行一个账号；邮箱、HTTP 接码地址、密码、2FA 顺序不限'} spellCheck="false" /></label>
-      {importMode === 'phones' ? <p className="field-help">每行一个手机号，可用次数可省略（默认 1 次，范围 0–3）。新号码默认不过期；导入后可直接修改“可用次数”，在“期限”列或“批量设置”中维护过期时间。</p> : <p className="field-help">按内容自动识别邮箱、HTTP 接码地址、2FA 和密码，无需固定字段顺序；<button type="button" className="field-help-link" onClick={() => { setImportMode(null); onOpenSettings?.('email:general'); }}>点击设置分隔符</button></p>}
+      <label className="field-label">粘贴素材<Textarea rows="12" value={importText} onChange={(event) => setImportText(event.target.value)} placeholder={importMode === 'phones' ? '手机号----取码 URL----可用次数' : '每行一个账号；邮箱、HTTP 接码地址、密码、2FA 顺序不限'} spellCheck="false" /></label>
+      {importMode === 'phones' ? <p className="field-help">每行一个手机号，可用次数可省略（默认 1 次，范围 0–3）。新号码默认不过期；导入后可直接修改“可用次数”，在“期限”列或“批量设置”中维护过期时间。</p> : <p className="field-help">按内容自动识别邮箱、HTTP 接码地址、2FA 和密码，无需固定字段顺序；<ActionButton type="button" className="field-help-link" onClick={() => { setImportMode(null); onOpenSettings?.('email:general'); }}>点击设置分隔符</ActionButton></p>}
     </Modal>
 
     <Modal open={Boolean(proxyRow)} title={`测试账号代理 · ${proxyRow?.email || ''}`} onClose={() => setProxyRow(null)} footer={<Button onClick={() => setProxyRow(null)}>关闭</Button>}>
@@ -759,16 +732,16 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
 
     <Modal open={Boolean(editAccount)} title={`编辑 ChatGPT 账号 · ${editAccount?.email || ''}`} onClose={() => setEditAccount(null)} wide footer={<><Button onClick={() => setEditAccount(null)}>取消</Button><Button variant="primary" icon={Check} onClick={saveEditor}>保存账号</Button></>}>
       <div className="edit-form"><div className="edit-grid">
-        <label className="field-label">邮箱<input value={editDraft.email || ''} onChange={(event) => setEditDraft((current) => ({ ...current, email: event.target.value }))} readOnly={editAccount?.registration_status === 'registered'} autoComplete="off" />{editAccount?.registration_status === 'registered' ? <small className="field-help">已注册账号的邮箱属于登录身份，不能直接更改。</small> : null}</label>
-        <label className="field-label">ChatGPT 密码<input value={editDraft.chatgpt_password || ''} onChange={(event) => setEditDraft((current) => ({ ...current, chatgpt_password: event.target.value }))} autoComplete="off" /></label>
-        <label className="field-label">邮箱取码 URL<input value={editDraft.email_code_url || ''} onChange={(event) => setEditDraft((current) => ({ ...current, email_code_url: event.target.value }))} autoComplete="off" /></label>
-        <label className="field-label">TOTP 密钥<input value={editDraft.totp_secret || ''} onChange={(event) => setEditDraft((current) => ({ ...current, totp_secret: event.target.value }))} autoComplete="off" /></label>
-      </div><label className="field-label">备注<textarea rows="3" value={editDraft.note || ''} onChange={(event) => setEditDraft((current) => ({ ...current, note: event.target.value }))} /></label>
+        <label className="field-label">邮箱<Input value={editDraft.email || ''} onChange={(event) => setEditDraft((current) => ({ ...current, email: event.target.value }))} readOnly={editAccount?.registration_status === 'registered'} autoComplete="off" />{editAccount?.registration_status === 'registered' ? <small className="field-help">已注册账号的邮箱属于登录身份，不能直接更改。</small> : null}</label>
+        <label className="field-label">ChatGPT 密码<Input value={editDraft.chatgpt_password || ''} onChange={(event) => setEditDraft((current) => ({ ...current, chatgpt_password: event.target.value }))} autoComplete="off" /></label>
+        <label className="field-label">邮箱取码 URL<Input value={editDraft.email_code_url || ''} onChange={(event) => setEditDraft((current) => ({ ...current, email_code_url: event.target.value }))} autoComplete="off" /></label>
+        <label className="field-label">TOTP 密钥<Input value={editDraft.totp_secret || ''} onChange={(event) => setEditDraft((current) => ({ ...current, totp_secret: event.target.value }))} autoComplete="off" /></label>
+      </div><label className="field-label">备注<Textarea rows="3" value={editDraft.note || ''} onChange={(event) => setEditDraft((current) => ({ ...current, note: event.target.value }))} /></label>
       <section className="edit-phone-pool" aria-label="账号代理">
         <h3>账号代理</h3>
         <p className="field-help">当前：{editAccount?.proxy_display || '本机网络'}。代理密码不会回填；保持不变不会丢失已有认证信息。</p>
         <Select value={editProxyMode} onChange={setEditProxyMode} options={[{ value: 'keep', label: '保持当前线路' }, { value: 'replace', label: '设置 / 替换代理' }, { value: 'direct', label: '清除代理，使用本机网络' }]} />
-        {editProxyMode === 'replace' ? <label className="field-label">代理服务器<input value={editDraft.proxy || ''} onChange={(event) => setEditDraft((current) => ({ ...current, proxy: event.target.value }))} placeholder="http://host:port 或 socks5h://user:pass@host:port" autoComplete="off" /></label> : null}
+        {editProxyMode === 'replace' ? <label className="field-label">代理服务器<Input value={editDraft.proxy || ''} onChange={(event) => setEditDraft((current) => ({ ...current, proxy: event.target.value }))} placeholder="http://host:port 或 socks5h://user:pass@host:port" autoComplete="off" /></label> : null}
         {editAccount ? <ProxyTest accountId={editProxyMode === 'keep' ? editAccount.id : ''} proxies={[editProxyMode === 'replace' ? (editDraft.proxy || '').trim() : '']} disabled={editProxyMode === 'replace' && !editDraft.proxy?.trim()} label="测试当前选择的线路" /> : null}
       </section>
       <section className="edit-phone-pool" aria-label="手机号接码池">
@@ -776,15 +749,15 @@ export default function RelayPage({ notify, summary, mode = 'all', embedded = fa
         <h3>加入手机号接码池（可选）</h3>
         <p className="field-help">填写一组号码和短信取码 URL，保存时会加入共享手机池，授权需要短信时才会取号。留空不会删除已有号码；已加入的候选号码请在“手机号接码池”查看和维护。</p>
         <div className="edit-grid">
-          <label className="field-label">新增手机号<input value={editDraft.phone || ''} onChange={(event) => setEditDraft((current) => ({ ...current, phone: event.target.value }))} placeholder="加入手机池的号码" autoComplete="off" /></label>
-          <label className="field-label">新增短信取码 URL<input value={editDraft.sms_code_url || ''} onChange={(event) => setEditDraft((current) => ({ ...current, sms_code_url: event.target.value }))} placeholder="https://…" autoComplete="off" /></label>
+          <label className="field-label">新增手机号<Input value={editDraft.phone || ''} onChange={(event) => setEditDraft((current) => ({ ...current, phone: event.target.value }))} placeholder="加入手机池的号码" autoComplete="off" /></label>
+          <label className="field-label">新增短信取码 URL<Input value={editDraft.sms_code_url || ''} onChange={(event) => setEditDraft((current) => ({ ...current, sms_code_url: event.target.value }))} placeholder="https://…" autoComplete="off" /></label>
         </div>
       </section></div>
     </Modal>
 
     <Modal open={sub2Open} title="sub2api 服务与双向同步" onClose={() => setSub2Open(false)} wide footer={<><Button onClick={() => setSub2Open(false)}>关闭</Button><Button onClick={deleteSub2} variant="danger" disabled={!sub2ServiceId}>删除服务</Button><Button onClick={saveSub2}>保存服务</Button><Button icon={Download} disabled={!sub2ServiceId || !accountIds.length} onClick={() => runAction('/api/gpt-accounts/sub2/import', { account_ids: accountIds, service_id: sub2ServiceId, delete_terminal: false }, '已同步到 sub2api')}>同步到 sub2</Button><Button icon={RefreshCw} disabled={!sub2ServiceId} variant="primary" onClick={() => runAction('/api/gpt-accounts/sub2/sync', { service_id: sub2ServiceId }, '已从 sub2api 同步')}>从 sub2 同步</Button></>}>
       <div className="sub2-picker"><Select label="已保存服务" value={sub2ServiceId} onChange={(value) => { setSub2ServiceId(value); const service = sub2Services.find((item) => item.id === value); if (service) setSub2Draft({ name: service.name || '', homepage: service.homepage || '', api_base: service.api_base || '', admin_key: service.admin_key || '' }); }} options={[{ value: '', label: '新建服务' }, ...sub2Services.map((service) => ({ value: service.id, label: `${service.name} · ${service.api_base}` }))]} /><Button icon={Plus} onClick={() => { setSub2ServiceId(''); setSub2Draft({ name: '', homepage: '', api_base: '', admin_key: '' }); }}>新建</Button></div>
-      <div className="edit-grid">{[['name', '服务名称'], ['homepage', '官网'], ['api_base', 'API 地址'], ['admin_key', '管理员 Key']].map(([key, label]) => <label className="field-label" key={key}>{label}<input type={key === 'admin_key' ? 'password' : 'text'} value={sub2Draft[key] || ''} onChange={(event) => setSub2Draft((current) => ({ ...current, [key]: event.target.value }))} autoComplete="off" /></label>)}</div>
+      <div className="edit-grid">{[['name', '服务名称'], ['homepage', '官网'], ['api_base', 'API 地址'], ['admin_key', '管理员 Key']].map(([key, label]) => <label className="field-label" key={key}>{label}<Input type={key === 'admin_key' ? 'password' : 'text'} value={sub2Draft[key] || ''} onChange={(event) => setSub2Draft((current) => ({ ...current, [key]: event.target.value }))} autoComplete="off" /></label>)}</div>
     </Modal>
 
     <Modal open={Boolean(logRow)} title={`账号日志 · ${logRow?.email || ''}`} onClose={() => setLogRow(null)} wide footer={<Button onClick={() => setLogRow(null)}>关闭</Button>}><pre className="log-viewer">{logText}</pre></Modal>

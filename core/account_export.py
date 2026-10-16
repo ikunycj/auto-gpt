@@ -27,39 +27,21 @@ logger = logging.getLogger(__name__)
 
 
 def _check_2fa_response(response, *, stage: str, route: str) -> None:
-    """Log an allowlisted HTTP summary and stop at the first failed 2FA step.
-
-    Redirect/callback URLs and response bodies may contain authorization codes,
-    so no URL, header value, or exception from the HTTP library is logged here.
-    """
+    """Log the complete HTTP response and stop at the first failed 2FA step."""
     status = getattr(response, "status_code", None)
     status = status if type(status) is int else "unknown"
+    response_url = str(getattr(response, "url", "") or "")
     try:
-        host = (urlsplit(str(getattr(response, "url", "") or "")).hostname or "").lower()
+        host = (urlsplit(response_url).hostname or "").lower()
     except (TypeError, ValueError):
         host = ""
-    if host not in ("chatgpt.com", "auth.openai.com"):
-        host = "unknown"
     headers = getattr(response, "headers", None) or {}
-    def _header(name: str) -> str:
-        try:
-            value = headers.get(name)
-            if value is None:
-                value = headers.get(name.title())
-            if value is None:
-                value = next((v for k, v in headers.items() if str(k).lower() == name), "")
-            return str(value or "")
-        except Exception:
-            return ""
-    content_type = _header("content-type").split(";", 1)[0].strip().lower()
-    if content_type not in ("application/json", "text/html", "text/plain", "application/problem+json"):
-        content_type = "other" if content_type else "unknown"
-    cloudflare_challenge = "chlray" in _header("server-timing").lower()
+    response_text = str(getattr(response, "text", "") or "")
     level = logging.WARNING if type(status) is int and status >= 400 else logging.INFO
     logger.log(
         level,
-        "[2FA] HTTP stage=%s host=%s route=%s status=%s mime=%s chlray=%s",
-        stage, host, route, status, content_type, cloudflare_challenge,
+        "[2FA] HTTP stage=%s host=%s route=%s status=%s url=%s headers=%r body=%s",
+        stage, host, route, status, response_url, dict(headers), response_text,
     )
     if type(status) is int and status >= 400:
         raise RuntimeError(f"2FA {stage} HTTP {status}")

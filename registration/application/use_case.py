@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Application use case for one ChatGPT registration.
 
-This module owns the protocol flow and post-registration orchestration.  CLI and
+This module owns driver dispatch and shared registration checkpoints.  CLI and
 Web workers call :func:`run_registration`; browser integrations are resolved
 through the lazy driver registry.
 """
@@ -12,27 +12,11 @@ import re
 import time
 
 from config import twofa as _twofa_cfg
-from config import openai_protocol as _protocol_cfg
 from core.session import BrowserSession
-from core.chatgpt_auth import get_providers, get_csrf_token, signin_openai
-from core.openai_auth import (
-    follow_authorize,
-    request_sentinel_token,
-    build_sentinel_header,
-    validate_email_otp,
-    send_email_otp,
-    network_preflight,
-    navigate_about_you,
-    EmailOtpInvalidError,
-    create_account,
-)
 from core.account_export import (
     follow_oauth_callback,
     fetch_session,
-    setup_2fa,
-    save_account_data,
 )
-from core.email_provider import automatic_email_enabled, wait_for_otp
 from core.humanize import delay as human_delay
 from core.profile_utils import generate_random_birthday
 from registration.application.models import RegistrationRequest, RegistrationResult
@@ -40,22 +24,9 @@ from registration.drivers.registry import get_driver
 
 logger = logging.getLogger(__name__)
 
-_LOG_SECRET_RE = re.compile(
-    r"(?i)(\b(?:password|passwd|token|secret|authorization|cookie|otp|code|access_token|refresh_token)\b\s*[:=]\s*)([^\s,;]+)"
-)
-_LOG_URL_RE = re.compile(r"(?i)\b(?:https?|chrome-error)://[^\s<>\"']+")
-_LOG_LONG_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{32,}\b")
-
-
-def _safe_log_text(value: object, limit: int = 240) -> str:
-    """Keep error class/context while excluding auth URLs and credential values."""
-    text = " ".join(str(value or "").split())
-    if not text:
-        return "-"
-    text = _LOG_URL_RE.sub("[URL已隐藏]", text)
-    text = _LOG_SECRET_RE.sub(lambda match: f"{match.group(1)}[已隐藏]", text)
-    text = _LOG_LONG_TOKEN_RE.sub("[长令牌已隐藏]", text)
-    return text[:limit] + ("…" if len(text) > limit else "")
+def _diagnostic_text(value: object, limit: int = 240) -> str:
+    """Return the complete registration error for local auditing."""
+    return str(value or "-")
 
 _FINALIZE_SESSION_MAX_ATTEMPTS = 5
 _FINALIZE_SESSION_BACKOFF_BASE = 2.0
@@ -115,7 +86,7 @@ def _finalize_registration_session(
             backoff = _FINALIZE_SESSION_BACKOFF_BASE ** (attempt - 1)
             logger.warning(
                 f"[登录态] 回调或拉取 Token 失败：{email}，"
-                f"{type(exc).__name__}: {_safe_log_text(exc)}，{backoff:.1f}s 后重试"
+                f"{type(exc).__name__}: {_diagnostic_text(exc)}，{backoff:.1f}s 后重试"
             )
             time.sleep(backoff)
 
@@ -123,354 +94,6 @@ def _finalize_registration_session(
         f"OAuth 回调/拉取 Token 重试耗尽：{email}，"
         f"最后错误：{type(last_exc).__name__ if last_exc else 'Unknown'}: {last_exc}"
     ) from last_exc
-
-def _run_protocol_registration(
-    email: str,
-    name: str,
-    birthday: str | None = None,
-    proxy: str = None,
-    otp_code: str = None,
-    batch_dir=None,
-):
-    """
-    执行完整的 ChatGPT 注册流程（OTP-only，无密码）。
-
-    OpenAI 当前默认流程：signin 时携带 login_hint+screen_hint=login_or_signup
-    → follow_authorize 重定向链自动落到 /email-verification 并触发 OTP 发送
-    → 用户输入验证码 → validate_email_otp → about-you 提交昵称生日 → 完成。
-
-    Args:
-        email: 注册邮箱
-        name: 用户显示名称
-        birthday: 生日，格式 YYYY-MM-DD
-        proxy: 代理地址（不传则从 PROXY_POOL 随机抽）
-        otp_code: 邮箱验证码（如果为None，会等待手动输入）
-    """
-    require_password_2fa_driver("protocol")
-
-    # This helper is called by the protocol adapter only; driver selection is
-    # owned by the registry and happens before entering this function.
-    # 创建浏览器会话（proxy=None 时自动从 config.PROXY_POOL 随机抽一个）
-    session = BrowserSession(proxy=proxy)
-
-    # 从代理 URL 中抽取 sid 段做日志，避免把账号密码完整打印
-    proxy_label = "无"
-    if session.proxy:
-        # 形如 socks5h://user-region-JP-sid-XXXX-t-5:pass@host:port
-        try:
-            sid_part = next(
-                (seg for seg in session.proxy.split("@")[0].split("-") if len(seg) == 8),
-                "***",
-            )
-            proxy_label = f"{session.proxy.split('://')[0]}://...sid-{sid_part}...@{session.proxy.split('@')[-1]}"
-        except Exception:
-            proxy_label = "已配置"
-
-    if not birthday:
-        birthday = generate_random_birthday()
-
-    logger.info(f"[注册] 开始：{email}，代理={proxy_label}")
-    logger.info(f"[注册] 本次随机生日: {birthday}")
-    logger.debug(f"[注册] 设备ID={session.device_id}，会话日志ID={session.auth_session_logging_id}")
-
-    create_acknowledged = False
-    account_id = None
-    try:
-        # 网络预检必须在 signin/follow_authorize 之前完成；预检不带邮箱，不会触发 OTP。
-        network_preflight(session)
-        human_delay("navigate")
-
-        # 根据 2026-07-19 HAR 补齐匿名态 ChatGPT 首屏/模型预热链路。
-        if getattr(_protocol_cfg, "CHATGPT_ANON_BOOTSTRAP_ENABLED", True):
-            from core.chatgpt_bootstrap import anonymous_bootstrap
-            anonymous_bootstrap(
-                session,
-                strict=bool(getattr(_protocol_cfg, "CHATGPT_BOOTSTRAP_STRICT", False)),
-            )
-            human_delay("navigate")
-
-        # ==================== 阶段1: ChatGPT 认证 ====================
-        # 步骤1: 获取 providers
-        providers = get_providers(session)
-        human_delay("api")
-
-        # 步骤2: 获取 CSRF token
-        csrf_token = get_csrf_token(session)
-        human_delay("api")
-
-        # 步骤3: 发起 OAuth signin
-        authorize_url = signin_openai(session, csrf_token, email)
-        human_delay("api")
-
-        # 记录"OTP 触发"前的时间戳，自动取信箱时只看此后的邮件，
-        # 避免取到上次注册留下的旧 OTP。
-        otp_after_ts = time.time()
-
-        # ==================== 阶段2: OpenAI Auth ====================
-        # 步骤4: 跟随 authorize URL（建立 auth.openai.com 的 cookies）
-        # 由于步骤3已携带 login_hint + screen_hint=login_or_signup，
-        # 重定向链会直接走到 /email-verification 并自动触发 OTP 发送，
-        # 不需要 /create-account/password、register_user、单独 send_email_otp 调用。
-        follow_authorize(session, authorize_url)
-        human_delay("navigate")
-
-        # ==================== 阶段3: 验证码验证 ====================
-        # Sentinel Token 不提前生成；等 OTP 到手后紧贴 validate 请求生成，
-        # 避免等待邮箱期间 challenge 过期或与重新发送后的状态不一致。
-
-        # 如果验证码错误/过期，自动重新发送并重新取最新验证码。
-        validate_result = None
-        max_otp_attempts = 3
-        current_otp = otp_code
-        for otp_attempt in range(1, max_otp_attempts + 1):
-            if current_otp is None:
-                if automatic_email_enabled():
-                    logger.info(f"[OTP] 等待验证码：{email}（第 {otp_attempt}/{max_otp_attempts} 次）")
-                else:
-                    logger.info(f"[OTP] 等待手动提交验证码：{email}（第 {otp_attempt}/{max_otp_attempts} 次）")
-                current_otp = wait_for_otp(email, after_ts=otp_after_ts)
-
-            human_delay("otp_input")
-            try:
-                # HAR 对齐：2026-07-19 抓包中的 email-otp/validate 未携带 Sentinel。
-                # 保留开关，必要时可切回旧逻辑。
-                sentinel_header_9 = None
-                so_header_9 = None
-                if getattr(_protocol_cfg, "SEND_SENTINEL_ON_EMAIL_OTP_VALIDATE", False):
-                    sentinel_resp_9 = request_sentinel_token(session, "authorize_continue")
-                    sentinel_header_9, so_header_9 = build_sentinel_header(session, sentinel_resp_9, "authorize_continue")
-                    human_delay("challenge")
-
-                # 步骤10: 提交验证码
-                validate_result = validate_email_otp(session, current_otp, sentinel_header_9, so_header_9)
-                break
-            except EmailOtpInvalidError as exc:
-                if otp_attempt >= max_otp_attempts:
-                    raise
-                logger.warning("[OTP] 验证码错误/过期：%s，准备重新发送并重新获取验证码", _safe_log_text(exc, 180))
-                otp_after_ts = time.time()
-                send_email_otp(session)
-                human_delay("api")
-                current_otp = None
-
-        if validate_result is None:
-            raise RuntimeError("OTP 验证未完成")
-        human_delay("api")
-
-        # OTP 校验后的下一步由服务端 auth session 决定：
-        #   - about_you：新账号，需要继续提交姓名/生日 create_account。
-        #   - external_url：通常说明服务端已可直接 OAuth 回调（常见于已有账号/无需资料页），
-        #                   此时再强行调用 create_account 会触发 invalid_auth_step。
-        page = validate_result.get("page") if isinstance(validate_result, dict) else {}
-        page = page if isinstance(page, dict) else {}
-        page_type = str(page.get("type") or "")
-        otp_continue_url = (
-            validate_result.get("continue_url")
-            or validate_result.get("external_url")
-            or validate_result.get("url")
-            or page.get("continue_url")
-            or page.get("external_url")
-            or page.get("url")
-        )
-        logger.info(
-            f"[步骤10] 后续分支判断: page_type={page_type or '空'}, "
-            f"has_continue_url={bool(otp_continue_url)}"
-        )
-
-        # ==================== 阶段5/6: 完成注册或直接 OAuth 回调 ====================
-        otp_continue_text = str(otp_continue_url or "")
-        direct_oauth_after_otp = bool(
-            otp_continue_text
-            and "about-you" not in otp_continue_text
-            and (
-                "chatgpt.com/api/auth/callback" in otp_continue_text
-                or "auth.openai.com/authorize/continue" in otp_continue_text
-                or page_type == "external_url"
-            )
-        )
-        if page_type == "external_url" or direct_oauth_after_otp:
-            if not otp_continue_url:
-                raise RuntimeError(f"OTP external_url 响应缺少可跟随 URL，无法继续: {validate_result}")
-            logger.info(f"[注册] OTP 后进入 OAuth 回调分支，跳过 create_account：{email}")
-            create_acknowledged = True
-            session_info, access_token = _finalize_registration_session(
-                session,
-                otp_continue_url,
-                email,
-                callback_referer="https://auth.openai.com/email-verification",
-            )
-            if getattr(_protocol_cfg, "CHATGPT_AUTH_BOOTSTRAP_ENABLED", True):
-                from core.chatgpt_bootstrap import authenticated_bootstrap
-                authenticated_bootstrap(
-                    session,
-                    access_token,
-                    strict=bool(getattr(_protocol_cfg, "CHATGPT_BOOTSTRAP_STRICT", False)),
-                )
-            human_delay("post_auth")
-        else:
-            # 兼容服务端只返回 continue_url=/about-you 但 page.type 为空/变化的情况。
-            if page_type and page_type not in ("about_you", "about-you"):
-                if otp_continue_url and "about-you" not in str(otp_continue_url):
-                    raise RuntimeError(
-                        f"OTP 后续页面类型未知，不应盲目 create_account: "
-                        f"page_type={page_type}, resp={validate_result}"
-                    )
-                logger.warning(
-                    f"[步骤10] 未知 page_type={page_type}，但 continue_url 指向 about-you，继续 create_account"
-                )
-
-            # 先真实导航到 about-you，让 auth session/page state 与 create_account 一致。
-            about_url = str(otp_continue_url) if otp_continue_url and "about-you" in str(otp_continue_url) else None
-            navigate_about_you(session, about_url)
-            human_delay("navigate")
-
-            # 步骤11: 获取 Sentinel Token（oauth_create_account）
-            sentinel_resp_11 = request_sentinel_token(session, "oauth_create_account")
-            sentinel_header_11, so_header_11 = build_sentinel_header(session, sentinel_resp_11, "oauth_create_account")
-            human_delay("challenge")
-
-            human_delay("form")
-
-            # 步骤12: 提交用户信息，完成注册
-            create_result = create_account(session, name, birthday, sentinel_header_11, so_header_11)
-            create_acknowledged = True
-
-            logger.info(f"[注册] 创建接口已通过：{email}，继续完成 OAuth 回调")
-            human_delay("post_auth")
-
-            # 步骤12.5: 跟随 create_account 返回的 continue_url 完成 OAuth 回调
-            continue_url = create_result.get("continue_url")
-            if not continue_url:
-                raise RuntimeError(
-                    f"create_account 响应缺少 continue_url，无法继续: {create_result}"
-                )
-
-            # 步骤13: 拉 /api/auth/session 提取 accessToken
-            session_info, access_token = _finalize_registration_session(session, continue_url, email)
-            if getattr(_protocol_cfg, "CHATGPT_AUTH_BOOTSTRAP_ENABLED", True):
-                from core.chatgpt_bootstrap import authenticated_bootstrap
-                authenticated_bootstrap(
-                    session,
-                    access_token,
-                    strict=bool(getattr(_protocol_cfg, "CHATGPT_BOOTSTRAP_STRICT", False)),
-                )
-            human_delay("post_auth")
-
-        # accessToken 只代表远端注册阶段完成。账号必须等所有启用的安全步骤
-        # 完成后才允许写入 GPT 账号库，避免留下只有邮箱 OTP 登录能力的账号。
-        from core.email_provider import resolve_email_source, snapshot_email_context
-
-        email_source = resolve_email_source(email)
-        provider_context = snapshot_email_context(email, source=email_source)
-        codex_result = {
-            "status": "not_authorized",
-            "ok": False,
-            "message": "GPT 注册完成，等待在 GPT账号 页面手动发起 Codex 授权",
-        }
-        account_fields = {
-            "user_id": (session_info.get("user") or {}).get("id"),
-            "user_name": (session_info.get("user") or {}).get("name"),
-            "plan_type": (session_info.get("account") or {}).get("planType"),
-            "expires_at": session_info.get("expires"),
-            "device_id": session.device_id,
-            "sentinel_sid": getattr(session, "sentinel_sid", None),
-            "browser_profile": getattr(session, "browser_profile", None),
-            "registration_driver": "protocol",
-            "email_provider_context": provider_context,
-            "codex_status": codex_result["status"],
-        }
-        # ==================== 阶段7: 设置 2FA（受 config.ENABLE_2FA 控制）====================
-        totp_secret = None
-        if _twofa_cfg.ENABLE_2FA:
-            # 步骤14-20: 重认证（要再收一次邮箱 OTP）→ enroll TOTP → activate
-            try:
-                totp_secret = setup_2fa(session, email, otp_provider=wait_for_otp)
-            except Exception as exc:
-                logger.error("2FA 设置失败: %s: %s", type(exc).__name__, _safe_log_text(exc))
-                logger.debug("2FA 错误详情已省略敏感堆栈：%s", type(exc).__name__)
-                raise RuntimeError(
-                    "protocol 注册无法完成密码 + TOTP 独立登录验证；账号不会写入 GPT 账号库"
-                ) from exc
-        else:
-            logger.debug("已跳过 2FA 设置 (config.ENABLE_2FA=False)")
-
-        # ==================== 阶段8: 写批次归档 ====================
-        account_id = save_account_data(
-            email=email,
-            access_token=access_token,
-            totp_secret=totp_secret,
-            email_source=email_source,
-            proxy=session.proxy or None,
-            login_method="email_otp",
-            batch_dir=batch_dir,
-            **account_fields,
-            archive=True,
-        verified_registration=True,
-            enqueue_plan=True,
-        )
-
-        logger.info(f"[完成] {email}，账号ID={account_id}，已获取登录态")
-
-        # ==================== 阶段9: 后置自动触发 flow ====================
-        # 只有 GPT 注册拿到 token 并保存成功的账号，才会触发 flow。
-        # flow 请求不影响账号保存状态，但会记录结果并参与批量统计。
-        flow_result = {"status": "skipped", "ok": False, "message": "未触发"}
-        try:
-            from core.flow_trigger import trigger_flow
-            flow_result = trigger_flow(access_token)
-        except Exception as exc:
-            flow_result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {exc}"}
-
-        if flow_result.get("ok"):
-            logger.info(
-                f"[Flow] 成功：{email}，HTTP={flow_result.get('http_status')}, "
-                f"flow_id={flow_result.get('flow_id') or '未解析'}"
-            )
-        elif flow_result.get("status") == "skipped":
-            logger.info(f"[Flow] 跳过：{email}，原因={flow_result.get('message')}")
-        else:
-            logger.warning(
-                f"[Flow] 失败：{email}，HTTP={flow_result.get('http_status') or '无'}, "
-                f"原因={flow_result.get('message')}"
-            )
-
-        logger.debug("[完成] TOTP 已设置：%s", bool(totp_secret))
-
-        return {"success": True, "email": email, "account_id": account_id,
-                "access_token": access_token, "totp_secret": totp_secret,
-                "flow": flow_result, "codex": codex_result,
-                "error": None}
-
-    except Exception as e:
-        logger.error("[失败] %s: %s: %s", email, type(e).__name__, _safe_log_text(e))
-        logger.debug("详细错误信息已省略敏感堆栈：%s", type(e).__name__)
-        # 邮箱状态回收策略，三种情况：
-        #   1. 账号已废（account_deactivated 等）：邮箱素材本身不可用，标 failed 直接剔除。
-        #   2. 创建接口通过后失败：远端已消耗这个邮箱，直接废弃，避免重复注册。
-        #   3. 创建接口通过前的普通失败：邮箱还可以下次继续尝试，放回 available。
-        from core.openai_auth import AccountUnusableError
-        account_dead = isinstance(e, AccountUnusableError)
-        try:
-            if email:
-                from core.email_provider import release_email
-                if account_dead:
-                    src = release_email(
-                        email, status="failed",
-                        note=f"账号已废弃，邮箱不可用: {str(e)[:180]}",
-                    )
-                    logger.warning(f"[邮箱:{src}] {email} 账号已废弃，标记为 failed，不再重新注册")
-                elif create_acknowledged:
-                    src = release_email(
-                        email, status="failed",
-                        note=f"创建接口已通过但后续失败，已废弃: {str(e)[:180]}",
-                    )
-                    logger.warning(f"[邮箱:{src}] {email} 已创建但后续失败，标记为 failed，不再重新注册")
-                else:
-                    src = release_email(email, status="available", note=f"上次失败: {str(e)[:180]}")
-                    logger.info(f"[邮箱:{src}] {email} 已恢复 available")
-        except Exception:
-            pass
-        return {"success": False, "email": email, "error": str(e)}
 
 def run_registration(
     email: str,

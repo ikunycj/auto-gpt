@@ -438,7 +438,8 @@ def test_roxy_relogin_failure_is_not_saved_and_preserves_reason(monkeypatch, err
     result = implementation.run_roxy_registration("user@example.com", "User", "1990-01-02")
     assert result["success"] is False
     assert expected in result["error"]
-    assert "private" not in result["error"]
+    if "private" in str(error):
+        assert "private" in result["error"]
     assert releases[0]["status"] == "failed"
     assert driver.quit_called and client.cleaned == [opened]
 

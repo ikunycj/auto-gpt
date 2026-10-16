@@ -78,20 +78,12 @@ from config.openai_protocol import (
     OPENAI_BUILD_ID,
     OAI_CLIENT_BUILD_NUMBER,
     OAI_CLIENT_VERSION,
-    STATSIG_CLIENT_KEY,
-    STATSIG_SDK_VERSION,
-    STATSIG_SDK_TYPE,
-    AB_CLIENT_KEY,
-    AB_SDK_VERSION,
-    SEND_SENTINEL_ON_EMAIL_OTP_VALIDATE,
-    CHATGPT_ANON_BOOTSTRAP_ENABLED,
-    CHATGPT_AUTH_BOOTSTRAP_ENABLED,
-    CHATGPT_BOOTSTRAP_STRICT,
 )
 
 # ---------- 代理池 ----------
 from config.proxy import (
     PROXY_POOL,
+    PROXY_POOL_DISABLED,
     PLAN_CHECK_PROXY_MODE,
     PLAN_CHECK_PROXY,
     PLAN_CHECK_TIMEOUT,
@@ -172,8 +164,6 @@ _RELOADABLE_SUBMODULES = (
     "config.twofa",
     "config.roxybrowser",
     "config.cloakbrowser",
-    "config.browser_use",
-    "config.skyvern",
     "config.flow_trigger",
     "config.codex",
     "config.extract_link",
@@ -208,9 +198,9 @@ def reload_all() -> list[str]:
 def _refresh_top_level_constants() -> None:
     """把刚 reload 的子模块的常量重新拷一份到 config 包顶层。"""
     import config as _self
-    from config import browser, openai_protocol, proxy as _proxy, register, email, twofa, roxybrowser, cloakbrowser, browser_use, skyvern, codex, extract_link, sub2api, humanize, flow_trigger
+    from config import browser, openai_protocol, proxy as _proxy, register, email, twofa, roxybrowser, cloakbrowser, codex, extract_link, sub2api, humanize, flow_trigger
     # 简单粗暴：枚举一遍重要常量，覆盖到 _self
-    for src in (browser, openai_protocol, _proxy, register, email, twofa, roxybrowser, cloakbrowser, browser_use, skyvern, codex, extract_link, sub2api, humanize, flow_trigger):
+    for src in (browser, openai_protocol, _proxy, register, email, twofa, roxybrowser, cloakbrowser, codex, extract_link, sub2api, humanize, flow_trigger):
         for k in dir(src):
             if k.isupper() or k in ("pick_proxy", "pick_browser_profile", "build_browser_environment", "validate_browser_profile"):
                 setattr(_self, k, getattr(src, k))
@@ -235,10 +225,8 @@ __all__ = [
     # openai_protocol
     "OPENAI_CLIENT_ID", "OPENAI_SCOPE", "OPENAI_AUDIENCE", "OPENAI_REDIRECT_URI",
     "SENTINEL_SV", "OPENAI_BUILD_ID", "OAI_CLIENT_BUILD_NUMBER", "OAI_CLIENT_VERSION",
-    "STATSIG_CLIENT_KEY", "STATSIG_SDK_VERSION", "STATSIG_SDK_TYPE", "AB_CLIENT_KEY", "AB_SDK_VERSION",
-    "SEND_SENTINEL_ON_EMAIL_OTP_VALIDATE", "CHATGPT_ANON_BOOTSTRAP_ENABLED", "CHATGPT_AUTH_BOOTSTRAP_ENABLED", "CHATGPT_BOOTSTRAP_STRICT",
     # proxy
-    "PROXY_POOL", "PLAN_CHECK_PROXY_MODE", "PLAN_CHECK_PROXY",
+    "PROXY_POOL", "PROXY_POOL_DISABLED", "PLAN_CHECK_PROXY_MODE", "PLAN_CHECK_PROXY",
     "PLAN_CHECK_TIMEOUT", "PLAN_CHECK_MAX_ATTEMPTS", "PLAN_CHECK_RETRY_DELAY",
     "PLAN_CHECK_REGISTRATION_RECHECK_DELAY", "PLAN_CHECK_WORKERS", "PLAN_CHECK_QUEUE_LIMIT",
     "PLAN_CHECK_MIN_INTERVAL", "PLAN_CHECK_JITTER", "pick_proxy", "PROXY",

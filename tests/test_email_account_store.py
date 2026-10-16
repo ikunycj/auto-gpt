@@ -62,6 +62,45 @@ def test_registering_same_email_updates_one_gpt_entity(isolated_store):
     assert db._load_email_pool() == []
 
 
+def test_claimed_mailbox_is_persisted_in_gpt_workspace_until_registration_finishes(isolated_store):
+    db.import_outlook_accounts([{
+        "email": "claimed@example.com",
+        "password": "mail-pass",
+        "client_id": "client",
+        "refresh_token": "refresh",
+    }])
+    db.claim_next_outlook()
+    job = db.create_job("outlook")
+
+    account_id = db.ensure_registration_account(
+        "claimed@example.com",
+        source="outlook",
+        job_id=job["id"],
+    )
+
+    pending = db.get_account(account_id)
+    assert pending["email"] == "claimed@example.com"
+    assert pending["registration_pending"] is True
+    assert "mailbox_password" not in pending
+    assert "outlook_refresh_token" not in pending
+    assert db.get_job(job["id"])["account_id"] == account_id
+    assert db.get_job(job["id"])["email"] == "claimed@example.com"
+    assert db._load_email_pool()[0]["status"] == "used"
+    assert b"claimed@example.com" not in sqlite_store.read_file(db._ACCOUNTS_TXT, category="text_exports")
+
+    completed_id = db.insert_account(
+        email="claimed@example.com",
+        access_token="access-token",
+    )
+
+    completed = db.get_account(completed_id)
+    assert completed_id == account_id
+    assert completed.get("registration_pending") is None
+    assert completed["mailbox_password"] == "mail-pass"
+    assert db._load_email_pool() == []
+    assert b"claimed@example.com" in sqlite_store.read_file(db._ACCOUNTS_TXT, category="text_exports")
+
+
 def test_failed_registration_write_rolls_back_gpt_and_mailbox(isolated_store, monkeypatch):
     db.import_outlook_accounts([{
         "email": "rollback@example.com",

@@ -33,18 +33,20 @@ dev/preview 将 `/api` 代理到后端。WebUI 仅绑定本机回环地址，不
 
 ### 2.1 注册驱动
 
-注册驱动可在 WebUI「设置 → 浏览器与网络 → 代理浏览器 → 总览与驱动」中选择（底层配置键为 `REGISTRATION_DRIVER`），当前支持六种实现：
+注册驱动可在 WebUI 左侧栏底部点击「浏览器」直接选择，选择后自动保存（底层配置键为 `REGISTRATION_DRIVER`），当前支持四种实现：
 
 | 驱动 | 说明 | 典型依赖 |
 |---|---|---|
-| `protocol` | `curl_cffi` 协议流程，结合 Sentinel/PoW | 代理、协议客户端 |
+| `protocol` | `curl_cffi` 协议流程，按附件项目请求顺序，结合 Sentinel/PoW | 代理、协议客户端 |
 | `roxy` | RoxyBrowser 指纹浏览器 + Selenium | 本机 RoxyBrowser API |
 | `cloak` | CloakBrowser + Playwright 适配层 | Cloak binary，支持免费版 |
-| `browser_use` | Browser Use Cloud stealth Chromium | `BROWSER_USE_API_KEY` |
-| `skyvern` | Skyvern Browser Sessions 云端浏览器 | `SKYVERN_API_KEY` |
 | `chrome_cdp` | 正常启动本机 Google Chrome，并通过 CDP 接管；本地推荐 | 系统 Google Chrome |
 
 浏览器驱动通过 `registration/drivers/registry.py` 注册，业务用例不直接依赖某个浏览器实现。这样可以为不同环境切换驱动，也可以在不改动 WebUI 和任务服务的情况下添加新驱动。
+
+纯协议驱动仅使用附件兼容流程：验证码等待前生成 `authorize_continue` Sentinel，并在 OTP 校验后直接进入 `oauth_create_account` / `create_account`。旧的协议注册实现已移除。
+
+账号继续使用当前项目的 SQLite 保存、邮箱状态回收和批次归档；注册流程不自动执行 Codex 授权。启用 `ENABLE_2FA` 时，纯协议驱动仍会在领取邮箱前被拒绝。
 
 未开启 2FA 的 Roxy 注册保留邮箱 OTP 优先的流程；只有未提供 OTP 入口且必须创建密码时，才会使用设置中的备用密码，或为当前账号生成独立随机密码。普通 OTP 注册记录为 `email_otp`，`protocol` 驱动始终是 OTP-only。
 
@@ -67,7 +69,7 @@ WebUI「设置 → 邮箱设置」中的 `EMAIL_SOURCE` 支持多个来源组合
 ### 2.3 Codex OAuth 与接码
 
 - GPT 注册与 Codex OAuth 完全分离：注册完成后账号状态为“未授权”，只有在 GPT账号 页面显式点击授权才会启动 Codex OAuth。
-- 授权驱动支持 `protocol`、`roxy`、`cloak`、`chrome_cdp`、`browser_use`、`skyvern` 和 `same_as_registration`。
+- 授权驱动支持 `protocol`、`roxy`、`cloak`、`chrome_cdp` 和 `same_as_registration`。
 - 支持 CPA 管理接口或本地 PKCE 授权地址。
 - 手机验证支持 GrizzlySMS、本地 L 服务和 H 服务。GPT账号授权任务只有在实际进入手机验证页面时才从手机号池取号；未触发短信验证不会占用号码或可用次数。
 - Codex 凭证、授权回执和重试日志写入 SQLite 的 `codex_credentials`、`codex_retry_logs` 等文件类别。
@@ -171,7 +173,7 @@ Markdown 链接（`[说明](https://...)`）和聊天复制产生的反斜杠转
 
 ### 3.3 选择注册驱动
 
-进入 WebUI「设置 → 浏览器与网络 → 代理浏览器 → 总览与驱动」，选择 `chrome_cdp`、`protocol`、`roxy`、`cloak`、`browser_use` 或 `skyvern`。各浏览器的 API 地址、工作区、无头、代理、GeoIP、语言、时区和超时设置在“代理浏览器”顶部的对应模块中配置；云浏览器的 API Key 也在各自模块填写。Roxy 的团队/项目可以使用配置页中的“获取团队”工具读取并保存。
+点击 WebUI 左侧栏底部「浏览器」，直接选择 `chrome_cdp`、`protocol`、`roxy` 或 `cloak`，选择后自动保存。点击“浏览器参数设置”进入对应配置模块。各浏览器的 API 地址、工作区、无头、代理、GeoIP、语言、时区和超时设置在“代理浏览器”对应模块中配置；套餐查询网络参数仍在“设置 → 代理IP设置”中配置。Roxy 的团队/项目可以使用配置页中的“获取团队”工具读取并保存。
 
 `config/*.py` 中仍保留安全默认值，供 CLI 和开发环境使用，但不建议为了日常运行直接编辑源码。修改配置页后，新的任务会读取热加载后的值；已经运行中的浏览器任务不会被强行改写。
 
@@ -183,7 +185,7 @@ Roxy 固定 Profile 会在关闭状态下同步本次任务的网络设置（含
 
 成功授权后会私下保存已核验的网络线路（包含明确直连），后续凭证刷新与 GPT 验活沿用该线路，不依赖临时 Profile 继续存在，也不重新随机抽取代理。该内部字段不会在账号列表接口中返回；更改账号显式代理时会清除旧线路记录。旧账号若只有 Profile 信息而无法读回网络配置，会明确报错，不猜测为直连。
 
-在 WebUI「设置 → 代理池」中逐行填写代理 URL，并设置套餐查询的独立网络模式、超时和重试策略。代理包含用户名或密码时也建议只通过配置页保存，系统会将其写入 `.env`。
+在 WebUI 左侧工作区「代理IP」中逐行填写代理 URL，并设置套餐查询的独立网络模式、超时和重试策略。代理包含用户名或密码时也建议只通过配置页保存，系统会将其写入 `.env`。
 
 在「设置 → Codex」中选择授权地址来源、OAuth 驱动以及 CPA/sub2API 参数。接码配置位于「设置 → 手机接码」区域，进入后通过顶部横向选项切换“总览与开关 / GrizzlySMS / L 接码服务 / H 接码服务”。开启“加入手机号池”后，当前选中的平台会在“手机号池”顶部显示为特殊的动态来源，GPT账号授权遇到手机验证时会自动向该平台取号；关闭后只使用手工导入的手机号。旧的全局固定号码配置不会参与 WebUI 授权。接口语义可参考 [L_API.md](L_API.md)。
 
@@ -239,13 +241,13 @@ GPT账号表中的注册和授权按钮作用于同一行。注册按钮会把�
 注册任务要完成 ChatGPT/OpenAI 注册，至少需要以下资源：
 
 - **邮箱身份**：邮箱地址，以及可读取验证码的 HTTP 接码 API；或者 Outlook 的邮箱密码、Client ID 和 Refresh Token。只有邮箱地址而没有收码能力时，自动注册无法取得邮箱验证码。
-- **注册资料**：设置中的注册驱动（`chrome_cdp`、`protocol`、`roxy`、`cloak`、`browser_use` 或 `skyvern`）、代理/浏览器参数，以及注册流程需要的显示名和生日生成配置。
+- **注册资料**：设置中的注册驱动（`chrome_cdp`、`protocol`、`roxy` 或 `cloak`）、代理/浏览器参数，以及注册流程需要的显示名和生日生成配置。
 - **可选 2FA**：启用自动 2FA 时需要允许账号完成二次验证；已有账号导入可直接提供 Base32/TOTP 密钥。
 
 Codex 授权要完成 OAuth 登录和回调，至少需要：
 
 - GPT账号表中的 ChatGPT 密码；如果账号启用了 2FA，还需要 TOTP 密钥；
-- “设置”中的 Codex OAuth/CPA/sub2API、浏览器驱动和代理配置；
+- “设置”中的 Codex OAuth/CPA/sub2API 和浏览器参数；代理池配置位于左侧“代理IP”工作区；
 - “手机号池”中的号码与取码地址。授权启动不会预先检查或占用手机号；只有流程实际触发短信验证时，系统才从手机号池分配号码并在验证成功后扣减可用次数。
 
 手机号池支持批量 `+1` / `-1`，也可以直接在表格的“可用次数”列选择精确次数（沿用 `0–3` 次范围，选择后自动保存），或勾选多个号码后“批量设置”。手机号表格不再提供“操作”列；点击“期限”列中的“不过期”或截止时间即可单独维护过期时间。期限默认**不过期**，可以选择“按天设置”，从保存时起计算 `N × 24` 小时，也可重新设为“不过期”。只修改次数时保留原过期时间，只修改期限时保留原可用次数；重复导入号码也不会清除已有期限。表格显示截止时间和向上取整的剩余天数，支持“已过期”筛选。
@@ -378,7 +380,7 @@ with connect() as conn:
 ├── core/                           # 邮箱、OAuth、浏览器客户端、SQLite 数据访问
 ├── registration/
 │   ├── application/                # 注册用例、任务服务、领域模型
-│   ├── drivers/                    # protocol/Roxy/Cloak/Browser Use/Skyvern 适配器
+│   ├── drivers/                    # protocol/Roxy/Cloak/Chrome CDP 适配器
 │   └── ports/                      # 与具体驱动无关的端口
 ├── web/                            # React/Vite 前端、源码和 dist 构建产物
 ├── sentinel/                       # Sentinel JavaScript 运行组件

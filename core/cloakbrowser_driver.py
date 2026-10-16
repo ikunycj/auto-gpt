@@ -298,14 +298,53 @@ class CloakSeleniumDriver:
                 cleaned.append(item)
         return first_el, cleaned
 
-    @staticmethod
-    def _unwrap_js_result(page, handle: Any) -> Any:
+    @classmethod
+    def _unwrap_js_result(cls, page, handle: Any) -> Any:
+        """Convert nested DOM elements in a Selenium-style script result.
+
+        Playwright serializes a DOM element nested inside an object as ``{}``.
+        The registration flow returns structures such as ``{input, button}``,
+        so flattening that result makes the next operation call DOM methods on
+        a plain dict. Preserve nested ElementHandles recursively instead.
+        """
         try:
             element = handle.as_element()
         except Exception:
             element = None
         if element is not None:
             return CloakElement(page, handle=element)
+
+        properties = None
+        try:
+            properties = handle.get_properties()
+        except Exception:
+            properties = None
+        if properties:
+            try:
+                numeric_keys = [key for key in properties if str(key).isdigit()]
+                is_array = len(numeric_keys) == len(properties)
+                if is_array:
+                    result = [None] * (max((int(key) for key in numeric_keys), default=-1) + 1)
+                else:
+                    result = {}
+                for key, child in properties.items():
+                    value = cls._unwrap_js_result(page, child)
+                    if is_array:
+                        result[int(key)] = value
+                    else:
+                        result[key] = value
+                    if not isinstance(value, CloakElement):
+                        try:
+                            child.dispose()
+                        except Exception:
+                            pass
+                return result
+            finally:
+                try:
+                    handle.dispose()
+                except Exception:
+                    pass
+
         try:
             return handle.json_value()
         except Exception as exc:
@@ -495,10 +534,11 @@ def build_cloak_driver(
         opts["license_key"] = license_key
 
     user_data_dir = str(getattr(_cfg, "CLOAK_USER_DATA_DIR", "") or "").strip()
+    from core.account_proxy import proxy_display
     logger.info(
         "[Cloak] 启动 CloakBrowser：headless=%s humanize=%s geoip=%s proxy=%s locale=%s timezone=%s accept_language=%s persistent=%s",
         opts.get("headless"), opts.get("humanize"), opts.get("geoip"),
-        proxy_url or "无", opts.get("locale") or "自动/默认", opts.get("timezone") or "自动/默认",
+        proxy_display(proxy_url), opts.get("locale") or "自动/默认", opts.get("timezone") or "自动/默认",
         locale_opts.get("accept_language") or "自动/默认", bool(user_data_dir),
     )
     context_kwargs = {}

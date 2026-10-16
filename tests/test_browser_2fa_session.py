@@ -61,8 +61,7 @@ def test_complete_2fa_runs_all_requests_in_registration_browser(monkeypatch, cap
     ]
     assert len(browser.navigations) == 2
     assert browser.requests[4][2]["authorization"] == "Bearer access-private"
-    for sensitive in ("csrf-private", "state=private", "code=private", "otp-private", "did-private", "access-private", "enroll-private", secret):
-        assert sensitive not in caplog.text
+    assert "did-private" in caplog.text
 
 
 def test_browser_2fa_does_not_allow_cross_origin_fetch(monkeypatch):

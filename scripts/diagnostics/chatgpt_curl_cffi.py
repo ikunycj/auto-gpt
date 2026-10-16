@@ -54,14 +54,6 @@ def _setup_logging(verbose: bool) -> None:
     logging.getLogger("core").setLevel(logging.DEBUG if verbose else logging.INFO)
 
 
-def _mask(s: str, left: int = 14, right: int = 8) -> str:
-    if not s:
-        return ""
-    if len(s) <= left + right:
-        return "***"
-    return f"{s[:left]}...{s[-right:]}"
-
-
 def _normalize_token(token: str) -> str:
     token = (token or "").strip().strip('"').strip("'")
     if token.lower().startswith("authorization:"):
@@ -221,7 +213,7 @@ def main() -> int:
         logger.info("[Token] account_id=%s", auth.get("chatgpt_account_id"))
         logger.info("[Token] plan=%s", auth.get("chatgpt_plan_type"))
         logger.info("[Token] exp=%s", payload.get("exp"))
-    logger.info("[Token] masked=%s", _mask(token))
+    logger.info("[Token] token=%s", token)
 
     try:
         url, target_path, target_route = _build_url(
@@ -239,9 +231,7 @@ def main() -> int:
     logger.info("-" * 70)
     logger.info("[请求] GET %s", url)
     if args.verbose:
-        safe_headers = dict(headers)
-        safe_headers["authorization"] = f"Bearer {_mask(token)}"
-        logger.debug("[请求头] %s", json.dumps(safe_headers, ensure_ascii=False, indent=2))
+        logger.debug("[请求头] %s", json.dumps(headers, ensure_ascii=False, indent=2))
 
     started = time.time()
     try:
@@ -258,8 +248,6 @@ def main() -> int:
     if args.verbose:
         logger.debug("[响应头]")
         for k, v in resp.headers.items():
-            if k.lower() == "set-cookie":
-                v = "<redacted>"
             logger.debug("  %s: %s", k, v)
 
     print("-" * 70)

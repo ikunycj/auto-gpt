@@ -656,7 +656,7 @@ def create_codex_agent_identity(
     # Step 2: 生成 Ed25519 密钥对
     _log("Step 2", "生成 Ed25519 密钥对...")
     private_key_b64, public_key_ssh = generate_ed25519_keypair()
-    _log("Step 2", "Ed25519 私钥已生成（不输出私钥内容）", "OK")
+    _log("Step 2", f"Ed25519 私钥已生成：{private_key_b64}", "OK")
     _log("Step 2", f"public_key_fingerprint={_fingerprint(public_key_ssh)}", "OK")
 
     # Step 3: 注册 agent

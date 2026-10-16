@@ -181,10 +181,32 @@ def test_wait_for_cdp_reports_early_process_exit():
         chrome_cdp._wait_for_cdp(9333, process, timeout=1)
 
 
-def test_proxy_endpoint_mask_drops_credentials():
-    assert chrome_cdp._mask_proxy_endpoint(
+def test_proxy_endpoint_keeps_credentials_for_local_audit():
+    assert chrome_cdp._proxy_endpoint(
         "http://user:password@proxy.example:8080"
-    ) == "http://proxy.example:8080"
+    ) == "http://user:password@proxy.example:8080"
+
+
+def test_proxy_preflight_reports_chatgpt_and_auth_routes(monkeypatch):
+    class Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    calls = []
+
+    def get(url, **_kwargs):
+        calls.append(url)
+        return Response(200 if "auth.openai.com" in url else 503)
+
+    from curl_cffi import requests as curl_requests
+    monkeypatch.setattr(curl_requests, "get", get)
+
+    ok, detail = chrome_cdp._probe_chatgpt_route("http://proxy.example:8080")
+
+    assert ok is False
+    assert calls == [chrome_cdp._CHATGPT_LOGIN_URL, chrome_cdp._AUTH_OPENAI_PROBE_URL]
+    assert "chatgpt.com=HTTP 503 upstream error" in detail
+    assert "auth.openai.com=HTTP 200" in detail
 
 
 def test_configured_invalid_proxy_pool_never_falls_back_to_direct(monkeypatch):
@@ -200,7 +222,7 @@ def test_configured_invalid_proxy_pool_never_falls_back_to_direct(monkeypatch):
     with pytest.raises(RuntimeError, match="代理池没有有效代理端点") as exc_info:
         chrome_cdp._select_proxy(None)
 
-    assert "secret" not in str(exc_info.value)
+    assert "secret" in str(exc_info.value)
 
 
 def test_empty_proxy_pool_allows_direct_access(monkeypatch):

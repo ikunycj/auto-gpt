@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
+import platform
+import subprocess
+import tempfile
+import threading
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -29,6 +35,8 @@ class MailNestAccount:
 
 
 _CONTEXT_CACHE: dict[str, MailNestAccount] = {}
+_CA_BUNDLE_LOCK = threading.Lock()
+_CA_BUNDLE_PATH: str | None = None
 
 
 def _cache_key(email: str) -> str:
@@ -49,15 +57,68 @@ def _project_code() -> str:
     return project_code
 
 
+def _request_verify() -> bool | str:
+    """Use the host trust store on macOS while keeping TLS verification on."""
+    configured = str(os.getenv("MAIL_NEST_CA_BUNDLE") or os.getenv("REQUESTS_CA_BUNDLE") or "").strip()
+    if configured:
+        return configured
+    if platform.system().lower() != "darwin":
+        return True
+
+    global _CA_BUNDLE_PATH
+    with _CA_BUNDLE_LOCK:
+        if _CA_BUNDLE_PATH and os.path.isfile(_CA_BUNDLE_PATH):
+            return _CA_BUNDLE_PATH
+        try:
+            import requests.certs
+
+            system = subprocess.run(
+                ["security", "find-certificate", "-a", "-p", "/Library/Keychains/System.keychain"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout
+            login_keychain = os.path.expanduser("~/Library/Keychains/login.keychain-db")
+            if os.path.isfile(login_keychain):
+                system += subprocess.run(
+                    ["security", "find-certificate", "-a", "-p", login_keychain],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                ).stdout
+            if not system.strip():
+                return True
+            fd, path = tempfile.mkstemp(prefix="turb-mailnest-ca-", suffix=".pem")
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(Path(requests.certs.where()).read_text(encoding="utf-8"))
+                handle.write("\n")
+                handle.write(system)
+            os.chmod(path, 0o600)
+            _CA_BUNDLE_PATH = path
+            return path
+        except (OSError, subprocess.SubprocessError, ImportError, ValueError):
+            logger.warning("无法读取 macOS 系统证书链，使用 requests 默认 CA bundle", exc_info=True)
+            return True
+
+
 def _request(method: str, path: str, *, params: dict | None = None, json: dict | None = None):
     try:
+        request_kwargs = {
+            "params": params,
+            "json": json,
+            "headers": {"Authorization": f"Bearer {_api_key()}", "Accept": "application/json"},
+            "timeout": REQUEST_TIMEOUT,
+            "verify": _request_verify(),
+        }
+        mailnest_proxy = str(os.getenv("MAIL_NEST_PROXY") or "").strip()
+        if mailnest_proxy:
+            request_kwargs["proxies"] = {"http": mailnest_proxy, "https": mailnest_proxy}
         resp = requests.request(
             method,
             BASE_URL + path,
-            params=params,
-            json=json,
-            headers={"Authorization": f"Bearer {_api_key()}", "Accept": "application/json"},
-            timeout=REQUEST_TIMEOUT,
+            **request_kwargs,
         )
     except requests.RequestException as exc:
         raise MailNestClientError(f"MailNest 请求失败 ({path}): {type(exc).__name__}: {exc}") from exc

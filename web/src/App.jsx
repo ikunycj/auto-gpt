@@ -1,20 +1,23 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Activity, Inbox, Menu, Settings2, Smartphone,
+  Activity, Inbox, Menu, Network, Settings2, Smartphone,
   Users, X,
 } from 'lucide-react';
 import { get, post } from './api';
-import { Toast, IconButton } from './components/ui';
+import { ActionButton, useConfirm, Toast, IconButton } from './components/ui';
 import { usePolling } from './hooks';
 import EmailPage from './pages/EmailPage';
 import GptAccountsPage from './pages/GptAccountsPage';
 import RelayPage from './pages/RelayPage';
 import ConfigPage from './pages/ConfigPage';
+import ProxyPage from './pages/ProxyPage';
+import WorkspaceBrowser from './components/WorkspaceBrowser';
 
 const NAV = [
   { id: 'email', label: '邮箱账号', caption: '待注册邮箱', icon: Inbox },
   { id: 'gpt', label: 'GPT账号', caption: '已注册与授权', icon: Users },
   { id: 'phones', label: '手机号', caption: '接码号码', icon: Smartphone },
+  { id: 'proxy', label: '代理IP', caption: '代理池与出口测试', icon: Network },
   { id: 'settings', label: '设置', caption: '运行参数', icon: Settings2 },
 ];
 
@@ -37,15 +40,15 @@ function useToast() {
   return [toast, notify, () => setToast(null)];
 }
 
-function Sidebar({ active, onChange, open, onClose, backendOnline }) {
+function Sidebar({ active, onChange, open, onClose, browserProps }) {
   return <aside className={`sidebar ${open ? 'is-open' : ''}`}>
     <div className="brand-lockup"><div className="brand-mark"><ChatGPTMark /></div><div><strong>ChatGPT 注册机</strong><span>registration console</span></div><IconButton label="关闭导航" icon={X} className="sidebar-close" onClick={onClose} /></div>
     <div className="sidebar-rule" />
     <nav className="nav-list" aria-label="工作区导航">
       <div className="nav-label">工作区</div>
-      {NAV.map(({ id, label, caption, icon: Icon }) => <button key={id} className={`nav-item ${active === id ? 'is-active' : ''}`} onClick={() => { onChange(id); onClose?.(); }}><span className="nav-icon"><Icon size={17} /></span><span><strong>{label}</strong><small>{caption}</small></span>{active === id ? <span className="nav-current" /> : null}</button>)}
+      {NAV.map(({ id, label, caption, icon: Icon }) => <ActionButton key={id} className={`nav-item ${active === id ? 'is-active' : ''}`} onClick={() => { onChange(id); onClose?.(); }}><span className="nav-icon"><Icon size={17} /></span><span><strong>{label}</strong><small>{caption}</small></span>{active === id ? <span className="nav-current" /> : null}</ActionButton>)}
     </nav>
-    <div className="sidebar-footer"><div className={`local-status ${backendOnline ? 'is-online' : 'is-offline'}`} aria-live="polite"><span className={`status-dot ${backendOnline ? 'is-online' : 'is-offline'}`} /> <span>{backendOnline ? '本地服务在线' : '本地服务离线'}</span></div><span className="build-tag">React workspace</span></div>
+    <div className="sidebar-footer"><WorkspaceBrowser {...browserProps} /></div>
   </aside>;
 }
 
@@ -58,18 +61,56 @@ function LoadingView() {
 }
 
 export default function App() {
+  const confirm = useConfirm();
   const [active, setActive] = useState(() => {
     const stored = localStorage.getItem('gpt_console_active_tab');
     return normalizeActiveTab(stored);
   });
   const [settingsGroup, setSettingsGroup] = useState('');
   const [settingsDirty, setSettingsDirty] = useState(false);
+  const [registrationDriver, setRegistrationDriver] = useState('');
+  const [driverLoading, setDriverLoading] = useState(true);
+  const [driverSaving, setDriverSaving] = useState(false);
+  const [driverError, setDriverError] = useState('');
+  const [configRevision, setConfigRevision] = useState(0);
   const [registrationRequested, setRegistrationRequested] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
   const [summary, setSummary] = useState(null);
   const [ready, setReady] = useState(false);
   const [backendOnline, setBackendOnline] = useState(false);
   const [toast, notify, clearToast] = useToast();
+  const loadDriver = useCallback(async () => {
+    setDriverLoading(true);
+    try {
+      const response = await get('/api/config');
+      const fields = Array.isArray(response) ? response : response.fields || response.items || [];
+      const driver = fields.find((field) => field.key === 'REGISTRATION_DRIVER')?.value;
+      if (!driver) throw new Error('未读取到注册驱动，请重新读取配置。');
+      setRegistrationDriver(driver);
+      setDriverError('');
+    } catch (error) {
+      setDriverError(error.message);
+    } finally {
+      setDriverLoading(false);
+    }
+  }, []);
+  useEffect(() => { loadDriver(); }, [loadDriver]);
+  const changeDriver = useCallback(async (value) => {
+    if (driverSaving || settingsDirty || value === registrationDriver) return;
+    setDriverSaving(true);
+    setDriverError('');
+    try {
+      const response = await post('/api/config', { updates: { REGISTRATION_DRIVER: value } });
+      setRegistrationDriver(value);
+      setConfigRevision((revision) => revision + 1);
+      notify(response.note || '注册驱动已保存', response.reloaded === false ? 'warning' : 'success');
+    } catch (error) {
+      setDriverError(error.message);
+      notify(error.message, 'error');
+    } finally {
+      setDriverSaving(false);
+    }
+  }, [driverSaving, settingsDirty, registrationDriver, notify]);
   const loadSummary = useCallback(async () => {
     try {
       const value = await get('/api/summary');
@@ -93,26 +134,26 @@ export default function App() {
   }, [loadSummary]);
   const { refresh: refreshSummary, running: refreshing } = usePolling(pollSummary, 5000, true);
 
-  const confirmSettingsExit = useCallback(() => {
+  const confirmSettingsExit = useCallback(async () => {
     if (!settingsDirty) return true;
-    return window.confirm('设置有未保存修改，确定离开吗？');
-  }, [settingsDirty]);
-  const changePage = useCallback((pageId) => {
+    return confirm('设置有未保存修改，确定离开吗？');
+  }, [settingsDirty, confirm]);
+  const changePage = useCallback(async (pageId) => {
     if (pageId === active) return;
-    if (active === 'settings' && pageId !== 'settings' && !confirmSettingsExit()) return;
+    if (active === 'settings' && pageId !== 'settings' && !await confirmSettingsExit()) return;
     setSettingsGroup('');
     if (active === 'settings') setSettingsDirty(false);
     setActive(pageId);
   }, [active, confirmSettingsExit]);
-  const openSettings = useCallback((group = '') => {
+  const openSettings = useCallback(async (group = '') => {
     const nextGroup = group || '';
-    if (active === 'settings' && nextGroup !== settingsGroup && settingsDirty && !confirmSettingsExit()) return;
+    if (active === 'settings' && nextGroup !== settingsGroup && settingsDirty && !await confirmSettingsExit()) return;
     if (active === 'settings' && nextGroup === settingsGroup) return;
     setSettingsGroup(nextGroup);
     setActive('settings');
   }, [active, confirmSettingsExit, settingsDirty, settingsGroup]);
-  const openGptRegistration = useCallback(() => {
-    if (active === 'settings' && !confirmSettingsExit()) return;
+  const openGptRegistration = useCallback(async () => {
+    if (active === 'settings' && !await confirmSettingsExit()) return;
     setSettingsGroup('');
     if (active === 'settings') setSettingsDirty(false);
     setRegistrationRequested(true);
@@ -132,10 +173,11 @@ export default function App() {
     const common = { notify, summary, onSummaryRefresh: refreshSummary };
     if (active === 'email') return <EmailPage {...common} onOpenSettings={openSettings} onOpenGptRegistration={openGptRegistration} />;
     if (active === 'phones') return <RelayPage {...common} mode="phones" />;
-    if (active === 'settings') return <ConfigPage {...common} initialGroup={settingsGroup} onOpenEmail={() => changePage('email')} onOpenGptRegistration={openGptRegistration} onDirtyChange={setSettingsDirty} />;
-    return <GptAccountsPage {...common} onOpenSettings={openSettings} onOpenEmail={() => changePage('email')} registrationRequested={registrationRequested} onRegistrationRequestHandled={clearRegistrationRequest} />;
-  }, [active, changePage, clearRegistrationRequest, notify, openGptRegistration, openSettings, refreshSummary, registrationRequested, settingsGroup, summary]);
+    if (active === 'proxy') return <ProxyPage {...common} />;
+    if (active === 'settings') return <ConfigPage {...common} initialGroup={settingsGroup} onOpenEmail={() => changePage('email')} onOpenGptRegistration={openGptRegistration} onDirtyChange={setSettingsDirty} onConfigSaved={loadDriver} configRevision={configRevision} />;
+    return <GptAccountsPage {...common} onOpenSettings={openSettings} onOpenProxy={() => changePage('proxy')} onOpenEmail={() => changePage('email')} registrationRequested={registrationRequested} onRegistrationRequestHandled={clearRegistrationRequest} />;
+  }, [active, changePage, clearRegistrationRequest, notify, openGptRegistration, openSettings, refreshSummary, registrationRequested, settingsGroup, summary, loadDriver, configRevision]);
 
   if (!ready) return <LoadingView />;
-  return <div className="app-shell"><Sidebar active={active} onChange={changePage} open={navOpen} onClose={() => setNavOpen(false)} backendOnline={backendOnline} /><div className="app-main"><Topbar active={active} onMenu={() => setNavOpen(true)} summary={summary} backendOnline={backendOnline} onRefresh={handleRefresh} refreshing={refreshing} /><main className="page-content">{page}</main></div><div className={`sidebar-scrim ${navOpen ? 'is-visible' : ''}`} onClick={() => setNavOpen(false)} /><Toast toast={toast} onClose={clearToast} /></div>;
+  return <div className="app-shell"><Sidebar active={active} onChange={changePage} open={navOpen} onClose={() => setNavOpen(false)} browserProps={{ value: registrationDriver, loading: driverLoading, saving: driverSaving, error: driverError, settingsDirty, onChange: changeDriver, onOpenSettings: () => { openSettings('browser:roxy'); setNavOpen(false); } }} /><div className="app-main"><Topbar active={active} onMenu={() => setNavOpen(true)} summary={summary} backendOnline={backendOnline} onRefresh={handleRefresh} refreshing={refreshing} /><main className="page-content">{page}</main></div><div className={`sidebar-scrim ${navOpen ? 'is-visible' : ''}`} onClick={() => setNavOpen(false)} /><Toast toast={toast} onClose={clearToast} /></div>;
 }

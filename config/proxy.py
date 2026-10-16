@@ -20,7 +20,7 @@ def normalize_proxy_url(value: str) -> str:
     PROXY_POOL entries must have a host and port and cannot have a path or
     query. Providers often issue HTTPS subscription URLs with a token query;
     accepting one as an HTTPS proxy makes CONNECT fail with a misleading 400.
-    Error messages intentionally never include user-supplied material.
+    Error messages include the original value for local diagnosis.
     """
     text = str(value or "").strip()
     if not text:
@@ -44,21 +44,21 @@ def normalize_proxy_url(value: str) -> str:
         elif len(parts) == 2 and parts[0] and parts[1].isdigit():
             text = f"http://{text}"
         else:
-            raise ValueError("代理地址无效：请输入带端口的代理服务器地址")
+            raise ValueError(f"代理地址无效：请输入带端口的代理服务器地址；原值={text}")
 
     parsed = urlparse(text)
     if parsed.scheme not in {"http", "https", "socks4", "socks4a", "socks5", "socks5h"}:
-        raise ValueError("代理协议无效：仅支持 HTTP(S) 或 SOCKS 代理")
+        raise ValueError(f"代理协议无效：仅支持 HTTP(S) 或 SOCKS 代理；原值={text}")
     if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
-        raise ValueError("代理池需要代理服务器 host:port，不能填写订阅下载链接")
+        raise ValueError(f"代理池需要代理服务器 host:port，不能填写订阅下载链接；原值={text}")
     if not parsed.hostname:
-        raise ValueError("代理地址无效：缺少服务器主机名")
+        raise ValueError(f"代理地址无效：缺少服务器主机名；原值={text}")
     try:
         port = parsed.port
     except ValueError as exc:
-        raise ValueError("代理端口无效") from exc
+        raise ValueError(f"代理端口无效；原值={text}") from exc
     if port is None:
-        raise ValueError("代理地址无效：缺少代理端口；订阅链接不能作为代理服务器")
+        raise ValueError(f"代理地址无效：缺少代理端口；订阅链接不能作为代理服务器；原值={text}")
     auth = ""
     if parsed.username is not None:
         auth = quote(unquote(parsed.username), safe="")
@@ -72,19 +72,21 @@ def normalize_proxy_url(value: str) -> str:
 # 有配置优先走代理；没有配置时使用本机网络，不假定本机存在代理服务。
 # 推荐使用 socks5h://（DNS 在代理端解析），避免本地 DNS 与出口 IP 地区错配。
 PROXY_POOL = []
+# WebUI 保留的禁用代理记录；运行时不会从这里抽取代理。
+PROXY_POOL_DISABLED = []
 
-# 套餐/Plus 试用资格查询与 Codex Agent Token 生成共用这组独立网络策略，
+# 套餐/Plus 试用资格查询与 Token 生成共用这组独立网络策略，
 # 避免批量请求被注册代理池中的临时本地代理拖垮，也避免无条件直连造成出口策略失控。
 #   auto   = 优先使用 PLAN_CHECK_PROXY 或代理池；本地代理端口未监听时回退直连
 #   proxy  = 强制使用 PLAN_CHECK_PROXY 或代理池，失败直接报错
 #   direct = 始终直连
 PLAN_CHECK_PROXY_MODE = "auto"
 
-# 套餐查询 / Codex Agent Token 生成专用代理。留空时 auto/proxy 模式从 PROXY_POOL 选择。
+# 套餐查询 / Token 生成专用代理。留空时 auto/proxy 模式从 PROXY_POOL 选择。
 # 代理可能包含账号密码，因此 WebUI 会把它保存到 .env。
 PLAN_CHECK_PROXY = ""
 
-# 查套餐 / 生成 Codex Agent Token 使用独立的短超时和有限重试，避免后台任务长时间卡住。
+# 查套餐 / 生成 Token 使用独立的短超时和有限重试，避免后台任务长时间卡住。
 PLAN_CHECK_TIMEOUT = 15.0
 PLAN_CHECK_MAX_ATTEMPTS = 2
 PLAN_CHECK_RETRY_DELAY = 1.5
@@ -93,7 +95,7 @@ PLAN_CHECK_RETRY_DELAY = 1.5
 # Plus 试用资格时，等待该秒数后再复查一次；设为 0 可关闭复查。
 PLAN_CHECK_REGISTRATION_RECHECK_DELAY = 2.0
 
-# 自动、手动和批量套餐查询共用同一个后台队列；Codex Agent Token 使用独立队列，
+# 自动、手动和批量套餐查询共用同一个后台队列；Token 生成使用独立队列，
 # 但复用这里的网络模式、请求启动间隔与随机抖动，避免批量后台请求过于集中。
 PLAN_CHECK_WORKERS = 3
 PLAN_CHECK_QUEUE_LIMIT = 500
@@ -131,6 +133,7 @@ PROXY = _legacy_proxy()
 # ---- .env overrides for WebUI editable fields ----
 apply_env_overrides(globals(), {
     'PROXY_POOL': 'list_str_multiline',
+    'PROXY_POOL_DISABLED': 'list_str_multiline',
     'PLAN_CHECK_PROXY_MODE': 'str',
     'PLAN_CHECK_PROXY': 'str',
     'PLAN_CHECK_TIMEOUT': 'float',

@@ -58,13 +58,6 @@ _PHONE_SETTING_UNSET = object()
 _LOCK = threading.RLock()
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _CODE_RE = re.compile(r"^\d{4,8}$")
-_SENSITIVE_RE = re.compile(
-    r"(?i)(refresh_token|access_token|id_token|password|code|otp|token)=([^\s&]+)"
-)
-_OTP_CONTEXT_RE = re.compile(
-    r"(?i)((?:(?:邮箱|手机|短信|手动)\s*)?(?:一次性)?(?:验证码|OTP)"
-    r"\s*(?:已?收到|已?提交|为)?\s*[:：=]\s*)(?<!\d)\d{4,8}(?!\d)"
-)
 _IMPORT_FORMATS = {
     "auto",
     "generic_api",
@@ -127,10 +120,6 @@ def _browser_assist_grace_seconds() -> float:
         return max(0.1, min(300.0, float(raw)))
     except ValueError:
         return 300.0
-
-
-def _show_full_urls() -> bool:
-    return str(os.environ.get("CODEX_RELAY_SHOW_FULL_URLS", "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class RelayStopped(RuntimeError):
@@ -214,18 +203,16 @@ def _valid_url(value: str) -> bool:
 
 
 def _normalize_proxy_value(value: object) -> str:
-    """Normalize one account proxy without echoing credentials or URLs."""
+    """Normalize one account proxy for local auditing and storage."""
     text = str(value or "").strip()
     if not text:
         return ""
     try:
         return normalize_proxy_url(text)
     except Exception as exc:
-        # ``normalize_proxy_url`` deliberately uses generic messages. Keep this
-        # boundary generic too in case a future parser raises a raw exception.
         if isinstance(exc, ValueError):
-            raise ValueError(f"代理地址无效：{str(exc).split('：', 1)[-1]}") from exc
-        raise ValueError("代理地址无效") from exc
+            raise ValueError(str(exc)) from exc
+        raise
 
 
 def _proxy_alias(data: dict) -> tuple[str, str]:
@@ -896,13 +883,16 @@ def _public_account(row: dict) -> dict:
         codex_status = "failed" if row.get("last_status") == "failed" else "not_authorized"
     chatgpt_password = str(row.get("chatgpt_password") or "")
     mailbox_password = str(row.get("mailbox_password") or "")
-    return {
+    result = dict(row)
+    result.update({
         "id": row.get("id"),
         "email": row.get("email"),
         "has_password": bool(chatgpt_password or mailbox_password),
         "password_kind": "ChatGPT" if chatgpt_password else "微软邮箱" if mailbox_password else "",
         "has_proxy": bool(row.get("proxy")),
         "proxy_source": (str(row.get("proxy_source") or "relay").strip() if row.get("proxy") else ""),
+        "proxy": row.get("proxy") or "",
+        "_codex_verified_proxy": row.get("_codex_verified_proxy") or "",
         "chatgpt_password": chatgpt_password,
         "mailbox_password": mailbox_password,
         "has_email_code_url": bool(row.get("email_code_url")),
@@ -985,7 +975,8 @@ def _public_account(row: dict) -> dict:
         "last_job_id": row.get("last_job_id"),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
-    }
+    })
+    return result
 
 
 def _url_host(value: str) -> str:
@@ -1051,13 +1042,6 @@ def list_accounts(
     elif twofa == "disabled":
         rows = [x for x in rows if not x.get("has_totp")]
     return sorted(rows, key=lambda x: str(x.get("updated_at") or ""), reverse=True)
-
-
-def _mask_phone(value: str) -> str:
-    raw = _normalize_phone(value)
-    prefix = "+" if raw.startswith("+") else ""
-    digits = raw.lstrip("+")
-    return prefix + ("*" * max(0, len(digits) - 4)) + digits[-4:]
 
 
 def _phone_public_status(*, invalid: bool, reserved: bool, assigned: bool, available_uses: int, expired: bool = False) -> str:
@@ -2024,8 +2008,6 @@ def _sub2_public_service(service: dict) -> dict:
 
 def _sub2_safe_detail(value: object, admin_key: str, *, limit: int = 500) -> str:
     detail = str(value or "未知错误")
-    if admin_key:
-        detail = detail.replace(admin_key, "[已隐藏]")
     return detail[:limit]
 
 
@@ -2434,7 +2416,7 @@ def _delete_terminal_accounts_from_sub2(accounts: list[dict], service: dict) -> 
             result["errors"].append({
                 "account_id": local_id,
                 "email": email,
-                "error": _redact(str(exc))[:500],
+                "error": _diagnostic_text(str(exc))[:500],
             })
     _record_sub2_terminal_deletions(service, updates)
     return result
@@ -2573,14 +2555,7 @@ def _sub2_oauth_credential_payload(
     email: str,
     existing_credentials: dict | None = None,
 ) -> dict:
-    """Merge fresh local OAuth fields into redacted sub2api credentials.
-
-    sub2api intentionally preserves omitted sensitive values but treats the
-    non-sensitive part of ``credentials`` as a replacement.  Starting with
-    the remote redacted object therefore keeps model mappings, header
-    overrides and capability flags while the fresh local token replaces only
-    the OAuth identity fields.
-    """
+    """Merge fresh local OAuth fields into the sub2api credential payload."""
     if not isinstance(credential, dict):
         raise ValueError("本地 Codex 凭证不是 JSON 对象")
     access_token = _credential_text(credential, "access_token", "accessToken")
@@ -2662,7 +2637,7 @@ def refresh_sub2_account(account_id: str, service_id: str = "") -> dict:
             str(account_id),
             sub2_credentials_update_status="failed",
             sub2_refresh_status="failed",
-            sub2_refresh_error=_redact(str(exc))[:1000],
+            sub2_refresh_error=_diagnostic_text(str(exc))[:1000],
         )
         raise
     encoded_id = quote(remote_id, safe="")
@@ -2677,7 +2652,7 @@ def refresh_sub2_account(account_id: str, service_id: str = "") -> dict:
         existing_credentials = remote.get("credentials") if isinstance(remote, dict) else None
         if not isinstance(existing_credentials, dict):
             # Older sub2 list responses may omit credentials even though the
-            # detail endpoint still returns the redacted non-sensitive map.
+            # The detail endpoint may contain credential fields omitted by the list endpoint.
             detail = _sub2_get_json(service, f"accounts/{encoded_id}")
             existing_credentials = detail.get("credentials") if isinstance(detail, dict) else None
         if not isinstance(existing_credentials, dict):
@@ -2694,7 +2669,7 @@ def refresh_sub2_account(account_id: str, service_id: str = "") -> dict:
             idempotency_key=f"relay-apply-oauth-{uuid.uuid4().hex}",
         )
     except Exception as exc:
-        detail = _redact(str(exc))[:1000]
+        detail = _diagnostic_text(str(exc))[:1000]
         _update_account(
             str(account_id),
             sub2_credentials_update_status="failed",
@@ -3028,8 +3003,6 @@ def _sub2_error_messages(payload: dict, admin_key: str) -> list[str]:
         else:
             value = item
         message = str(value or "导入失败")
-        if admin_key:
-            message = message.replace(admin_key, "[已隐藏]")
         messages.append(message[:500])
     return messages
 
@@ -3317,8 +3290,6 @@ def _public_job(row: dict) -> dict:
         result["message"] = str(result["message"]).replace("（未登录、未接码）", "")
     if result.get("error"):
         result["error"] = _normalize_exception_message(result["error"])
-    if not _show_full_urls() and result.get("browser_url"):
-        result["browser_url"] = _safe_diagnostic_url(result["browser_url"])
     return result
 
 
@@ -3349,28 +3320,8 @@ def _update_job(job_id: str, **changes) -> None:
         _write(_JOBS_PATH, rows)
 
 
-def _redact(message: str) -> str:
-    text = _SENSITIVE_RE.sub(lambda m: f"{m.group(1)}=[已隐藏]", str(message or ""))
-    text = _OTP_CONTEXT_RE.sub(lambda m: f"{m.group(1)}[已隐藏]", text)
-    def replace_url(match):
-        if _show_full_urls():
-            return match.group(0).rstrip(".,;:)]}")
-        raw = match.group(0).rstrip(".,;:)]}")
-        try:
-            parsed = urlparse(raw)
-            host = (parsed.hostname or "").lower()
-            safe_host = host in {"localhost", "127.0.0.1"} or host.endswith(".openai.com")
-            if not safe_host or not parsed.path:
-                return "[URL已隐藏]"
-            netloc = host
-            if parsed.port:
-                netloc = f"{netloc}:{parsed.port}"
-            safe = f"{parsed.scheme}://{netloc}{parsed.path}"
-            return safe + ("?[参数已隐藏]" if parsed.query or parsed.fragment else "")
-        except Exception:
-            return "[URL已隐藏]"
-    text = re.sub(r"https?://\S+", replace_url, text)
-    return text[:2000]
+def _diagnostic_text(message: str) -> str:
+    return str(message or "")
 
 
 def _normalize_exception_message(message: object) -> str:
@@ -3382,18 +3333,7 @@ def _normalize_exception_message(message: object) -> str:
 
 
 def _safe_diagnostic_url(value: str) -> str:
-    try:
-        parsed = urlparse(str(value or ""))
-        host = (parsed.hostname or "").lower()
-        if host not in {"localhost", "127.0.0.1"} and not host.endswith(".openai.com"):
-            return "[URL已隐藏]"
-        if not parsed.path:
-            return "[URL已隐藏]"
-        netloc = host + (f":{parsed.port}" if parsed.port else "")
-        safe = f"{parsed.scheme}://{netloc}{parsed.path}"
-        return safe + ("?[参数已隐藏]" if parsed.query or parsed.fragment else "")
-    except Exception:
-        return "[URL已隐藏]"
+    return str(value or "")
 
 
 def _log_path(job_id: str) -> Path:
@@ -3407,7 +3347,7 @@ def _append_log(job_id: str, message: str) -> None:
     with _LOCK:
         sqlite_store.append_file(
             path,
-            f"[{_now()}] {_redact(message)}\n",
+            f"[{_now()}] {_diagnostic_text(message)}\n",
             category="relay_logs",
             encoding="utf-8",
         )
@@ -4030,7 +3970,7 @@ def _run_job(
     except Exception as exc:
         detail = str(exc)
         prefix = f"{type(exc).__name__}: "
-        message = _redact(_normalize_exception_message(detail if detail.startswith(prefix) else f"{prefix}{detail}"))
+        message = _diagnostic_text(_normalize_exception_message(detail if detail.startswith(prefix) else f"{prefix}{detail}"))
         current = next((item for item in list_jobs() if item.get("id") == job_id), {})
         failure_stage = current.get("stage") if current.get("stage") not in (None, "", "authorize") else _oauth_failure_stage(message)
         _update_job(job_id, status="failed", stage=failure_stage, message="Codex 授权失败", error=message, completed_at=_now(), waiting_since="")
@@ -4257,7 +4197,7 @@ def _run_maintenance_job(job_id: str, account_id: str, action: str) -> None:
             else:
                 message = "sub2api OAuth 凭证已更新，但远端账号刷新失败，可重试"
             if errors:
-                message += "；" + "；".join(_redact(item)[:300] for item in errors[:3])
+                message += "；" + "；".join(_diagnostic_text(item)[:300] for item in errors[:3])
             _update_account(
                 account_id,
                 maintenance_status="success" if not errors else "partial",
@@ -4319,11 +4259,11 @@ def _run_maintenance_job(job_id: str, account_id: str, action: str) -> None:
         elif action == "check_quota":
             changes.update(quota_status="error", quota_checked_at=_now())
         _update_account(account_id, **changes)
-        message = _redact(f"{type(exc).__name__}: {exc}")
+        message = _diagnostic_text(f"{type(exc).__name__}: {exc}")
         _update_job(job_id, status="failed", stage="failed", message="账号维护失败", error=message, completed_at=_now(), waiting_since="")
         _append_log(job_id, message)
     except Exception as exc:
-        message = _redact(f"{type(exc).__name__}: {exc}")
+        message = _diagnostic_text(f"{type(exc).__name__}: {exc}")
         _update_job(job_id, status="failed", stage="failed", message="账号维护失败", error=message, completed_at=_now(), waiting_since="")
         _update_account(account_id, maintenance_status="failed", maintenance_action=action)
         _append_log(job_id, message)

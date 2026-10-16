@@ -14,7 +14,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from core import db, sqlite_store
 from registration.ports.stop_signal import (
@@ -100,9 +100,47 @@ def _random_display_name() -> str:
     return random_display_name()
 
 
+def _persist_claimed_registration_email(
+    email: str,
+    *,
+    job_id: int,
+    email_sources: str | list[str] | None,
+) -> dict[str, str | dict]:
+    """Persist mailbox ownership and provider context immediately after claim."""
+    from core.email_provider import resolve_email_source, snapshot_email_context
+
+    try:
+        source = resolve_email_source(email)
+    except Exception:
+        source = str(email_sources or "").split(",", 1)[0].strip().lower()
+    try:
+        provider_context = snapshot_email_context(email, source=source)
+    except Exception as exc:
+        provider_context = {}
+        logger.warning(
+            "[Job %s] 邮箱渠道上下文快照失败，仍保留邮箱记录：%s",
+            job_id,
+            type(exc).__name__,
+        )
+    try:
+        account_id = db.ensure_registration_account(
+            email,
+            source=source,
+            provider_context=provider_context,
+            job_id=job_id,
+        )
+    except Exception:
+        # Preserve the claimed address on the task even if the account
+        # collection cannot be committed, so the failure remains recoverable.
+        db.update_job(job_id, email=email)
+        raise
+    return {"email": email, "source": source, "account_id": account_id}
+
+
 def _prepare_registration_args(
     email_override: str | None = None,
     email_sources: str | list[str] | None = None,
+    on_email_acquired: Callable[[str], Any] | None = None,
 ) -> tuple[str, str, str]:
     """复用 CLI 的默认规则，为旧 Web 任务入口补齐注册参数。"""
     # 用模块属性读，支持 WebUI 热加载
@@ -136,10 +174,14 @@ def _prepare_registration_args(
         # stale manual address remains configured.
         if selected_sources:
             email = acquire_email(email_sources)
+            if callable(on_email_acquired):
+                on_email_acquired(email)
         elif manual_email:
             email = manual_email
         elif _e.USE_EMAIL_SERVICE:
             email = acquire_email()
+            if callable(on_email_acquired):
+                on_email_acquired(email)
         else:
             raise RuntimeError(
                 "手动模式未配置邮箱。请在 WebUI 配置页设置 REGISTER_EMAIL，"
@@ -326,14 +368,25 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             log_logger.info(f"[Job {job_id}] 开始注册任务")
             target_email = current.get("email")
             email_sources = current.get("email_source")
+            registration_record = {}
+
+            def persist_acquired_email(claimed_email):
+                registration_record.update(_persist_claimed_registration_email(
+                    claimed_email,
+                    job_id=job_id,
+                    email_sources=email_sources,
+                ))
+
             with bind_email_sources(email_sources):
                 # Unsupported drivers must fail before reserving a short-lived mailbox.
                 require_password_2fa_driver()
                 email, name, birthday = _prepare_registration_args(
                     target_email,
                     email_sources,
+                    on_email_acquired=persist_acquired_email,
                 )
-                db.update_job(job_id, email=email)
+                if not registration_record:
+                    persist_acquired_email(email)
                 check_stop_requested()
                 with bind_stop_signal(CallbackStopSignal(lambda: is_stop_requested(job_id))):
                     result = run_registration(email=email, name=name, birthday=birthday)

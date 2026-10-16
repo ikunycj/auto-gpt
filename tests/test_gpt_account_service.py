@@ -67,6 +67,33 @@ def test_registered_account_exposes_verified_phone_state(isolated_accounts):
     assert row["sms_code_url"] == "https://sms.example/code"
 
 
+def test_claimed_registration_mailbox_remains_visible_with_failure_detail(isolated_accounts, monkeypatch):
+    _seed(isolated_accounts, [{
+        "id": "gpt-pending",
+        "email": "pending@example.com",
+        "email_source": "mailnest",
+        "email_provider": "mailnest",
+        "registration_pending": True,
+    }])
+    monkeypatch.setattr(service.db, "list_jobs", lambda **_: [{
+        "id": 37,
+        "job_type": "registration",
+        "account_id": "gpt-pending",
+        "email": "pending@example.com",
+        "status": "failed",
+        "error_message": "Chrome CDP proxy route reset",
+        "created_at": "2026-10-15T16:21:49",
+    }])
+
+    row = service.list_accounts()[0]
+
+    assert row["registration_status"] == "failed"
+    assert row["registration_status_raw"] == "failed"
+    assert row["registration_job"]["error"] == "Chrome CDP proxy route reset"
+    assert row["email_provider"] == "mailnest"
+    assert "registration_pending" not in row
+
+
 @pytest.mark.parametrize("raw_status", ["deleted", "deactivated"])
 @pytest.mark.parametrize("previous_job_status", ["failed", "success"])
 def test_terminal_account_status_is_preserved_for_display_and_filtering(
@@ -214,12 +241,12 @@ def test_authorization_material_uses_flat_gpt_credentials_and_provider_context()
     assert material["proxy"] == "http://proxy.example:8080"
 
 
-def test_public_account_does_not_expose_verified_route_snapshot(isolated_accounts):
+def test_public_account_exposes_verified_route_snapshot_for_local_audit(isolated_accounts):
     _seed(isolated_accounts, [{
         "id": "route-private", "email": "route@example.com",
         "_codex_verified_proxy": "socks5h://user:private@proxy.example:1080",
     }])
     row = service.get_account("route-private")
-    assert "_codex_verified_proxy" not in row
-    assert "private@" not in str(row)
-    assert "_codex_verified_proxy" not in service.db.get_account("route-private")
+    assert row["_codex_verified_proxy"] == "socks5h://user:private@proxy.example:1080"
+    assert "private@" in str(row)
+    assert service.db.get_account("route-private")["_codex_verified_proxy"] == "socks5h://user:private@proxy.example:1080"

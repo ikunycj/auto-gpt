@@ -10,9 +10,6 @@ import json
 import pathlib
 import urllib.parse
 
-SENSITIVE_KEYS = {"authorization", "cookie", "set-cookie", "openai-sentinel-token", "openai-sentinel-so-token"}
-
-
 def decode_sentinel_p(value: str):
     if not value:
         return None
@@ -36,9 +33,7 @@ def short_body(text: str, limit: int = 260):
         if isinstance(obj, dict):
             out = {}
             for k, v in obj.items():
-                if k in {"p", "prepare_token", "token", "code"}:
-                    out[k] = f"<{k}:len={len(str(v))}>"
-                elif k in {"batch", "series"}:
+                if k in {"batch", "series"}:
                     out[k] = f"<{k}:items={len(v) if isinstance(v, list) else '?'}>"
                 else:
                     out[k] = v
@@ -49,15 +44,7 @@ def short_body(text: str, limit: int = 260):
 
 
 def header_dict(headers):
-    out = {}
-    for h in headers or []:
-        k = h.get("name", "")
-        v = h.get("value", "")
-        if k.lower() in SENSITIVE_KEYS:
-            out[k] = f"<redacted:len={len(v)}>"
-        else:
-            out[k] = v
-    return out
+    return {h.get("name", ""): h.get("value", "") for h in headers or []}
 
 
 def classify(url: str) -> str:

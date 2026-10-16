@@ -459,6 +459,12 @@ def wait_for_otp(
 
 def release_email(email: str, status: str = "available", note: str | None = None) -> str:
     """按邮箱实际来源回收状态，返回来源名。"""
+    from core import db
+
+    account = db.get_account_by_email(email)
+    if account and account.get("registration_pending"):
+        return str(account.get("email_source") or resolve_email_source(email) or "").strip().lower()
+
     source = resolve_email_source(email)
     if source == "gptmail":
         from core.gptmail_client import release_account

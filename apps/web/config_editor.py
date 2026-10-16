@@ -17,7 +17,7 @@ from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _CONFIG_DIR = _PROJECT_ROOT / "config"
-EXPLICIT_EMPTY_LIST_KEYS = {"PROXY_POOL"}
+EXPLICIT_EMPTY_LIST_KEYS = {"PROXY_POOL", "PROXY_POOL_DISABLED"}
 
 
 # ============================================================
@@ -34,7 +34,6 @@ EDITABLE_FIELDS = [
         "key": "REGISTRATION_DRIVER", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "注册驱动", "help": "本机推荐 chrome_cdp；浏览器驱动优先邮箱 OTP，仅在 OpenAI 没有 OTP 入口且强制创建密码时使用密码兜底；protocol 始终是纯邮箱 OTP 流程",
     },
-
     # ---- CloakBrowser ----
     {
         "key": "CLOAK_HEADLESS", "file": "cloakbrowser.py", "type": "bool", "group": "代理浏览器",
@@ -85,107 +84,6 @@ EDITABLE_FIELDS = [
         "label": "保留Cloak浏览器", "help": "调试时开启，任务结束后不自动关闭",
     },
 
-    # ---- Browser Use Cloud ----
-    {
-        "key": "BROWSER_USE_API_KEY", "file": "browser_use.py", "type": "str", "group": "代理浏览器",
-        "label": "Browser Use API Key", "help": "保存在 .env（BROWSER_USE_API_KEY），不写回 config/*.py",
-        "storage": "env", "secret": True,
-    },
-    {
-        "key": "BROWSER_USE_CONNECT_MODE", "file": "browser_use.py", "type": "str", "group": "代理浏览器",
-        "label": "连接方式", "help": "cdp_url=直接连接官方 CDP；sdk=预留的 REST 会话模式",
-    },
-    {
-        "key": "BROWSER_USE_API_BASE", "file": "browser_use.py", "type": "str", "group": "代理浏览器",
-        "label": "REST API 地址", "help": "Browser Use REST API 根地址；通常保持默认值",
-    },
-    {
-        "key": "BROWSER_USE_PROXY_COUNTRY_CODE", "file": "browser_use.py", "type": "str", "group": "代理浏览器",
-        "label": "代理国家代码", "help": "两位国家码，如 jp/us/sg；配合 Browser Use 内置 residential proxy",
-    },
-    {
-        "key": "BROWSER_USE_USE_PROXY", "file": "browser_use.py", "type": "bool", "group": "代理浏览器",
-        "label": "使用内置代理", "help": "True=连接参数带 proxyCountryCode；False=不强制传国家代理参数",
-    },
-    {
-        "key": "BROWSER_USE_PROFILE_ID", "file": "browser_use.py", "type": "str", "group": "代理浏览器",
-        "label": "Profile ID", "help": "可选。填写则复用 Browser Use profile 的 cookies/localStorage；批量建议留空",
-    },
-    {
-        "key": "BROWSER_USE_CDP_BASE", "file": "browser_use.py", "type": "str", "group": "代理浏览器",
-        "label": "CDP 地址", "help": "默认 wss://connect.browser-use.com",
-    },
-    {
-        "key": "BROWSER_USE_TIMEOUT", "file": "browser_use.py", "type": "int", "group": "代理浏览器",
-        "label": "操作超时(秒)", "help": "Playwright 默认操作超时",
-    },
-    {
-        "key": "BROWSER_USE_NAVIGATION_TIMEOUT", "file": "browser_use.py", "type": "int", "group": "代理浏览器",
-        "label": "页面导航超时(秒)", "help": "页面打开和跳转的最长等待时间",
-    },
-    {
-        "key": "BROWSER_USE_SESSION_TIMEOUT", "file": "browser_use.py", "type": "int", "group": "代理浏览器",
-        "label": "云端keepAlive(分钟)", "help": "传给 Browser Use connect URL 的 timeout/keepAlive；程序会自动限制到 1-240，建议 240",
-    },
-    {
-        "key": "BROWSER_USE_FAST_MODE", "file": "browser_use.py", "type": "bool", "group": "代理浏览器",
-        "label": "快速模式", "help": "减少 Browser Use 额外等待和 humanize 延迟；建议开启，异常排查时可关闭",
-    },
-    {
-        "key": "BROWSER_USE_LOG_TIMING", "file": "browser_use.py", "type": "bool", "group": "代理浏览器",
-        "label": "耗时日志", "help": "打印 Browser Use 各阶段耗时：连接、打开页面、邮箱、OTP、手机、callback",
-    },
-    {
-        "key": "BROWSER_USE_KEEP_BROWSER_OPEN", "file": "browser_use.py", "type": "bool", "group": "代理浏览器",
-        "label": "保留远端会话", "help": "调试时可不主动 browser.close()；默认 False",
-    },
-    {
-        "key": "BROWSER_USE_START_URL", "file": "browser_use.py", "type": "str", "group": "代理浏览器",
-        "label": "起始 URL", "help": "默认 https://chatgpt.com/auth/login",
-    },
-
-    # ---- Skyvern Cloud Browser ----
-    {
-        "key": "SKYVERN_API_KEY", "file": "skyvern.py", "type": "str", "group": "代理浏览器",
-        "label": "Skyvern API Key", "help": "保存在 .env（SKYVERN_API_KEY），用于创建 Skyvern Browser Session",
-        "storage": "env", "secret": True,
-    },
-    {
-        "key": "SKYVERN_API_BASE", "file": "skyvern.py", "type": "str", "group": "代理浏览器",
-        "label": "API 地址", "help": "默认 https://api.skyvern.com",
-    },
-    {
-        "key": "SKYVERN_BROWSER_SESSION_TIMEOUT", "file": "skyvern.py", "type": "int", "group": "代理浏览器",
-        "label": "Session 超时(分钟)", "help": "创建 Skyvern Browser Session 时传入的 timeout",
-    },
-    {
-        "key": "SKYVERN_BROWSER_PROFILE_ID", "file": "skyvern.py", "type": "str", "group": "代理浏览器",
-        "label": "Browser Profile ID", "help": "可选，复用 Skyvern browser profile",
-    },
-    {
-        "key": "SKYVERN_PROXY_LOCATION", "file": "skyvern.py", "type": "str", "group": "代理浏览器",
-        "label": "代理地区", "help": "可填 jp/us/gb 等简写；会自动转为 Skyvern 枚举，如 jp→RESIDENTIAL_JP；留空不传",
-    },
-    {
-        "key": "SKYVERN_BROWSER_TYPE", "file": "skyvern.py", "type": "str", "group": "代理浏览器",
-        "label": "浏览器类型", "help": "Skyvern 支持 msedge / chrome / stealth-chromium；旧值 chromium-headful 会自动转为 stealth-chromium",
-    },
-    {
-        "key": "SKYVERN_AD_BLOCKER", "file": "skyvern.py", "type": "bool", "group": "代理浏览器",
-        "label": "广告拦截", "help": "创建 Skyvern Browser Session 时启用 ad_blocker",
-    },
-    {
-        "key": "SKYVERN_GENERATE_BROWSER_PROFILE", "file": "skyvern.py", "type": "bool", "group": "代理浏览器",
-        "label": "保存浏览器Profile", "help": "Session 结束时是否让 Skyvern 生成/保存 browser profile",
-    },
-    {
-        "key": "SKYVERN_KEEP_BROWSER_OPEN", "file": "skyvern.py", "type": "bool", "group": "代理浏览器",
-        "label": "保留浏览器", "help": "调试时可开启，任务结束后不主动关闭 Skyvern Browser Session",
-    },
-    {
-        "key": "SKYVERN_START_URL", "file": "skyvern.py", "type": "str", "group": "代理浏览器",
-        "label": "起始 URL", "help": "默认 https://chatgpt.com/auth/login",
-    },
     {
         "key": "ROXY_API_BASE", "file": "roxybrowser.py", "type": "str", "group": "代理浏览器",
         "label": "Roxy API 地址", "help": "默认 http://127.0.0.1:50000；需在 Roxy 应用 API 配置中开启",
@@ -317,7 +215,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "CODEX_OAUTH_DRIVER", "file": "codex.py", "type": "str", "group": "Codex",
-        "label": "Codex授权驱动", "help": "本地推荐 chrome_cdp；protocol=原协议授权；roxy=用 RoxyBrowser；cloak=用 CloakBrowser；chrome_cdp=正常启动系统 Chrome 后通过 CDP 接管；browser_use=用 Browser Use Cloud；skyvern=用 Skyvern；same_as_registration=跟随注册驱动",
+        "label": "Codex授权驱动", "help": "本地推荐 chrome_cdp；protocol=原协议授权；roxy=用 RoxyBrowser；cloak=用 CloakBrowser；chrome_cdp=正常启动系统 Chrome 后通过 CDP 接管；same_as_registration=跟随注册驱动",
     },
     {
         "key": "CODEX_REQUEST_TIMEOUT", "file": "codex.py", "type": "int", "group": "Codex",
@@ -569,45 +467,49 @@ EDITABLE_FIELDS = [
         "label": "代理池(每行一个)", "help": "注册时优先使用池中代理，留空使用本机网络；注册使用的非本机代理会记录到账号。已有账号仅使用自身记录的代理，无记录则使用本机网络。可先测试再保存；Roxy 已开窗口路由不一致时需先关闭，不会静默切换直连",
     },
     {
-        "key": "PLAN_CHECK_PROXY_MODE", "file": "proxy.py", "type": "str", "group": "代理池",
-        "label": "套餐/Agent网络模式", "help": "用于查套餐和生成 Agent Token；auto=本地代理可用则走代理、未监听则直连；proxy=强制代理；direct=强制直连",
+        "key": "PROXY_POOL_DISABLED", "file": "proxy.py", "type": "list_str_multiline", "group": "代理池",
+        "label": "已禁用代理池(内部)", "help": "由代理IP工作区维护，禁用代理不会参与运行时抽取。",
     },
     {
-        "key": "PLAN_CHECK_PROXY", "file": "proxy.py", "type": "str", "group": "代理池",
-        "label": "套餐/Agent专用代理", "help": "用于查套餐和生成 Agent Token；留空时 auto/proxy 从代理池选择。可能包含认证信息，仅保存到 .env",
+        "key": "PLAN_CHECK_PROXY_MODE", "file": "proxy.py", "type": "str", "group": "代理IP设置",
+        "label": "套餐查询网络模式", "help": "用于查套餐和生成 Token；auto=本地代理可用则走代理、未监听则直连；proxy=强制代理；direct=强制直连",
+    },
+    {
+        "key": "PLAN_CHECK_PROXY", "file": "proxy.py", "type": "str", "group": "代理IP设置",
+        "label": "套餐查询专用代理", "help": "用于查套餐和生成 Token；留空时 auto/proxy 从代理池选择。可能包含认证信息，仅保存到 .env",
         "storage": "env", "secret": True,
     },
     {
-        "key": "PLAN_CHECK_TIMEOUT", "file": "proxy.py", "type": "float", "group": "代理池",
-        "label": "套餐/Agent超时(秒)", "help": "查套餐和生成 Agent Token 的单次请求超时，建议 10-20 秒；独立于注册请求超时",
+        "key": "PLAN_CHECK_TIMEOUT", "file": "proxy.py", "type": "float", "group": "代理IP设置",
+        "label": "套餐查询超时(秒)", "help": "查套餐和生成 Token 的单次请求超时，建议 10-20 秒；独立于注册请求超时",
     },
     {
-        "key": "PLAN_CHECK_MAX_ATTEMPTS", "file": "proxy.py", "type": "int", "group": "代理池",
-        "label": "套餐/Agent最大尝试次数", "help": "查套餐和生成 Agent Token 遇到网络错误、429、5xx 等临时错误时的重试次数，建议 2 次",
+        "key": "PLAN_CHECK_MAX_ATTEMPTS", "file": "proxy.py", "type": "int", "group": "代理IP设置",
+        "label": "套餐查询最大尝试次数", "help": "查套餐和生成 Token 遇到网络错误、429、5xx 等临时错误时的重试次数，建议 2 次",
     },
     {
-        "key": "PLAN_CHECK_RETRY_DELAY", "file": "proxy.py", "type": "float", "group": "代理池",
-        "label": "套餐/Agent重试间隔(秒)", "help": "查套餐和生成 Agent Token 的重试间隔，按尝试次数递增；服务端 Retry-After 优先",
+        "key": "PLAN_CHECK_RETRY_DELAY", "file": "proxy.py", "type": "float", "group": "代理IP设置",
+        "label": "套餐查询重试间隔(秒)", "help": "查套餐和生成 Token 的重试间隔，按尝试次数递增；服务端 Retry-After 优先",
     },
     {
-        "key": "PLAN_CHECK_REGISTRATION_RECHECK_DELAY", "file": "proxy.py", "type": "float", "group": "代理池",
+        "key": "PLAN_CHECK_REGISTRATION_RECHECK_DELAY", "file": "proxy.py", "type": "float", "group": "代理IP设置",
         "label": "新账号资格复查延迟(秒)", "help": "新注册 free 账号未发现试用资格或首次查询失败时复查一次；0 表示关闭",
     },
     {
-        "key": "PLAN_CHECK_WORKERS", "file": "proxy.py", "type": "int", "group": "代理池",
-        "label": "套餐查询并发数", "help": "自动、手动和批量查套餐共用；Agent Token 生成使用独立队列；建议 2-4 个线程",
+        "key": "PLAN_CHECK_WORKERS", "file": "proxy.py", "type": "int", "group": "代理IP设置",
+        "label": "套餐查询并发数", "help": "自动、手动和批量查套餐共用；Token 生成使用独立队列；建议 2-4 个线程",
     },
     {
-        "key": "PLAN_CHECK_QUEUE_LIMIT", "file": "proxy.py", "type": "int", "group": "代理池",
+        "key": "PLAN_CHECK_QUEUE_LIMIT", "file": "proxy.py", "type": "int", "group": "代理IP设置",
         "label": "套餐查询队列上限", "help": "防止异常批量操作无限堆积，建议 100-1000",
     },
     {
-        "key": "PLAN_CHECK_MIN_INTERVAL", "file": "proxy.py", "type": "float", "group": "代理池",
-        "label": "套餐/Agent请求最小间隔(秒)", "help": "限制查套餐和生成 Agent Token 的请求启动频率，降低 429 风险",
+        "key": "PLAN_CHECK_MIN_INTERVAL", "file": "proxy.py", "type": "float", "group": "代理IP设置",
+        "label": "套餐查询请求最小间隔(秒)", "help": "限制查套餐和生成 Token 的请求启动频率，降低 429 风险",
     },
     {
-        "key": "PLAN_CHECK_JITTER", "file": "proxy.py", "type": "float", "group": "代理池",
-        "label": "套餐/Agent请求随机抖动(秒)", "help": "在查套餐和生成 Agent Token 的最小间隔上增加随机延迟，避免请求过于规律",
+        "key": "PLAN_CHECK_JITTER", "file": "proxy.py", "type": "float", "group": "代理IP设置",
+        "label": "套餐查询请求随机抖动(秒)", "help": "在查套餐和生成 Token 的最小间隔上增加随机延迟，避免请求过于规律",
     },
     # ---- 提链 ----
     {
@@ -902,7 +804,7 @@ _SMS_FIELD_CHANNEL = {
 # 指纹参数必须在 WebUI 中隔离展示。模块只影响元数据和页面分组，不改变
 # .env 键名、默认值或保存协议。
 _BROWSER_FIELD_MODULE = {
-    "REGISTRATION_DRIVER": "general",
+    "REGISTRATION_DRIVER": "workspace",
     **{
         field["key"]: "roxy"
         for field in EDITABLE_FIELDS
@@ -912,16 +814,6 @@ _BROWSER_FIELD_MODULE = {
         field["key"]: "cloak"
         for field in EDITABLE_FIELDS
         if field["group"] == "代理浏览器" and field["key"].startswith("CLOAK_")
-    },
-    **{
-        field["key"]: "browser_use"
-        for field in EDITABLE_FIELDS
-        if field["group"] == "代理浏览器" and field["key"].startswith("BROWSER_USE_")
-    },
-    **{
-        field["key"]: "skyvern"
-        for field in EDITABLE_FIELDS
-        if field["group"] == "代理浏览器" and field["key"].startswith("SKYVERN_")
     },
     **{
         field["key"]: "system_chrome"

@@ -14,13 +14,11 @@ from config.env_loader import env_str, apply_env_overrides
 #   "protocol"     = 原有 curl_cffi 纯协议注册（容易封号，不建议）
 #   "roxy"         = 调用 RoxyBrowser 指纹浏览器 + Selenium 自动化注册
 #   "cloak"        = 调用 CloakBrowser + Playwright/Selenium 适配层注册
-#   "browser_use"  = Browser Use Cloud stealth Chromium + Playwright
-#   "skyvern"      = Skyvern Browser Sessions + Playwright
 #   "chrome_cdp"   = 本机 Google Chrome + CDP（本地推荐）
 REGISTRATION_DRIVER: str = "protocol"
 
 # RoxyBrowser 本地 API
-ROXY_API_BASE: str = "http://127.0.0.1:50100"
+ROXY_API_BASE: str = "http://127.0.0.1:50000"
 ROXY_API_TOKEN: str = env_str("ROXY_API_TOKEN", "")
 
 # Roxy 环境/Profile ID；留空时使用 ROXY_PROFILE_CREATE_* 先创建临时环境（如果接口支持）
@@ -28,10 +26,10 @@ ROXY_PROFILE_ID: str = ""
 
 # Roxy 工作区 ID。Roxy 创建 Profile 时接口要求 workspaceId，必须填写。
 # 可在 Roxy 工作区/团队页面或 API 返回中查看。
-ROXY_WORKSPACE_ID: str = "90143"
+ROXY_WORKSPACE_ID: str = ""
 
 # Roxy 项目 ID。/browser/workspace 返回 project_details.projectId；创建 Profile 时一并提交。
-ROXY_PROJECT_ID: str = "97471"
+ROXY_PROJECT_ID: str = ""
 
 # 获取团队/工作区列表接口路径。不同版本若不同，可在 WebUI 修改；客户端也会自动尝试多个常见路径。
 ROXY_WORKSPACE_LIST_PATH: str = "/browser/workspace"

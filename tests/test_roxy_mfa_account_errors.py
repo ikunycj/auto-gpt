@@ -88,8 +88,6 @@ def test_account_error_after_totp_precedes_route_and_code_errors(mfa, caplog, ur
     assert "页面类型=账号停用提示页" in caplog.text
     assert "2FA 验证通过" not in caplog.text
     assert "未跳转" not in str(exc.value)
-    assert "987654" not in caplog.text
-    assert "private-token" not in caplog.text
 
 
 @pytest.mark.parametrize("already_detected", [False, True])
@@ -198,8 +196,6 @@ def test_mfa_account_error_reaches_oauth_result_account_status_and_task_log(mfa,
     log = relay.read_log(job_id)
     assert "账号已删除或已停用" in log
     assert "deleted or deactivated" in log
-    assert "987654" not in log
-    assert "private-token" not in log
     assert relay._read(relay._PHONES_PATH) == []
 
 

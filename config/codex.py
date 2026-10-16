@@ -52,7 +52,6 @@ CODEX_REQUEST_TIMEOUT: int = 30
 #   "roxy"     = 调用 RoxyBrowser 指纹浏览器完成授权页面/手机验证/回调捕获
 #   "cloak"    = 调用 CloakBrowser 完成授权页面/手机验证/回调捕获
 #   "chrome_cdp" = 正常启动本机 Chrome，再通过 CDP 接管（本地推荐）
-#   "browser_use" = 调用 Browser Use Cloud 完成授权页面/手机验证/回调捕获
 #   "same_as_registration" = 跟随 REGISTRATION_DRIVER
 CODEX_OAUTH_DRIVER: str = "protocol"
 

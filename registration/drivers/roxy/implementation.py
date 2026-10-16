@@ -243,92 +243,18 @@ def _log_prefix(driver=None) -> str:
 
 
 def _diagnostic_route(url: object) -> str:
-    """Give logs a route label without query strings, fragments or opaque path tokens."""
-    from urllib.parse import urlsplit
-
-    try:
-        parsed = urlsplit(str(url or ""))
-        path = (parsed.path or "").lower()
-        for route in (
-            "/create-account/password", "/log-in/password", "/email-verification",
-            "/signup/profile", "/create-account/profile", "/about-you", "/profile",
-            "/add-phone", "/phone-verification", "/authorize", "/consent",
-            "/workspace", "/auth/callback", "/auth/login",
-        ):
-            if path == route or path.startswith(route + "/"):
-                return route
-        if path == "/":
-            return "/"
-    except Exception:
-        pass
-    return "[其他页面]"
+    """Return the complete browser URL for local auditing."""
+    return str(url or "")
 
 
-_DIAGNOSTIC_URL_RE = re.compile(r"(?i)\b(?:https?|chrome-error)://[^\s<>\"']+")
-_DIAGNOSTIC_EMAIL_RE = re.compile(r"(?i)\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
-_DIAGNOSTIC_SECRET_RE = re.compile(
-    r"(?i)(\b(?:password|passwd|token|secret|authorization|cookie|otp|code|access_token|refresh_token)\b\s*[:=]\s*)([^\s,;]+)"
-)
-_DIAGNOSTIC_LONG_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_-]{32,}\b")
-
-
-def _safe_exception_text(exc: object, limit: int = 240) -> str:
-    """Keep ordinary error labels while removing values from browser/provider errors."""
-    network_error = describe_browser_network_error(exc)
-    if network_error:
-        return network_error[:limit]
-    text = " ".join(str(exc or "").split())
-    if not text:
-        return "-"
-
-    def redact_url(match: re.Match) -> str:
-        return f"route={_diagnostic_route(match.group(0))}"
-
-    text = _DIAGNOSTIC_URL_RE.sub(redact_url, text)
-    text = _DIAGNOSTIC_EMAIL_RE.sub("[邮箱]", text)
-    text = _DIAGNOSTIC_SECRET_RE.sub(lambda match: f"{match.group(1)}[已隐藏]", text)
-    text = _DIAGNOSTIC_LONG_TOKEN_RE.sub("[长令牌已隐藏]", text)
-    text = text.replace("\x00", " ")
-    return text[:limit] + ("…" if len(text) > limit else "")
+def _diagnostic_text(exc: object, limit: int = 240) -> str:
+    """Return the complete browser/provider error for local auditing."""
+    return str(exc or "-").replace("\x00", " ")
 
 
 def _diagnostic_state(state: object) -> dict:
-    """Summarize untrusted DOM/JS results without any input, body or URL values."""
-    if not isinstance(state, dict):
-        return {"state": "unavailable"}
-    summary = {"route": _diagnostic_route(state.get("url"))}
-    for key in ("inputs", "buttons", "widgets", "forms", "actions", "errors"):
-        if isinstance(state.get(key), list):
-            summary[f"{key}_count"] = len(state[key])
-    invalid = sum(
-        str(item.get("ariaInvalid") or "").lower() == "true"
-        for item in (state.get("inputs") or []) if isinstance(item, dict)
-    )
-    if invalid:
-        summary["invalid_inputs"] = invalid
-    for key in ("ok", "hasForm", "hasSubmit"):
-        if isinstance(state.get(key), bool):
-            summary[key] = state[key]
-    if type(state.get("status")) is int:
-        summary["status"] = state["status"]
-    # Only page-script labels may be included. An arbitrary DOM/exception reason
-    # could itself contain an OTP, password or redirect query parameter.
-    reason = state.get("reason")
-    if isinstance(reason, str) and reason in {
-        "missing_email_input", "email_value_not_ready", "no_safe_submit",
-        "no_safe_global_action", "ambiguous_submit", "primary_submit",
-        "safe_submit", "empty_email", "missing_form", "missing_safe_submit",
-        "stable_async_enter_click", "resubmitted_email_form",
-        "missing_continue_with_password", "clicked_continue_with_password",
-        "continue_with_password_did_not_open_password_page",
-        "missing_password_input", "missing_submit", "password_targets",
-        "missing_passwordless_button", "passwordless_send_otp_target",
-        "clicked_passwordless_send_otp", "empty_result",
-    }:
-        summary["reason"] = reason
-    if state.get("error"):
-        summary["error"] = "页面检查失败"
-    return summary
+    """Return the complete DOM/JS diagnostic state for local auditing."""
+    return dict(state) if isinstance(state, dict) else {"state": "unavailable"}
 
 
 def _webdriver_rejected_performance_logging(exc: object) -> bool:
@@ -493,7 +419,7 @@ def _center_browser_window(driver) -> None:
         driver.set_window_position(x, y)
         logger.info("[Roxy] 浏览器窗口已居中：x=%s y=%s width=%s height=%s", x, y, width, height)
     except Exception as exc:
-        logger.warning("[Roxy] 浏览器窗口居中失败，继续执行：%s", _safe_exception_text(exc))
+        logger.warning("[Roxy] 浏览器窗口居中失败，继续执行：%s", _diagnostic_text(exc))
 
 
 def _wait(driver, timeout: int | None = None):
@@ -630,7 +556,7 @@ def _apply_browser_automation_mask(driver) -> None:
             pass
         logger.info("%s 已注入浏览器自动化特征弱化脚本", _log_prefix(driver))
     except Exception as exc:
-        logger.debug("%s 注入自动化特征弱化脚本失败：%s", _log_prefix(driver), _safe_exception_text(exc))
+        logger.debug("%s 注入自动化特征弱化脚本失败：%s", _log_prefix(driver), _diagnostic_text(exc))
 
 
 def _human_scroll_to(driver, el) -> None:
@@ -687,7 +613,7 @@ def _human_click(driver, el, *, label: str = "") -> None:
             el.click();
             """, el)
     except Exception as exc:
-        logger.debug("%s 人工化点击失败，回退 el.click label=%s err=%s", _log_prefix(driver), label, _safe_exception_text(exc))
+        logger.debug("%s 人工化点击失败，回退 el.click label=%s err=%s", _log_prefix(driver), label, _diagnostic_text(exc))
         time.sleep(random.uniform(0.12, 0.45))
         try:
             driver.execute_script("arguments[0].click();", el)
@@ -745,7 +671,7 @@ def _human_type_text(driver, el, value: str, *, clear: bool = True) -> None:
             el,
         )
     except Exception as exc:
-        logger.debug("%s 人工化输入失败，回退 JS setter err=%s", _log_prefix(driver), _safe_exception_text(exc))
+        logger.debug("%s 人工化输入失败，回退 JS setter err=%s", _log_prefix(driver), _diagnostic_text(exc))
         _set_element_value(driver, el, value)
 
 
@@ -1922,7 +1848,7 @@ def _fill_birthday_or_age(driver, birthday: str, age: int) -> str | None:
         """, birthday)
         return 'spinbutton'
     except Exception as exc:
-        logger.debug('%s spinbutton 生日填写失败：%s', _log_prefix(driver), _safe_exception_text(exc))
+        logger.debug('%s spinbutton 生日填写失败：%s', _log_prefix(driver), _diagnostic_text(exc))
         return None
 
 
@@ -2357,7 +2283,7 @@ def _accept_profile_consents(driver) -> int:
             logger.info("%s 已勾选 about-you/profile 同意协议复选框：%s", _log_prefix(driver), result.get('names'))
         return count
     except Exception as exc:
-        logger.debug('%s 勾选 profile consent 失败：%s', _log_prefix(driver), _safe_exception_text(exc))
+        logger.debug('%s 勾选 profile consent 失败：%s', _log_prefix(driver), _diagnostic_text(exc))
         return 0
 
 
@@ -2703,7 +2629,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                 _click_continue(driver)
                 logger.info("[Roxy注册][OTP] 已提交邮箱验证码，等待资料页或登录态")
             except Exception as exc:
-                logger.info("[Roxy注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s", _safe_exception_text(exc, 120))
+                logger.info("[Roxy注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s", _diagnostic_text(exc, 120))
 
             outcome = _wait_after_email_otp_submit(driver, timeout=10)
             if outcome == 'accepted':
@@ -2761,8 +2687,8 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                 if not totp_secret:
                     raise RuntimeError("2FA 激活后未返回 TOTP secret")
             except Exception as exc:
-                logger.error("[Roxy注册] 2FA 设置失败：%s: %s", type(exc).__name__, _safe_exception_text(exc))
-                raise RuntimeError(f"Roxy 注册已创建密码，但 2FA 设置失败：{type(exc).__name__}: {_safe_exception_text(exc, 180)}") from exc
+                logger.error("[Roxy注册] 2FA 设置失败：%s: %s", type(exc).__name__, _diagnostic_text(exc))
+                raise RuntimeError(f"Roxy 注册已创建密码，但 2FA 设置失败：{type(exc).__name__}: {_diagnostic_text(exc, 180)}") from exc
             logger.info("[Roxy注册] 2FA 设置完成：%s", email)
 
             # Keep the original single-browser flow. The verifier clears auth
@@ -2778,7 +2704,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                 logger.error("[Roxy注册] 密码 + TOTP 重登录验证失败：%s", type(exc).__name__)
                 raise RuntimeError(
                     "Roxy 注册已创建密码和 2FA，但当前环境的密码 + TOTP 登录验证失败："
-                    f"{type(exc).__name__}: {_safe_exception_text(exc, 180)}"
+                    f"{type(exc).__name__}: {_diagnostic_text(exc, 180)}"
                 ) from exc
             logger.info("[Roxy注册] 密码 + TOTP 重登录验证成功：%s", email)
 
@@ -2806,7 +2732,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
             "error": None,
         }
     except Exception as exc:
-        logger.error("[Roxy注册] 失败：%s: %s", type(exc).__name__, _safe_exception_text(exc))
+        logger.error("[Roxy注册] 失败：%s: %s", type(exc).__name__, _diagnostic_text(exc))
         logger.debug("[Roxy注册] 失败详情已省略敏感堆栈：%s", type(exc).__name__)
         # 未确认创建前回收邮箱；确认后避免重复使用。
         try:
@@ -2815,11 +2741,11 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                 email,
                 status=("disabled" if isinstance(exc, RegistrationPasswordSubmissionError)
                         else "failed" if create_acknowledged else "available"),
-                note=f"Roxy注册失败: {_safe_exception_text(exc, 180)}",
+                note=f"Roxy注册失败: {_diagnostic_text(exc, 180)}",
             )
         except Exception:
             pass
-        return {"success": False, "email": email, "error": f"{type(exc).__name__}: {_safe_exception_text(exc, 300)}"}
+        return {"success": False, "email": email, "error": f"{type(exc).__name__}: {_diagnostic_text(exc, 300)}"}
     finally:
         if driver and not bool(_cfg.ROXY_KEEP_BROWSER_OPEN) and not getattr(opened, "was_open", False):
             try:

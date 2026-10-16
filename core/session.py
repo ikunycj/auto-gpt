@@ -314,11 +314,6 @@ class BrowserSession:
         headers.update(self.get_datadog_headers())
         return headers
 
-    def js_timezone_offset_min(self) -> int:
-        """返回 JS Date.getTimezoneOffset() 语义：UTC-local，东八区为 -480。"""
-        profile = getattr(self, "browser_profile", {}) or {}
-        return -int(profile.get("timezone_offset_minutes", 0) or 0)
-
     def _attach_datadog_headers(self, headers: dict) -> dict:
         """为前端 API 请求补齐 Datadog 头，降低无诊断头 silent-drop 概率。"""
         headers.update(self.get_datadog_headers())

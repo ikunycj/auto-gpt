@@ -4,13 +4,12 @@ from config import email as email_config
 from config import register as register_config
 from config import roxybrowser as roxybrowser_config
 from registration.application import job_service, use_case
+from registration.drivers.protocol import attachment_implementation as protocol
 
 
 def test_protocol_registration_persists_as_not_authorized_without_running_codex(monkeypatch):
     events = []
     saves = []
-    secret = "JBSWY3DPEHPK3PXP"
-
     class Session:
         def __init__(self, proxy=None):
             self.proxy = proxy
@@ -19,15 +18,17 @@ def test_protocol_registration_persists_as_not_authorized_without_running_codex(
             self.sentinel_sid = "sentinel-1"
             self.browser_profile = {"user_agent": "test"}
 
-    monkeypatch.setattr(use_case, "BrowserSession", Session)
-    monkeypatch.setattr(use_case, "human_delay", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(use_case, "network_preflight", lambda _session: None)
-    monkeypatch.setattr(use_case, "get_providers", lambda _session: {})
-    monkeypatch.setattr(use_case, "get_csrf_token", lambda _session: "csrf")
-    monkeypatch.setattr(use_case, "signin_openai", lambda *_args: "https://auth.openai.com/authorize")
-    monkeypatch.setattr(use_case, "follow_authorize", lambda *_args: "https://auth.openai.com/email-verification")
+    monkeypatch.setattr(protocol, "BrowserSession", Session)
+    monkeypatch.setattr(protocol, "human_delay", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(protocol, "get_providers", lambda _session: {})
+    monkeypatch.setattr(protocol, "get_csrf_token", lambda _session: "csrf")
+    monkeypatch.setattr(protocol, "signin_openai", lambda *_args: "https://auth.openai.com/authorize")
+    monkeypatch.setattr(protocol, "follow_authorize", lambda *_args: "https://auth.openai.com/email-verification")
+    monkeypatch.setattr(protocol, "request_sentinel_token", lambda *_args: {})
+    monkeypatch.setattr(protocol, "build_sentinel_header", lambda *_args: ("sentinel", None))
+    monkeypatch.setattr(protocol, "create_account", lambda *_args: {"continue_url": "https://auth.openai.com/authorize/continue"})
     monkeypatch.setattr(
-        use_case,
+        protocol,
         "validate_email_otp",
         lambda *_args, **_kwargs: {
             "page": {"type": "external_url"},
@@ -35,7 +36,7 @@ def test_protocol_registration_persists_as_not_authorized_without_running_codex(
         },
     )
     monkeypatch.setattr(
-        use_case,
+        protocol,
         "_finalize_registration_session",
         lambda *_args, **_kwargs: (
             {
@@ -47,45 +48,37 @@ def test_protocol_registration_persists_as_not_authorized_without_running_codex(
             "access-token",
         ),
     )
-    def setup_2fa(_session, email, otp_provider=None, **_kwargs):
-        assert email == "new@mailnest.test"
-        assert otp_provider is use_case.wait_for_otp
-        return secret
-
-    monkeypatch.setattr(use_case, "setup_2fa", setup_2fa)
-    monkeypatch.setattr(use_case._protocol_cfg, "CHATGPT_ANON_BOOTSTRAP_ENABLED", False)
-    monkeypatch.setattr(use_case._protocol_cfg, "CHATGPT_AUTH_BOOTSTRAP_ENABLED", False)
     monkeypatch.setattr(use_case._twofa_cfg, "ENABLE_2FA", False)
     monkeypatch.setattr(email_config, "USE_EMAIL_SERVICE", False)
 
     from core import codex_oauth, email_provider, flow_trigger
 
-    monkeypatch.setattr(email_provider, "resolve_email_source", lambda _email: "mailnest")
-    monkeypatch.setattr(email_provider, "snapshot_email_context", lambda *_args, **_kwargs: {"project_code": "chatgpt001"})
+    monkeypatch.setattr(protocol, "resolve_email_source", lambda _email: "mailnest")
+    monkeypatch.setattr(protocol, "snapshot_email_context", lambda *_args, **_kwargs: {"project_code": "chatgpt001"})
     otp_calls = []
 
     def wait_for_otp(email, after_ts, **_kwargs):
         otp_calls.append((email, after_ts))
         return "123456"
 
-    monkeypatch.setattr(use_case, "wait_for_otp", wait_for_otp)
+    monkeypatch.setattr(protocol, "wait_for_otp", wait_for_otp)
 
     def save(**kwargs):
         events.append(f"save:{kwargs['codex_status']}")
         saves.append(kwargs)
         return 17
 
-    monkeypatch.setattr(use_case, "save_account_data", save)
+    monkeypatch.setattr(protocol, "save_account_data", save)
 
     monkeypatch.setattr(
         codex_oauth,
         "run_codex_oauth",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("注册流程不应调用 Codex OAuth")),
     )
-    monkeypatch.setattr(flow_trigger, "trigger_flow", lambda _token: {"ok": True, "status": "success"})
+    monkeypatch.setattr(protocol, "trigger_flow", lambda _token: {"ok": True, "status": "success"})
 
     with email_provider.bind_email_sources(["mailnest"]):
-        result = use_case._run_protocol_registration(
+        result = protocol.run_attachment_protocol_registration(
             "new@mailnest.test",
             "Test User",
             birthday="1990-01-01",
@@ -176,7 +169,7 @@ def test_unsupported_registration_driver_is_rejected_before_mailbox_acquisition(
 def test_all_non_password_totp_drivers_are_rejected_when_2fa_is_required(monkeypatch):
     monkeypatch.setattr(use_case._twofa_cfg, "ENABLE_2FA", True)
 
-    for driver in ("protocol", "browser_use", "skyvern", "cloak"):
+    for driver in ("protocol", "cloak"):
         with pytest.raises(RuntimeError, match="不能保证完成密码和 TOTP"):
             use_case.require_password_2fa_driver(driver)
 

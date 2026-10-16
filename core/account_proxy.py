@@ -45,13 +45,10 @@ def registration_proxy(proxy: str | None) -> str:
 
 
 def proxy_display(proxy: str | None) -> str:
-    """Display endpoint only, never username/password or invalid raw input."""
+    """Display the complete normalized proxy URL for local auditing."""
     if not proxy:
         return "本机网络"
     try:
-        parsed = urlparse(normalize_proxy_url(proxy))
-        host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-        auth = "（已配置认证）" if parsed.username is not None else ""
-        return f"{parsed.scheme}://{host}:{parsed.port}{auth}"
+        return normalize_proxy_url(proxy)
     except (ValueError, TypeError):
-        return "代理配置无效"
+        return str(proxy)

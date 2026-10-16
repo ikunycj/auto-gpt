@@ -102,6 +102,49 @@ def test_send_keys_preserves_select_all_until_clear_and_types_long_email_exactly
     assert locator.value == "qi5612b2f310yeiqyy@outlook.com"
 
 
+class _RemoteHandle:
+    def __init__(self, *, element=None, value=None, properties=None):
+        self.element = element
+        self.value = value
+        self.properties = properties or {}
+        self.disposed = False
+
+    def as_element(self):
+        return self.element
+
+    def get_properties(self):
+        return self.properties
+
+    def json_value(self):
+        return self.value
+
+    def dispose(self):
+        self.disposed = True
+
+
+def test_unwrap_js_result_preserves_elements_nested_in_password_page_result():
+    page = _Page()
+    password_input = _RemoteHandle(element=object())
+    submit_button = _RemoteHandle(element=object())
+    reason_value = _RemoteHandle(value="password_targets")
+    ok_value = _RemoteHandle(value=True)
+    result = _RemoteHandle(properties={
+        "ok": ok_value,
+        "reason": reason_value,
+        "input": password_input,
+        "button": submit_button,
+    })
+
+    unwrapped = CloakSeleniumDriver._unwrap_js_result(page, result)
+
+    assert unwrapped["ok"] is True
+    assert unwrapped["reason"] == "password_targets"
+    assert isinstance(unwrapped["input"], CloakElement)
+    assert unwrapped["input"].handle is password_input.element
+    assert isinstance(unwrapped["button"], CloakElement)
+    assert unwrapped["button"].handle is submit_button.element
+
+
 def test_window_controls_minimize_and_restore_the_current_cloak_window():
     page = _Page()
     driver = CloakSeleniumDriver(browser=object(), context=None, page=page)

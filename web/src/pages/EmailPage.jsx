@@ -5,8 +5,8 @@ import {
 } from 'lucide-react';
 import { copyText, get, post } from '../api';
 import { useDebounced, usePolling } from '../hooks';
-import {
-  Button, Card, Checkbox, EmptyState, ErrorState, Modal, Pager,
+import { ActionButton, Textarea,
+  useConfirm, Button, Card, Checkbox, EmptyState, ErrorState, Modal, Pager,
   RefreshButton, SearchField, SectionHeader, Select, StatusPill, Table,
   Toolbar,
 } from '../components/ui';
@@ -46,32 +46,24 @@ function formatDate(value) {
   return parsed.toLocaleString('zh-CN', { hour12: false });
 }
 
-function urlHost(value) {
-  try {
-    return new URL(String(value || '')).hostname || '接码地址';
-  } catch (_) {
-    return '接码地址';
-  }
-}
-
 function materialFor(row) {
   const source = sourceOf(row);
   if (source === 'generic_api') {
-    return { value: row.code_url || row.copy_line || '', preview: urlHost(row.code_url) };
+    return { value: row.code_url || row.copy_line || '' };
   }
   if (source === 'outlook') {
-    return { value: row.copy_line || '', preview: 'OAuth 凭证' };
+    return { value: row.copy_line || '' };
   }
-  return { value: '', preview: source === 'cloudflare_domain' ? '域名转发' : '邮箱素材' };
+  return { value: row.copy_line || row.email || '' };
 }
 
 function canRegister(row) {
   return ['outlook', 'generic_api'].includes(sourceOf(row)) && (row.status || 'available') === 'available';
 }
 
-function CopyValue({ value, preview, label, notify }) {
+function CopyValue({ value, label, notify }) {
   const text = String(value || '');
-  if (!text) return <span className="copy-cell-empty">{preview || '—'}</span>;
+  if (!text) return <span className="copy-cell-empty">—</span>;
   const copy = async () => {
     try {
       await copyText(text);
@@ -80,10 +72,11 @@ function CopyValue({ value, preview, label, notify }) {
       notify(error.message || `${label}复制失败`, 'error');
     }
   };
-  return <button type="button" className="copy-cell-button" title={`点击复制${label}`} onClick={copy}>{preview || text}</button>;
+  return <ActionButton type="button" className="copy-cell-button" title={`点击复制${label}`} onClick={copy}>{text}</ActionButton>;
 }
 
 export default function EmailPage({ notify, onOpenSettings, onOpenGptRegistration, onSummaryRefresh }) {
+  const confirm = useConfirm();
   const [rows, setRows] = useState([]);
   const [total, setTotal] = useState(0);
   const [source, setSource] = useState('all');
@@ -158,7 +151,7 @@ export default function EmailPage({ notify, onOpenSettings, onOpenGptRegistratio
 
   async function deleteItems(items) {
     if (!items.length) return notify('请先选择邮箱', 'warning');
-    if (!window.confirm(`确定彻底删除选中的 ${items.length} 个邮箱素材吗？此操作不可恢复。`)) return;
+    if (!await confirm(`确定彻底删除选中的 ${items.length} 个邮箱素材吗？此操作不可恢复。`)) return;
     try {
       const response = await post('/api/outlook/delete-bulk', { items, source });
       const deletedCount = Number(response.deleted_count ?? response.deleted?.length ?? 0);
@@ -258,7 +251,7 @@ export default function EmailPage({ notify, onOpenSettings, onOpenGptRegistratio
             <td><Checkbox checked={selected.has(rowKey)} onChange={(checked) => toggle(rowKey, checked)} /></td>
             <td><strong><CopyValue value={row.email} label="邮箱" notify={notify} /></strong></td>
             <td><span className="source-tag">{rowSource === 'generic_api' ? <Link2 size={13} /> : <Database size={13} />}{SOURCE_LABELS[rowSource] || rowSource}</span></td>
-            <td><CopyValue value={material.value} preview={material.preview} label="邮箱素材" notify={notify} /></td>
+            <td><CopyValue value={material.value} label="邮箱素材" notify={notify} /></td>
             <td><StatusPill value={rowStatus} /></td>
             <td className="truncate" title={row.note || ''}>{row.note || '—'}</td>
             <td className="cell-nowrap">{formatDate(row.imported_at || row.created_at || row.used_at)}</td>
@@ -277,8 +270,8 @@ export default function EmailPage({ notify, onOpenSettings, onOpenGptRegistratio
       <div className="form-grid">
         <Select label="邮箱类型" value={importSource} onChange={setImportSource} options={[{ value: 'outlook', label: 'Outlook' }, { value: 'generic_api', label: '接码 API' }]} />
       </div>
-      <label className="field-label">粘贴邮箱素材<textarea rows="12" value={importText} onChange={(event) => setImportText(event.target.value)} placeholder={importPlaceholder} spellCheck="false" /></label>
-      <p className="field-help">{importSource === 'outlook' ? '每行一个邮箱，按邮箱、密码、clientId、refreshToken 的顺序填写；' : '每行一个邮箱，自动识别邮箱和 HTTP 接码地址；'}<button type="button" className="field-help-link" onClick={() => { setImportOpen(false); onOpenSettings?.('email:general'); }}>点击设置分隔符</button></p>
+      <label className="field-label">粘贴邮箱素材<Textarea rows="12" value={importText} onChange={(event) => setImportText(event.target.value)} placeholder={importPlaceholder} spellCheck="false" /></label>
+      <p className="field-help">{importSource === 'outlook' ? '每行一个邮箱，按邮箱、密码、clientId、refreshToken 的顺序填写；' : '每行一个邮箱，自动识别邮箱和 HTTP 接码地址；'}<ActionButton type="button" className="field-help-link" onClick={() => { setImportOpen(false); onOpenSettings?.('email:general'); }}>点击设置分隔符</ActionButton></p>
     </Modal>
   </div>;
 }

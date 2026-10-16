@@ -29,11 +29,29 @@ def test_registration_request_is_driver_neutral(tmp_path: Path):
 
 
 def test_driver_aliases_and_plugin_registration():
-    assert normalize_driver_name("browser-use") == "browser_use"
+    assert normalize_driver_name("cloakbrowser") == "cloak"
     assert normalize_driver_name("system_chrome") == "chrome_cdp"
     assert get_driver("api").name == "protocol"
     assert get_driver("chrome").name == "chrome_cdp"
 
+
+def test_protocol_driver_runs_attachment_flow(monkeypatch):
+    from registration.drivers import protocol
+
+    called = {}
+
+    monkeypatch.setattr(
+        "registration.drivers.protocol.attachment_implementation.run_attachment_protocol_registration",
+        lambda **kwargs: called.update(kwargs) or {"success": True},
+    )
+
+    result = protocol.run(email="user@example.com", name="Test User")
+
+    assert result == {"success": True}
+    assert called == {"email": "user@example.com", "name": "Test User"}
+
+
+def test_plugin_registration():
     class StubDriver:
         name = "stub"
 
@@ -61,8 +79,6 @@ def test_registry_import_does_not_load_optional_browser_implementations():
         "get_driver('protocol')\n"
         "mods = ('registration.drivers.roxy.implementation', "
         "'registration.drivers.cloak.implementation', "
-        "'registration.drivers.browser_use.implementation', "
-        "'registration.drivers.skyvern.implementation', "
         "'registration.drivers.chrome_cdp.implementation')\n"
         "assert not any(name in sys.modules for name in mods)\n"
     )

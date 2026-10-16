@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 OpenAI Auth 模块
-处理 auth.openai.com 域名下的注册请求（步骤4-5、7-8、10、12）
+处理 auth.openai.com 域名下的授权、邮箱 OTP 和账号创建请求
 以及 sentinel.openai.com 的 sentinel token 请求（步骤6、9、11）
 """
 import json
@@ -336,98 +336,6 @@ def build_sentinel_header(session: BrowserSession, sentinel_resp: dict, flow: st
         logger.warning(f"[Sentinel] runner 输出解析失败: {exc}")
 
     return header_value, so_header
-
-
-# ============================================================
-# 密码分支专用函数（已停用，保留作备用）
-# 当前 OpenAI 主流程：follow_authorize 自动跳到 /email-verification 并发 OTP，
-# 不再走密码注册路径。如未来需要恢复密码注册（点击"使用密码继续"按钮的分支），
-# 可参考下方实现解封即可。
-# ============================================================
-
-# def get_create_account_page(session: BrowserSession) -> None:
-#     """
-#     [备用] 步骤5: 访问创建账号-密码页面（密码分支）。
-#     GET https://auth.openai.com/create-account/password
-#     """
-#     url = "https://auth.openai.com/create-account/password"
-#     headers = session.get_auth_navigate_headers(referer="https://auth.openai.com/email-verification")
-#     headers["sec-fetch-site"] = "same-origin"
-#
-#     logger.info("[步骤5] 访问创建账号-密码页（切换密码分支）...")
-#     resp = session.get(url, headers=headers, allow_redirects=True)
-#     resp.raise_for_status()
-#     logger.info(f"[步骤5] 创建账号-密码页访问成功, 落点: {resp.url}")
-
-
-# def register_user(session: BrowserSession, email: str, password: str, sentinel_header: str) -> dict:
-#     """
-#     [备用] 步骤7: 提交注册请求（邮箱+密码）。
-#     POST https://auth.openai.com/api/accounts/user/register
-#
-#     Returns:
-#         注册响应 JSON，例如:
-#         {
-#             "continue_url": "https://auth.openai.com/api/accounts/email-otp/send",
-#             "method": "GET",
-#             "page": {"type": "email_otp_send", "backstack_behavior": "default"}
-#         }
-#     """
-#     url = "https://auth.openai.com/api/accounts/user/register"
-#
-#     headers = session.get_auth_headers(referer="https://auth.openai.com/create-account/password")
-#     headers["openai-sentinel-token"] = sentinel_header
-#
-#     body = json.dumps({
-#         "password": password,
-#         "username": email,
-#     })
-#
-#     logger.info(f"[步骤7] 提交注册请求, 邮箱: {email}")
-#     resp = session.post(url, headers=headers, data=body)
-#
-#     if resp.status_code != 200:
-#         logger.error(f"[步骤7] 请求失败, 状态码: {resp.status_code}")
-#         logger.error(f"[步骤7] 响应内容: {resp.text}")
-#         resp.raise_for_status()
-#
-#     data = resp.json()
-#     logger.info(f"[步骤7] 注册请求成功: {data.get('page', {}).get('type')}")
-#     return data
-
-
-# def send_email_otp(session: BrowserSession) -> None:
-#     """
-#     [备用] 步骤8: 触发发送邮箱验证码。
-#     GET https://auth.openai.com/api/accounts/email-otp/send
-#     """
-#     url = "https://auth.openai.com/api/accounts/email-otp/send"
-#
-#     headers = session.get_auth_navigate_headers(referer="https://auth.openai.com/create-account/password")
-#     headers["sec-fetch-site"] = "same-origin"
-#     headers["sec-fetch-user"] = "?1"
-#
-#     logger.info("[步骤8] 触发发送邮箱验证码...")
-#     resp = session.get(url, headers=headers, allow_redirects=True)
-#     logger.info(f"[步骤8] 验证码发送请求完成, 状态码: {resp.status_code}")
-
-
-def navigate_about_you(session: BrowserSession, about_url: str | None = None) -> str:
-    """进入 about-you 页面状态；服务端未返回 continue_url 时使用默认页面 URL 兜底。"""
-    url = str(about_url or "https://auth.openai.com/about-you")
-    if url.startswith("/"):
-        url = "https://auth.openai.com" + url
-    headers = session.get_auth_navigate_headers(referer="https://auth.openai.com/email-verification")
-    headers["sec-fetch-site"] = "same-origin"
-    logger.info("[步骤10.5] 导航到 about-you 页面，建立资料页状态")
-    resp = session.get(url, headers=headers, allow_redirects=True)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"about-you 导航失败 status={resp.status_code}: {(resp.text or '')[:240]}")
-    final_url = str(getattr(resp, "url", "") or url)
-    if "/api/accounts/user/register" in final_url or "/create-account/password" in final_url:
-        raise RuntimeError(f"about-you 导航落入旧密码注册路径: {final_url}")
-    logger.info(f"[步骤10.5] about-you 导航完成，落点: {final_url}")
-    return final_url
 
 
 def send_email_otp(session: BrowserSession, referer: str = "https://auth.openai.com/email-verification") -> None:

@@ -13,7 +13,7 @@ from core.chrome_cdp_driver import build_chrome_cdp_driver
 from core.email_provider import resolve_email_source, wait_for_otp
 from registration.drivers.roxy.implementation import (
     RegistrationPasswordSubmissionError,
-    _safe_exception_text,
+    _diagnostic_text,
 )
 from core.humanize import delay as human_delay
 from registration.drivers.shared.selenium_steps import (
@@ -135,7 +135,7 @@ def run_chrome_cdp_registration(
                         otp_attempt + 1,
                         max_otp_attempts,
                         type(exc).__name__,
-                        _safe_exception_text(exc, 180),
+                        _diagnostic_text(exc, 180),
                     )
                     otp_after_ts = time.time()
                     _click_resend_email_otp(driver, timeout=25)
@@ -152,7 +152,7 @@ def run_chrome_cdp_registration(
             except Exception as exc:
                 logger.info(
                     "[Chrome注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s",
-                    _safe_exception_text(exc, 120),
+                    _diagnostic_text(exc, 120),
                 )
 
             outcome = _wait_after_email_otp_submit(driver, timeout=10)
@@ -209,9 +209,9 @@ def run_chrome_cdp_registration(
                     raise RuntimeError("2FA 激活后未返回 TOTP secret")
                 logger.info("[Chrome注册] 2FA 设置完成：%s", email)
             except Exception as exc:
-                logger.error("[Chrome注册] 2FA 设置失败：%s: %s", type(exc).__name__, _safe_exception_text(exc))
+                logger.error("[Chrome注册] 2FA 设置失败：%s: %s", type(exc).__name__, _diagnostic_text(exc))
                 raise RuntimeError(
-                    f"Chrome 注册已创建密码，但 2FA 设置失败：{type(exc).__name__}: {_safe_exception_text(exc, 180)}"
+                    f"Chrome 注册已创建密码，但 2FA 设置失败：{type(exc).__name__}: {_diagnostic_text(exc, 180)}"
                 ) from exc
 
             # The verification helper starts a separate Chrome profile and
@@ -258,7 +258,7 @@ def run_chrome_cdp_registration(
             "error": None,
         }
     except Exception as exc:
-        logger.error("[Chrome注册] 失败：%s: %s", type(exc).__name__, _safe_exception_text(exc))
+        logger.error("[Chrome注册] 失败：%s: %s", type(exc).__name__, _diagnostic_text(exc))
         try:
             from core.email_provider import release_email
 
@@ -266,14 +266,14 @@ def run_chrome_cdp_registration(
                 email,
                 status=("disabled" if isinstance(exc, RegistrationPasswordSubmissionError)
                         else "failed" if create_acknowledged else "available"),
-                note=f"Chrome注册失败: {_safe_exception_text(exc, 180)}",
+                note=f"Chrome注册失败: {_diagnostic_text(exc, 180)}",
             )
         except Exception:
             pass
         return {
             "success": False,
             "email": email,
-            "error": f"{type(exc).__name__}: {_safe_exception_text(exc, 300)}",
+            "error": f"{type(exc).__name__}: {_diagnostic_text(exc, 300)}",
         }
     finally:
         if driver is not None:

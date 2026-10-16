@@ -29,9 +29,9 @@ class BrowserResponse:
 
     def raise_for_status(self) -> None:
         if not 200 <= self.status_code < 400:
-            # OAuth callback URLs, response bodies, and response headers may
-            # contain session material. Never include them in an exception.
-            raise RuntimeError(f"浏览器请求失败：HTTP {self.status_code}")
+            raise RuntimeError(
+                f"浏览器请求失败：HTTP {self.status_code}; url={self.url}; payload={self.payload!r}"
+            )
 
 
 class BrowserBacked2FASession:
