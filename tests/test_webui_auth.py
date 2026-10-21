@@ -45,7 +45,7 @@ class WebUiAuthTests(unittest.TestCase):
         dist_index = Path(__file__).resolve().parents[1] / "web" / "dist" / "index.html"
         if dist_index.is_file():
             self.assertEqual(r.status_code, 200)
-            self.assertIn("ChatGPT 注册机", r.get_data(as_text=True))
+            self.assertIn("GPT 工作台", r.get_data(as_text=True))
             self.assertIn("/assets/index-", r.get_data(as_text=True))
 
     def test_login_serves_react_entry_when_bundle_exists(self):
@@ -53,7 +53,7 @@ class WebUiAuthTests(unittest.TestCase):
         if dist_index.is_file():
             r = self.client.get("/login")
             self.assertEqual(r.status_code, 200)
-            self.assertIn("ChatGPT 注册机", r.get_data(as_text=True))
+            self.assertIn("GPT 工作台", r.get_data(as_text=True))
             bad = self.client.post("/login?next=%2F", data={"auth_code": "wrong"})
             self.assertEqual(bad.status_code, 302)
             self.assertIn("error=invalid", bad.headers.get("Location", ""))

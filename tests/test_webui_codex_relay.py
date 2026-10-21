@@ -27,7 +27,8 @@ class CodexRelayWebUiTests(unittest.TestCase):
             patcher.start()
         relay._browser_controls.clear()
         relay._phone_locks.clear()
-        self.client = create_app(auth_code="test-auth").test_client()
+        with patch.dict("os.environ", {"TURB_SQLITE_PATH": str(root / "app.sqlite3")}):
+            self.client = create_app(auth_code="test-auth").test_client()
         self.client.environ_base["HTTP_X_AUTH_CODE"] = "test-auth"
 
     def tearDown(self):
@@ -399,6 +400,28 @@ class CodexRelayWebUiTests(unittest.TestCase):
         response = self.client.delete(f"/api/codex-relay/sub2-services/{service['id']}")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.client.get("/api/codex-relay/sub2-services").get_json()["total"], 0)
+
+    def test_codex_relay_jobs_route_forwards_selected_sub2_service(self):
+        with patch.object(relay, "start_jobs", return_value={"ok": True, "submitted": 1, "jobs": []}) as start:
+            response = self.client.post("/api/codex-relay/jobs", json={
+                "account_ids": ["gpt-sub2"], "workers": 2, "sub2_service_id": "service-1",
+            })
+
+        self.assertEqual(response.status_code, 200)
+        start.assert_called_once_with(
+            ["gpt-sub2"], workers=2, phone_ids=[], sub2_service_id="service-1",
+        )
+
+    def test_codex_relay_jobs_route_keeps_sub2_service_optional_for_api_clients(self):
+        with patch.object(relay, "start_jobs", return_value={"ok": True, "submitted": 1, "jobs": []}) as start:
+            response = self.client.post("/api/codex-relay/jobs", json={
+                "account_ids": ["gpt-local"], "workers": 1,
+            })
+
+        self.assertEqual(response.status_code, 200)
+        start.assert_called_once_with(
+            ["gpt-local"], workers=1, phone_ids=[], sub2_service_id="",
+        )
 
     def test_selected_accounts_are_imported_to_saved_sub2_service(self):
         self.client.post("/api/codex-relay/import", json={

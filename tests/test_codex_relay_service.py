@@ -2,10 +2,11 @@ import json
 import stat
 import threading
 import time
+from contextlib import nullcontext
 
 import pytest
 
-from core import codex_relay_service as relay
+from core import codex_relay_service as relay, sqlite_store
 
 
 @pytest.fixture
@@ -13,6 +14,7 @@ def relay_storage(tmp_path, monkeypatch):
     monkeypatch.setattr(relay, "_ACCOUNTS_PATH", tmp_path / "accounts.json")
     monkeypatch.setattr(relay, "_PHONES_PATH", tmp_path / "phones.json")
     monkeypatch.setattr(relay, "_JOBS_PATH", tmp_path / "jobs.json")
+    monkeypatch.setattr(relay, "_SUB2_SERVICES_PATH", tmp_path / "sub2-services.json")
     monkeypatch.setattr(relay, "_LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(relay, "_CREDENTIAL_DIR", tmp_path / "codex_accounts")
     relay._stop_events.clear()
@@ -22,6 +24,149 @@ def relay_storage(tmp_path, monkeypatch):
     relay._browser_controls.clear()
     relay._phone_locks.clear()
     return tmp_path
+
+
+def test_auto_sub2_sync_helper_imports_selected_service(relay_storage, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        relay,
+        "import_accounts_to_sub2",
+        lambda account_ids, service_id: calls.append((account_ids, service_id)) or {
+            "ok": True, "failed": 0, "note_failed": 0, "local_skipped": 0,
+        },
+    )
+
+    result = relay._sync_authorized_account_to_sub2("account-1", "service-1")
+
+    assert result["ok"] is True
+    assert calls == [(["account-1"], "service-1")]
+
+
+def test_auto_sub2_sync_helper_rejects_partial_import(relay_storage, monkeypatch):
+    monkeypatch.setattr(
+        relay,
+        "import_accounts_to_sub2",
+        lambda *_args: {"ok": True, "failed": 1, "errors": [{"error": "remote rejected"}]},
+    )
+
+    with pytest.raises(relay.Sub2SyncError, match="remote rejected"):
+        relay._sync_authorized_account_to_sub2("account-1", "service-1")
+
+
+def test_start_jobs_rejects_unknown_sub2_service_before_enqueuing(relay_storage, monkeypatch):
+    relay.import_accounts("sync@example.com----https://mail.example/code")
+    account = relay._read(relay._ACCOUNTS_PATH)[0]
+    monkeypatch.setattr(relay, "_run_job", lambda *_args: None)
+
+    with pytest.raises(ValueError, match="请选择已保存的 sub2api 服务"):
+        relay.start_jobs([account["id"]], sub2_service_id="missing-service")
+
+    assert relay._read(relay._JOBS_PATH) == []
+
+
+@pytest.mark.parametrize(
+    ("import_result", "expected_job_status", "expected_sync_status"),
+    [
+        ({"ok": True, "failed": 0, "note_failed": 0, "local_skipped": 0}, "success", "success"),
+        ({"ok": False, "failed": 1, "errors": [{"error": "remote rejected"}]}, "failed", "failed"),
+    ],
+)
+def test_authorization_imports_credential_to_selected_sub2_service(
+    relay_storage, monkeypatch, import_result, expected_job_status, expected_sync_status,
+):
+    relay.import_accounts("sync@example.com----https://mail.example/code")
+    account = relay._read(relay._ACCOUNTS_PATH)[0]
+    service = relay.save_sub2_service({
+        "name": "primary", "api_base": "https://sub2.example/api/v1", "admin_key": "test-key",
+    })
+    credential_path = relay._CREDENTIAL_DIR / "codex-sync@example.com.json"
+    sqlite_store.write_file(credential_path, json.dumps({
+        "email": account["email"], "access_token": "access", "refresh_token": "refresh",
+    }), category="codex_credentials")
+    relay._write(relay._JOBS_PATH, [{
+        "id": "job-sync", "account_id": account["id"], "email": account["email"],
+        "status": "pending", "stage": "queued", "sub2_service_id": service["id"],
+        "sub2_service_name": service["name"],
+    }])
+    monkeypatch.setattr(relay, "_email_provider", lambda *_args: lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(relay, "_totp_provider", lambda *_args: None)
+    monkeypatch.setattr(relay.sms_provider, "fixed_sms_context", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(relay, "_check_stopped", lambda _job_id: None)
+    sync_calls = []
+    monkeypatch.setattr(
+        relay,
+        "import_accounts_to_sub2",
+        lambda account_ids, service_id: sync_calls.append((account_ids, service_id)) or import_result,
+    )
+    monkeypatch.setattr(relay, "_append_log", lambda *_args, **_kwargs: None)
+    from core import codex_oauth, chatgpt_plan
+    monkeypatch.setattr(codex_oauth, "run_codex_oauth", lambda *_args, **_kwargs: {
+        "ok": True, "email": account["email"], "file_path": str(credential_path),
+    })
+    monkeypatch.setattr(chatgpt_plan, "check_codex_usage", lambda *_args, **_kwargs: {"ok": True})
+
+    relay._run_job("job-sync", account["id"], sub2_service_id=service["id"])
+
+    job = next(row for row in relay._read(relay._JOBS_PATH) if row["id"] == "job-sync")
+    stored = relay._get_account(account["id"])
+    assert sync_calls == [([account["id"]], service["id"])]
+    assert job["status"] == expected_job_status
+    assert job["sub2_status"] == expected_sync_status
+    assert job["sub2_service_id"] == service["id"]
+    assert stored["codex_status"] == "authorized"
+    assert stored["sub2_sync_status"] == ("synced" if expected_sync_status == "success" else "failed")
+
+
+def test_start_jobs_persists_selected_sub2_service(relay_storage, monkeypatch):
+    relay.import_accounts("sync@example.com----https://mail.example/code")
+    account = relay._read(relay._ACCOUNTS_PATH)[0]
+    service = relay.save_sub2_service({
+        "name": "primary", "api_base": "https://sub2.example/api/v1", "admin_key": "test-key",
+    })
+    monkeypatch.setattr(relay, "_run_job", lambda *_args: None)
+
+    result = relay.start_jobs([account["id"]], sub2_service_id=service["id"])
+
+    assert result["submitted"] == 1
+    job = relay._read(relay._JOBS_PATH)[0]
+    assert job["sub2_service_id"] == service["id"]
+    assert job["sub2_service_name"] == "primary"
+    assert relay._public_job(job)["sub2_service_name"] == "primary"
+    assert "admin_key" not in relay._public_job(job)
+
+
+def test_run_job_keeps_oauth_success_when_auto_sub2_sync_fails(relay_storage, monkeypatch):
+    relay.import_accounts("sync-failed@example.com----https://mail.example/code")
+    account = relay._read(relay._ACCOUNTS_PATH)[0]
+    credential_path = relay._CREDENTIAL_DIR / "codex-sync-failed@example.com.json"
+    sqlite_store.write_file(credential_path, json.dumps({
+        "email": account["email"], "access_token": "access", "refresh_token": "refresh",
+    }), category="codex_credentials")
+    relay._write(relay._JOBS_PATH, [{
+        "id": "job-sync-failed", "account_id": account["id"], "email": account["email"],
+        "status": "pending", "stage": "queued",
+    }])
+    monkeypatch.setattr(relay, "_email_provider", lambda *_args: lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(relay, "_totp_provider", lambda *_args: None)
+    monkeypatch.setattr(relay.sms_provider, "fixed_sms_context", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(relay, "_check_stopped", lambda _job_id: None)
+    monkeypatch.setattr(relay, "_sync_authorized_account_to_sub2", lambda *_args: (_ for _ in ()).throw(RuntimeError("sub2 unavailable")))
+    monkeypatch.setattr(relay, "_append_log", lambda *_args, **_kwargs: None)
+    from core import codex_oauth
+    monkeypatch.setattr(codex_oauth, "run_codex_oauth", lambda *_args, **_kwargs: {
+        "ok": True, "email": account["email"], "file_path": str(credential_path),
+    })
+
+    relay._run_job("job-sync-failed", account["id"], sub2_service_id="service-1")
+
+    job = next(row for row in relay._read(relay._JOBS_PATH) if row["id"] == "job-sync-failed")
+    stored = relay._get_account(account["id"])
+    assert job["status"] == "failed"
+    assert job["stage"] == "sub2_sync"
+    assert job["sub2_status"] == "failed"
+    assert "sub2 unavailable" in job["error"]
+    assert stored["codex_status"] == "authorized"
+    assert stored["sub2_sync_status"] == "failed"
 
 
 def test_gpt_liveness_refreshes_saved_rt_without_login_or_otp(relay_storage, monkeypatch):

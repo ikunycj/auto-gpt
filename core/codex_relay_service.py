@@ -109,6 +109,10 @@ class BrowserAssistTimeout(RuntimeError):
     pass
 
 
+class Sub2SyncError(RuntimeError):
+    """Codex OAuth succeeded, but the selected sub2api import did not."""
+
+
 class Sub2RemoteAccountNotFound(RuntimeError):
     pass
 
@@ -2807,7 +2811,8 @@ def _public_job(row: dict) -> dict:
     allowed = (
         "id", "account_id", "email", "action", "status", "stage", "message", "error",
         "result_file", "created_at", "started_at", "completed_at", "waiting_since",
-        "browser_url", "browser_assist_reason", "browser_focus_available",
+        "browser_url", "browser_assist_reason", "browser_focus_available", "sub2_service_id",
+        "sub2_service_name", "sub2_status", "sub2_error",
     )
     result = {key: row.get(key) for key in allowed if row.get(key) not in (None, "")}
     if result.get("message"):
@@ -3287,11 +3292,24 @@ def _oauth_failure_stage(message: str) -> str:
     return "failed"
 
 
+def _sync_authorized_account_to_sub2(account_id: str, service_id: str) -> dict:
+    """Import a verified local Codex credential into one saved sub2 service."""
+    result = import_accounts_to_sub2([str(account_id)], str(service_id or ""))
+    failed = int(result.get("failed") or 0)
+    note_failed = int(result.get("note_failed") or 0)
+    local_skipped = int(result.get("local_skipped") or 0)
+    if not result.get("ok") or failed or note_failed or local_skipped:
+        errors = [str(item.get("error") or item) for item in (result.get("errors") or [])]
+        raise Sub2SyncError("sub2api 注入失败：" + ("；".join(errors[:3]) or "服务返回失败"))
+    return result
+
+
 def _run_job(
     job_id: str,
     account_id: str,
     phone_override: dict | None = None,
     execution_slot: _ExecutionSlot | None = None,
+    sub2_service_id: str = "",
 ) -> None:
     account = _get_account(account_id)
     override = phone_override if isinstance(phone_override, dict) else {}
@@ -3407,21 +3425,54 @@ def _run_job(
                 consume_use=not bool(phone_state.get("consumed")),
             )
             phone_state["consumed"] = True
+        sub2_status = "not_requested"
+        sub2_error = ""
+        if sub2_service_id:
+            _update_job(job_id, stage="sub2_sync", message="Codex 授权完成，正在注入 sub2api")
+            try:
+                _sync_authorized_account_to_sub2(account_id, sub2_service_id)
+                sub2_status = "success"
+                _update_account(
+                    account_id,
+                    sub2_sync_status="synced",
+                    sub2_sync_error="",
+                    sub2_sync_at=_now(),
+                )
+            except Exception as exc:
+                sub2_status = "failed"
+                sub2_error = f"{type(exc).__name__}: {exc}"
+                _update_account(
+                    account_id,
+                    codex_status="authorized",
+                    sub2_sync_status="failed",
+                    sub2_sync_error=sub2_error,
+                    sub2_sync_at=_now(),
+                )
+                _append_log(job_id, f"Codex 授权已完成，但 sub2api 注入失败：{sub2_error}")
+        message = (
+            "Codex 授权完成，手机接码验证通过，RT 凭证已保存"
+            if phone_verified
+            else "Codex 授权完成，RT 凭证已保存"
+        )
+        if sub2_status == "success":
+            message += "并已注入 sub2api"
+        elif sub2_status == "failed":
+            message += "；sub2api 注入失败，请查看错误详情"
         _update_job(
             job_id,
-            status="success",
-            stage="done",
-            message=(
-                "Codex 授权完成，手机接码验证通过，RT 凭证已保存"
-                if phone_verified
-                else "Codex 授权完成，RT 凭证已保存"
-            ),
+            status="failed" if sub2_status == "failed" else "success",
+            stage="sub2_sync" if sub2_status == "failed" else "done",
+            message=message,
+            sub2_status=sub2_status,
+            sub2_error=sub2_error,
             result_file=result.get("file_path") or "",
-            error="",
+            error=sub2_error,
             completed_at=_now(),
             waiting_since="",
         )
         _append_log(job_id, "Codex OAuth 完成，凭证已保存")
+        if sub2_status == "success":
+            _append_log(job_id, "sub2api 注入完成")
     except RelayStopped:
         _update_job(job_id, status="stopped", stage="stopped", message="任务已停止", completed_at=_now(), waiting_since="")
         if account:
@@ -3737,11 +3788,18 @@ def start_account_actions(account_ids: list[str], action: str, workers: int = 1)
     return {"ok": True, "submitted": len(jobs), "workers": workers, "action": action, "jobs": [_public_job(x) for x in jobs]}
 
 
-def start_jobs(account_ids: list[str], workers: int = 1, phone_ids: list[str] | None = None) -> dict:
+def start_jobs(
+    account_ids: list[str],
+    workers: int = 1,
+    phone_ids: list[str] | None = None,
+    sub2_service_id: str = "",
+) -> dict:
     ids = list(dict.fromkeys(str(x) for x in account_ids if x))
     if not ids:
         raise ValueError("请先选择账号")
     workers = max(1, min(8, int(workers or 1)))
+    sub2_service_id = str(sub2_service_id or "").strip()
+    sub2_service = _sub2_service(sub2_service_id) if sub2_service_id else None
     jobs: list[dict] = []
     with _LOCK:
         accounts = _read(_ACCOUNTS_PATH)
@@ -3796,6 +3854,8 @@ def start_jobs(account_ids: list[str], workers: int = 1, phone_ids: list[str] | 
                 "stage": "queued",
                 "message": "等待执行",
                 "created_at": _now(),
+                "sub2_service_id": sub2_service_id,
+                "sub2_service_name": str((sub2_service or {}).get("name") or ""),
             }
             # 手机号只在 OAuth 页面实际要求短信时才分配，避免无手机验证的账号
             # 提前占用号码，也避免号码池数量被任务数错误卡死。
@@ -3842,6 +3902,7 @@ def start_jobs(account_ids: list[str], workers: int = 1, phone_ids: list[str] | 
                     job["account_id"],
                     job.get("phone_override"),
                     slots[job["id"]],
+                    job.get("sub2_service_id") or "",
                 )
                 for job in jobs
             ]

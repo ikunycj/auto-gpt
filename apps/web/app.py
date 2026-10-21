@@ -2457,6 +2457,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 data.get("account_ids") or [],
                 workers=data.get("workers") or 1,
                 phone_ids=data.get("phone_ids") or [],
+                sub2_service_id=data.get("sub2_service_id") or "",
             )
             return jsonify(result)
         except Exception as exc:

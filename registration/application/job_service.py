@@ -302,84 +302,86 @@ def _run_one_job(job_id: int, log_file: str) -> None:
 
     email: str | None = None
     try:
+        # Keep the per-job handler attached while failures and stops are logged.
         with _JobLogContext(log_file):
-            # Bind a framework-neutral signal so optional browser drivers do
-            # not need to import this Web task service.
-            from registration.application.use_case import run_registration
-            log_logger.info(f"[Job {job_id}] 开始注册任务")
-            email, name, birthday = _prepare_registration_args()
-            db.update_job(job_id, email=email)
-            check_stop_requested()
-            with bind_stop_signal(CallbackStopSignal(lambda: is_stop_requested(job_id))):
-                result = run_registration(email=email, name=name, birthday=birthday)
-            if is_stop_requested(job_id):
-                _release_unconsumed_job_email(email, "用户手动停止")
+            try:
+                # Bind a framework-neutral signal so optional browser drivers do
+                # not need to import this Web task service.
+                from registration.application.use_case import run_registration
+                log_logger.info(f"[Job {job_id}] 开始注册任务")
+                email, name, birthday = _prepare_registration_args()
+                db.update_job(job_id, email=email)
+                check_stop_requested()
+                with bind_stop_signal(CallbackStopSignal(lambda: is_stop_requested(job_id))):
+                    result = run_registration(email=email, name=name, birthday=birthday)
+                if is_stop_requested(job_id):
+                    _release_unconsumed_job_email(email, "用户手动停止")
+                    db.update_job(
+                        job_id,
+                        status="stopped",
+                        error="用户手动停止",
+                        completed_at=datetime.now().isoformat(timespec="seconds"),
+                    )
+                    log_logger.warning(f"[Job {job_id}] 已按用户请求停止")
+                    return
+                if isinstance(result, dict) and result.get("success"):
+                    db.update_job(
+                        job_id,
+                        status="success",
+                        email=result.get("email"),
+                        account_id=result.get("account_id"),
+                        completed_at=datetime.now().isoformat(timespec="seconds"),
+                    )
+                    log_logger.info(f"[Job {job_id}] 成功: {result.get('email')}")
+                else:
+                    # 注意：失败也可能伴随 account_id（如 Codex 失败但账号已注册成功）
+                    err = (result or {}).get("error") if isinstance(result, dict) else "unknown"
+                    result_email = (result or {}).get("email") if isinstance(result, dict) else None
+                    db.update_job(
+                        job_id,
+                        status="failed",
+                        email=result_email,
+                        account_id=(result or {}).get("account_id") if isinstance(result, dict) else None,
+                        error=str(err)[:500],
+                        completed_at=datetime.now().isoformat(timespec="seconds"),
+                    )
+                    email_to_handle = str(result_email or email or "").strip()
+                    if _should_disable_failed_registration_email(err):
+                        _disable_job_email(email_to_handle, str(err))
+                    else:
+                        _release_unconsumed_job_email(email_to_handle, str(err))
+                    log_logger.error(f"[Job {job_id}] 失败: {err}")
+            except StopRequested as exc:
+                _release_unconsumed_job_email(email, str(exc))
+                log_logger.warning(f"[Job {job_id}] 已停止: {exc}")
                 db.update_job(
                     job_id,
                     status="stopped",
                     error="用户手动停止",
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
-                log_logger.warning(f"[Job {job_id}] 已按用户请求停止")
-                return
-            if isinstance(result, dict) and result.get("success"):
-                db.update_job(
-                    job_id,
-                    status="success",
-                    email=result.get("email"),
-                    account_id=result.get("account_id"),
-                    completed_at=datetime.now().isoformat(timespec="seconds"),
-                )
-                log_logger.info(f"[Job {job_id}] 成功: {result.get('email')}")
-            else:
-                # 注意：失败也可能伴随 account_id（如 Codex 失败但账号已注册成功）
-                err = (result or {}).get("error") if isinstance(result, dict) else "unknown"
-                result_email = (result or {}).get("email") if isinstance(result, dict) else None
+            except Exception as exc:
+                err_text = f"{type(exc).__name__}: {exc}"
+                if _should_disable_failed_registration_email(err_text):
+                    _disable_job_email(email, err_text)
+                else:
+                    _release_unconsumed_job_email(email, err_text)
+                if is_stop_requested(job_id):
+                    log_logger.warning(f"[Job {job_id}] 停止中捕获异常，按停止处理: {type(exc).__name__}: {exc}")
+                    db.update_job(
+                        job_id,
+                        status="stopped",
+                        error="用户手动停止",
+                        completed_at=datetime.now().isoformat(timespec="seconds"),
+                    )
+                    return
+                log_logger.exception(f"[Job {job_id}] 异常")
                 db.update_job(
                     job_id,
                     status="failed",
-                    email=result_email,
-                    account_id=(result or {}).get("account_id") if isinstance(result, dict) else None,
-                    error=str(err)[:500],
+                    error=f"{type(exc).__name__}: {exc}"[:500],
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
-                email_to_handle = str(result_email or email or "").strip()
-                if _should_disable_failed_registration_email(err):
-                    _disable_job_email(email_to_handle, str(err))
-                else:
-                    _release_unconsumed_job_email(email_to_handle, str(err))
-                log_logger.error(f"[Job {job_id}] 失败: {err}")
-    except StopRequested as exc:
-        _release_unconsumed_job_email(email, str(exc))
-        log_logger.warning(f"[Job {job_id}] 已停止: {exc}")
-        db.update_job(
-            job_id,
-            status="stopped",
-            error="用户手动停止",
-            completed_at=datetime.now().isoformat(timespec="seconds"),
-        )
-    except Exception as exc:
-        err_text = f"{type(exc).__name__}: {exc}"
-        if _should_disable_failed_registration_email(err_text):
-            _disable_job_email(email, err_text)
-        else:
-            _release_unconsumed_job_email(email, err_text)
-        if is_stop_requested(job_id):
-            log_logger.warning(f"[Job {job_id}] 停止中捕获异常，按停止处理: {type(exc).__name__}: {exc}")
-            db.update_job(
-                job_id,
-                status="stopped",
-                error="用户手动停止",
-                completed_at=datetime.now().isoformat(timespec="seconds"),
-            )
-            return
-        log_logger.exception(f"[Job {job_id}] 异常")
-        db.update_job(
-            job_id,
-            status="failed",
-            error=f"{type(exc).__name__}: {exc}"[:500],
-            completed_at=datetime.now().isoformat(timespec="seconds"),
-        )
     finally:
         _deactivate_job(job_id)
 

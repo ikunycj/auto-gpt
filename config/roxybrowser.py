@@ -26,11 +26,12 @@ ROXY_API_TOKEN: str = env_str("ROXY_API_TOKEN", "")
 ROXY_PROFILE_ID: str = ""
 
 # Roxy 工作区 ID。Roxy 创建 Profile 时接口要求 workspaceId，必须填写。
-# 可在 Roxy 工作区/团队页面或 API 返回中查看。
-ROXY_WORKSPACE_ID: str = "90143"
+# 团队/项目属于当前 Roxy 账号，不得默认使用其他账号的 ID。
+ROXY_WORKSPACE_ID: str = ""
 
-# Roxy 项目 ID。/browser/workspace 返回 project_details.projectId；创建 Profile 时一并提交。
-ROXY_PROJECT_ID: str = "97471"
+# Roxy 项目 ID。请从上述团队的 /browser/workspace project_details 中选择。
+# 留空表示不传 projectId，不得回退到其他团队的项目。
+ROXY_PROJECT_ID: str = ""
 
 # 获取团队/工作区列表接口路径。不同版本若不同，可在 WebUI 修改；客户端也会自动尝试多个常见路径。
 ROXY_WORKSPACE_LIST_PATH: str = "/browser/workspace"

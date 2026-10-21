@@ -430,7 +430,7 @@ CPA_MANAGEMENT_KEY = "你的CPA管理密钥"
 ./webui.sh logs       # 查看实时日志
 ```
 
-脚本固定启动 `http://127.0.0.1:5000`；PID 文件位于 `data/runtime/`，日志正文写入 SQLite。
+脚本固定启动前端 `http://127.0.0.1:5555` 和 Flask 后端 `http://127.0.0.1:6666`；PID 文件位于 `data/runtime/`，日志正文写入 SQLite。
 
 可通过环境变量调整授权码和是否自动打开浏览器；地址和端口不可修改：
 
@@ -450,7 +450,7 @@ python web.py --open-browser
 默认地址：
 
 ```text
-http://127.0.0.1:5000
+http://127.0.0.1:5555
 ```
 
 WebUI 页面说明：
@@ -784,6 +784,6 @@ ROXY_OPEN_HEADLESS = False
 ---
 ## React WebUI
 
-The WebUI is built from the React application in [`web/`](web/). Flask serves the checked-in `web/dist/` bundle at `http://127.0.0.1:5000/` and keeps all existing `/api/*` endpoints, session authentication, and download behavior. The previous Flask template frontend has been removed.
+The WebUI is built from the React application in [`web/`](web/), with React Router providing URL-based navigation. Vite serves the frontend at `http://127.0.0.1:5555/` and proxies same-origin API requests to Flask at `http://127.0.0.1:6666`; the Flask app retains the existing `/api/*` endpoints, session authentication, and download behavior.
 
-For frontend development, see [`web/README.md`](web/README.md). The repository WebUI listener remains the single `http://127.0.0.1:5000` process managed by `./webui.sh`.
+For frontend development, see [`web/README.md`](web/README.md). Both local listeners are managed by `./webui.sh`.
