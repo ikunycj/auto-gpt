@@ -756,37 +756,55 @@ def _handle_totp_challenge_if_present(
 
     if not callable(totp_provider):
         raise RuntimeError("账号要求 2FA，但没有可用的 TOTP 提供器")
-    code = str(totp_provider() or "").strip()
-    if not code:
-        raise RuntimeError("TOTP 提供器未返回验证码")
-    _clear_otp_inputs(driver)
-    _type_otp(driver, code)
-    if not _click_if_present(driver, [
-        "button[type='submit']",
-        "//button[contains(., 'Continue')]",
-        "//button[contains(., '继续')]",
-        "//button[contains(., 'Verify')]",
-        "//button[contains(., '验证')]",
-    ], timeout=8):
-        raise RuntimeError("未找到 2FA 提交按钮")
-    logger.info("[Codex][Browser] 已识别 MFA 页面并提交本地生成的 2FA 验证码")
+    max_totp_attempts = 3
+    for attempt in range(1, max_totp_attempts + 1):
+        code = str(totp_provider() or "").strip()
+        if not code:
+            raise RuntimeError("TOTP 提供器未返回验证码")
+        _clear_otp_inputs(driver)
+        _type_otp(driver, code)
+        if not _click_if_present(driver, [
+            "button[type='submit']",
+            "//button[contains(., 'Continue')]",
+            "//button[contains(., '继续')]",
+            "//button[contains(., 'Verify')]",
+            "//button[contains(., '验证')]",
+        ], timeout=8):
+            raise RuntimeError("未找到 2FA 提交按钮")
+        logger.info("[Codex][Browser] 已提交第 %s/%s 次 2FA 验证码", attempt, max_totp_attempts)
 
-    transition_end = time.time() + max(1, transition_timeout)
-    while time.time() < transition_end:
-        text = _page_text(driver)
-        _raise_account_unusable_page_error(text, driver=driver)
-        if not _is_totp_challenge_page(driver):
-            logger.info("[Codex][Browser] 2FA 验证通过，继续检查手机号或授权确认页")
-            return True
-        if any(marker in text for marker in (
-            "invalid code", "incorrect code", "wrong code", "expired",
-            "验证码错误", "验证码无效", "验证码已过期", "コードが正しく", "無効",
-        )):
-            raise RuntimeError("2FA 验证码错误或已过期")
-        time.sleep(0.5)
-    # Do not lose a server error that arrived during the final polling sleep.
-    _raise_account_unusable_page_error(_page_text(driver), driver=driver)
-    raise RuntimeError("提交 2FA 后页面未跳转，仍停留在 MFA 验证页")
+        transition_end = time.time() + max(1, transition_timeout)
+        retry_with_fresh_code = False
+        while time.time() < transition_end:
+            text = _page_text(driver)
+            _raise_account_unusable_page_error(text, driver=driver)
+            if not _is_totp_challenge_page(driver):
+                logger.info("[Codex][Browser] 2FA 验证通过，继续检查手机号或授权确认页")
+                return True
+            if any(marker in text for marker in (
+                "invalid code", "incorrect code", "wrong code", "expired",
+                "invalid verification code", "incorrect verification code",
+                "验证码错误", "验证码无效", "验证码已过期", "代码无效",
+                "コードが正しく", "無効",
+            )):
+                if attempt >= max_totp_attempts:
+                    raise RuntimeError("2FA 验证码连续错误/过期，已达到最大重试次数")
+                logger.warning(
+                    "[Codex][Browser] 2FA 验证码错误/过期，重新获取后重试（%s/%s）",
+                    attempt + 1,
+                    max_totp_attempts,
+                )
+                retry_with_fresh_code = True
+                break
+            time.sleep(0.5)
+
+        if retry_with_fresh_code:
+            continue
+        # Do not lose a server error that arrived during the final polling sleep.
+        _raise_account_unusable_page_error(_page_text(driver), driver=driver)
+        raise RuntimeError("提交 2FA 后页面未跳转，仍停留在 MFA 验证页")
+
+    raise RuntimeError("2FA 验证码连续错误/过期，已达到最大重试次数")
 
 
 def _fill_email_and_otp(

@@ -15,7 +15,7 @@ import WorkspaceBrowser from './components/WorkspaceBrowser';
 
 const NAV = [
   { id: 'email', label: '邮箱账号', caption: '待注册邮箱', icon: Inbox },
-  { id: 'gpt', label: 'GPT账号', caption: '已注册与授权', icon: Users },
+  { id: 'gpt', label: 'Codex授权', caption: '已注册与授权', icon: Users },
   { id: 'phones', label: '手机号', caption: '接码号码', icon: Smartphone },
   { id: 'proxy', label: '代理IP', caption: '代理池与出口测试', icon: Network },
   { id: 'settings', label: '设置', caption: '运行参数', icon: Settings2 },

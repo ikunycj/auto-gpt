@@ -364,6 +364,39 @@ def test_roxy_authorize_mfa_takes_precedence_over_email_otp(monkeypatch):
     assert submitted == ["generated-locally"]
 
 
+def test_totp_challenge_fetches_a_new_code_after_expired_code(monkeypatch):
+    driver = FakeDriver()
+    driver.current_url = "https://auth.openai.com/mfa-challenge/session"
+    driver.submit_count = 0
+    codes = iter(("123456", "654321"))
+    typed = []
+
+    monkeypatch.setattr(browser_oauth, "install_auth_error_observer", lambda _driver: None)
+    monkeypatch.setattr(browser_oauth, "_raise_account_unusable_page_error", lambda _text, **_kwargs: None)
+    monkeypatch.setattr(browser_oauth, "_is_totp_challenge_page", lambda _driver: driver.submit_count < 2)
+    monkeypatch.setattr(browser_oauth, "_page_text", lambda _driver: (
+        "authenticator code expired" if driver.submit_count == 1 else "authenticator code"
+    ))
+    monkeypatch.setattr(browser_oauth, "_clear_otp_inputs", lambda _driver: None)
+    monkeypatch.setattr(browser_oauth, "_type_otp", lambda _driver, code: typed.append(code))
+    monkeypatch.setattr(
+        browser_oauth,
+        "_click_if_present",
+        lambda *_args, **_kwargs: setattr(driver, "submit_count", driver.submit_count + 1) or True,
+    )
+
+    result = browser_oauth._handle_totp_challenge_if_present(
+        driver,
+        lambda: next(codes),
+        detection_timeout=0,
+        transition_timeout=1,
+        already_detected=True,
+    )
+
+    assert result is True
+    assert typed == ["123456", "654321"]
+
+
 def test_password_challenge_fails_when_page_never_leaves_password_step(monkeypatch):
     monkeypatch.setattr(browser_oauth, "_page_text", lambda _driver: "")
     monkeypatch.setattr(browser_oauth, "_is_email_verification_page", lambda _driver: False)
