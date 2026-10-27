@@ -234,16 +234,103 @@ def test_callback_timeout_keeps_location_but_hides_query(monkeypatch):
 
 def test_totp_challenge_uses_local_provider_without_logging_code(monkeypatch, caplog):
     typed = []
-    monkeypatch.setattr(browser_oauth, "_page_text", lambda _driver: "enter the code from your authenticator app")
+    driver = FakeDriver()
+    driver.submitted = False
+
+    def page_text(_driver):
+        return "continue to workspace" if driver.submitted else "enter the code from your authenticator app"
+
+    monkeypatch.setattr(browser_oauth, "_page_text", page_text)
     monkeypatch.setattr(browser_oauth, "_type_otp", lambda _driver, code: typed.append(code))
-    monkeypatch.setattr(browser_oauth, "_click_if_present", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(browser_oauth, "_clear_otp_inputs", lambda _driver: None)
+    monkeypatch.setattr(browser_oauth, "_click_if_present", lambda *_args, **_kwargs: setattr(driver, "submitted", True) or True)
 
     with caplog.at_level("INFO"):
-        outcome = browser_oauth._post_password_challenge(FakeDriver(), lambda: "987654", timeout=1)
+        outcome = browser_oauth._post_password_challenge(driver, lambda: "987654", timeout=1)
 
     assert outcome == "next"
     assert typed == ["987654"]
     assert "987654" not in caplog.text
+
+
+def test_totp_challenge_fetches_fresh_code_after_expired_submission(monkeypatch):
+    driver = FakeDriver()
+    driver.current_url = "https://auth.openai.com/authorize"
+    submissions = 0
+    codes = iter(("123456", "654321"))
+    typed = []
+
+    def page_text(_driver):
+        if submissions == 0:
+            return "enter the code from your authenticator app"
+        if submissions == 1:
+            return "invalid code"
+        return "continue to workspace"
+
+    def click(*_args, **_kwargs):
+        nonlocal submissions
+        submissions += 1
+        if submissions == 2:
+            driver.current_url = "https://auth.openai.com/workspace/select"
+        return True
+
+    monkeypatch.setattr(browser_oauth, "_page_text", page_text)
+    monkeypatch.setattr(browser_oauth, "_clear_otp_inputs", lambda _driver: None)
+    monkeypatch.setattr(browser_oauth, "_type_otp", lambda _driver, code: typed.append(code))
+    monkeypatch.setattr(browser_oauth, "_click_if_present", click)
+
+    result = browser_oauth._post_password_challenge(driver, lambda: next(codes), timeout=2)
+
+    assert result == "next"
+    assert typed == ["123456", "654321"]
+
+
+def test_totp_challenge_does_not_resubmit_the_same_code(monkeypatch):
+    driver = FakeDriver()
+    driver.current_url = "https://auth.openai.com/mfa-challenge/session"
+    submissions = 0
+    codes = iter(("123456", "123456", "654321"))
+    typed = []
+
+    def page_text(_driver):
+        if submissions < 1:
+            return "enter the code from your authenticator app"
+        if submissions == 1:
+            return "the code you entered is incorrect"
+        return "continue to workspace"
+
+    def click(*_args, **_kwargs):
+        nonlocal submissions
+        submissions += 1
+        if submissions == 2:
+            driver.current_url = "https://auth.openai.com/workspace/select"
+        return True
+
+    monkeypatch.setattr(browser_oauth, "_page_text", page_text)
+    monkeypatch.setattr(browser_oauth, "_clear_otp_inputs", lambda _driver: None)
+    monkeypatch.setattr(browser_oauth, "_type_otp", lambda _driver, code: typed.append(code))
+    monkeypatch.setattr(browser_oauth, "_click_if_present", click)
+    monkeypatch.setattr(browser_oauth.time, "sleep", lambda _seconds: None)
+
+    result = browser_oauth._post_password_challenge(driver, lambda: next(codes), timeout=2)
+
+    assert result == "next"
+    assert typed == ["123456", "654321"]
+
+
+def test_totp_challenge_does_not_retry_when_submission_result_is_ambiguous(monkeypatch):
+    driver = FakeDriver()
+    driver.current_url = "https://auth.openai.com/mfa-challenge/session"
+    typed = []
+    monkeypatch.setattr(browser_oauth, "_page_text", lambda _driver: "authenticator app")
+    monkeypatch.setattr(browser_oauth, "_clear_otp_inputs", lambda _driver: None)
+    monkeypatch.setattr(browser_oauth, "_type_otp", lambda _driver, code: typed.append(code))
+    monkeypatch.setattr(browser_oauth, "_click_if_present", lambda *_args, **_kwargs: True)
+
+    with pytest.raises(RuntimeError, match="未返回明确结果"):
+        browser_oauth._post_password_challenge(driver, lambda: "123456", timeout=0.05)
+
+    assert typed == ["123456"]
 
 
 def test_password_challenge_fails_when_page_never_leaves_password_step(monkeypatch):

@@ -474,32 +474,138 @@ def _submit_login_password(driver, password: str, timeout: int = 25) -> str:
     )
 
 
-def _post_password_challenge(driver, totp_provider, timeout: int = 25) -> str:
-    """Handle TOTP when shown; otherwise tell the caller whether email OTP is needed."""
-    end = time.time() + timeout
+_TOTP_PAGE_MARKERS = (
+    "authenticator", "authentication app", "two-factor", "2fa",
+    "验证器", "身份验证器", "双重验证", "两步验证", "認証アプリ",
+)
+_TOTP_ERROR_MARKERS = (
+    "invalid code", "incorrect code", "wrong code", "code is invalid",
+    "code was invalid", "invalid verification code", "incorrect verification code",
+    "code is incorrect", "the code is incorrect", "the code you entered is incorrect",
+    "invalid one-time password", "incorrect one-time password",
+    "expired code", "expired", "验证码错误", "验证码无效", "验证码已过期",
+    "代码无效", "コードが正しく", "無効", "期限切れ",
+)
+
+
+def _is_totp_error(text: str) -> bool:
+    lower = str(text or "").lower()
+    return any(marker in lower for marker in _TOTP_ERROR_MARKERS)
+
+
+def _has_totp_error(driver, text: str) -> bool:
+    if _is_totp_error(text):
+        return True
+    try:
+        state = _email_otp_page_state(driver)
+        if any(str(item.get("ariaInvalid") or "").lower() == "true" for item in (state.get("inputs") or [])):
+            return True
+        return bool(state.get("errors"))
+    except Exception:
+        return False
+
+
+def _get_fresh_totp_code(totp_provider, used_codes: set[str], timeout: float = 35) -> str:
+    """Get a TOTP value that has not already been submitted in this challenge."""
+    deadline = time.time() + max(1.0, float(timeout))
+    while True:
+        code = str(totp_provider() or "").strip()
+        if not code:
+            raise RuntimeError("TOTP 提供器未返回验证码")
+        if code not in used_codes:
+            return code
+        if time.time() >= deadline:
+            raise RuntimeError("等待新的 2FA 验证码超时，取码器仍返回已提交的旧验证码")
+        logger.info("[Codex][Browser] 取到已提交过的 2FA 验证码，等待新的动态码")
+        time.sleep(1)
+
+
+def _is_totp_challenge(driver, text: str | None = None) -> bool:
+    url = str(getattr(driver, "current_url", "") or "").lower()
+    if any(marker in url for marker in ("/mfa-challenge", "/totp-challenge", "/authenticator-challenge")):
+        return True
+    if "email-verification" in url:
+        return False
+    lower_text = str(_page_text(driver) if text is None else text).lower()
+    return any(marker in lower_text for marker in _TOTP_PAGE_MARKERS)
+
+
+def _wait_after_totp_submit(driver, timeout: float = 8) -> str:
+    """Return accepted, invalid, email_otp, or timeout after one TOTP submit."""
+    end = time.time() + max(0.1, float(timeout))
     while time.time() < end:
         url = str(getattr(driver, "current_url", "") or "").lower()
         text = _page_text(driver)
         _raise_explicit_password_page_error(text)
-        if any(x in url for x in ("phone", "workspace", "consent", "authorize", "localhost:1455")):
-            return "next"
-        is_totp = any(x in text for x in (
-            "authenticator", "authentication app", "two-factor", "2fa", "验证器", "身份验证器", "認証アプリ",
-        ))
+        if _has_totp_error(driver, text):
+            return "invalid"
+        if any(marker in url for marker in ("/workspace", "/consent", "localhost:1455")):
+            return "accepted"
+        is_totp = _is_totp_challenge(driver, text)
+        if not is_totp and _is_email_verification_page(driver):
+            return "email_otp"
+        if not is_totp:
+            return "accepted"
+        time.sleep(0.25)
+    return "timeout"
+
+
+def _post_password_challenge(driver, totp_provider, timeout: int = 25) -> str:
+    """Handle TOTP when shown; otherwise tell the caller whether email OTP is needed."""
+    end = time.time() + timeout
+    totp_attempt = 0
+    max_totp_attempts = 3
+    used_totp_codes: set[str] = set()
+    totp_retry_pending = False
+    while time.time() < end:
+        url = str(getattr(driver, "current_url", "") or "").lower()
+        text = _page_text(driver)
+        _raise_explicit_password_page_error(text)
+
+        # A challenge can remain on a generic /authorize route. Inspect the
+        # rendered MFA prompt before treating that route as an accepted step.
+        is_totp = totp_retry_pending or _is_totp_challenge(driver, text)
         if is_totp:
             if not callable(totp_provider):
                 raise RuntimeError("账号要求 2FA，但没有可用的 TOTP 提供器")
-            code = str(totp_provider() or "").strip()
-            if not code:
-                raise RuntimeError("TOTP 提供器未返回验证码")
+            if totp_attempt >= max_totp_attempts:
+                raise RuntimeError("2FA 验证码连续错误/过期，已达到最大重试次数")
+            totp_attempt += 1
+            code = _get_fresh_totp_code(totp_provider, used_totp_codes)
+            used_totp_codes.add(code)
+            _clear_otp_inputs(driver)
             _type_otp(driver, code)
             if not _click_if_present(driver, [
                 "button[type='submit']",
                 "//button[contains(., 'Continue')]",
                 "//button[contains(., '继续')]",
+                "//button[contains(., 'Verify')]",
+                "//button[contains(., '验证')]",
             ], timeout=8):
                 raise RuntimeError("未找到 2FA 提交按钮")
-            logger.info("[Codex][Browser] 已提交本地生成的 2FA 验证码")
+
+            logger.info("[Codex][Browser] 已提交第 %s/%s 次 2FA 验证码", totp_attempt, max_totp_attempts)
+            outcome = _wait_after_totp_submit(driver, timeout=min(8, max(0.1, end - time.time())))
+            if outcome == "accepted":
+                logger.info("[Codex][Browser] 2FA 验证通过")
+                return "next"
+            if outcome == "email_otp":
+                return "email_otp"
+            if outcome == "invalid":
+                if totp_attempt >= max_totp_attempts:
+                    raise RuntimeError("2FA 验证码连续错误/过期，已达到最大重试次数")
+                # Auth may keep the generic /authorize URL and replace the MFA
+                # prompt with only an error message; preserve the known step.
+                totp_retry_pending = True
+                logger.warning(
+                    "[Codex][Browser] 2FA 验证码错误/过期，重新获取后重试（%s/%s）",
+                    totp_attempt + 1,
+                    max_totp_attempts,
+                )
+                continue
+            raise RuntimeError("提交 2FA 后页面未返回明确结果，停止继续提交")
+
+        if any(x in url for x in ("phone", "workspace", "consent", "authorize", "localhost:1455")):
             return "next"
         if _is_email_verification_page(driver):
             return "email_otp"
