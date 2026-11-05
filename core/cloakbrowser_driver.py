@@ -120,6 +120,9 @@ class CloakElement:
         except Exception:
             return None
 
+    def get_property(self, name: str) -> Any:
+        return self._eval("(el, propertyName) => el[propertyName]", name)
+
 
 class _SwitchTo:
     def __init__(self, driver: "CloakSeleniumDriver"):

@@ -779,6 +779,26 @@ def test_failed_phone_material_is_marked_invalid_and_not_reused(relay_storage):
         relay._acquire_phone_for_job("job-two", account, [])
 
 
+def test_reimporting_invalid_phone_restores_sms_candidate(relay_storage):
+    relay.import_accounts("one@example.com----https://mail.example/one")
+    relay.import_phones("+14155550123----https://sms.example/code----2")
+    account = relay._read(relay._ACCOUNTS_PATH)[0]
+    phone = relay._read(relay._PHONES_PATH)[0]
+    relay._mark_phone_invalid(phone["id"], "短信验证码被拒绝")
+
+    assert relay.list_phones()[0]["candidate"] is False
+
+    result = relay.import_phones("+14155550123----https://sms.example/code----2")
+
+    assert result["updated"] == 1
+    restored = relay.list_phones()[0]
+    assert restored["invalid"] is False
+    assert restored["candidate"] is True
+    material = relay._acquire_phone_for_job("job-retry", account, [])
+    assert material["phone_id"] == phone["id"]
+    assert relay.list_phones()[0]["reserved"] is True
+
+
 def test_account_filters_cover_provider_status_and_materials(relay_storage):
     relay.import_accounts(
         "outlook@example.com----mailbox----client----refresh\n"

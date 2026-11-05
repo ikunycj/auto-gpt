@@ -262,11 +262,19 @@ def _fill_first_any_frame(page, selectors: list[str], value: str, timeout_ms: in
             try:
                 loc.scroll_into_view_if_needed(timeout=2000)
                 loc.click(timeout=2000)
+                logger.info(
+                    "[Codex][BrowserUse] 输入操作前：method=fill_any_frame selectors=%s length=%s",
+                    selectors, len(value),
+                )
                 loc.fill(value, timeout=5000)
                 return True
             except Exception as exc:
                 last_err = exc
                 try:
+                    logger.info(
+                        "[Codex][BrowserUse] 输入操作前：method=js_setter_any_frame selectors=%s length=%s",
+                        selectors, len(value),
+                    )
                     loc.evaluate(
                         """(el, value) => {
                           const proto = el.tagName === 'TEXTAREA'
@@ -284,12 +292,13 @@ def _fill_first_any_frame(page, selectors: list[str], value: str, timeout_ms: in
                     last_err = exc2
         time.sleep(0.25)
     if last_err:
-        logger.debug("[Codex][BrowserUse] fill any-frame failed: %s", last_err)
+        logger.debug("[Codex][BrowserUse] fill any-frame failed: %s", type(last_err).__name__)
     return False
 
 
 def _js_fill_email_fallback(page, email: str) -> bool:
     """最后兜底：在所有 frame 里扫描可见 input，填第一个疑似邮箱/用户名输入框。"""
+    logger.info("[Codex][BrowserUse] 输入操作前：field=email method=js_fallback length=%s", len(email))
     script = r"""
     (email) => {
       const isVisible = (el) => {
@@ -391,6 +400,7 @@ def _click_email_entry_fast(page) -> bool:
 
 
 def _fill_email_fast(page, email: str) -> bool:
+    logger.info("[Codex][BrowserUse] 输入操作前：field=email method=js_setter length=%s", len(email))
     script = r"""
     (email) => {
       const isVisible = (el) => {
@@ -721,7 +731,7 @@ def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_trac
             _restart_email_otp_flow("等待验证码超时，避免点击 resend 导致 500")
             continue
         used_codes.add(str(code))
-        logger.info("[Codex][BrowserUse] 邮箱 OTP 收到：%s", code)
+        logger.info("[Codex][BrowserUse] 邮箱 OTP 收到，准备输入：length=%s", len(code))
         _t_otp_submit = _StepTimer("提交邮箱 OTP")
         _clear_otp_inputs(page)
         _type_otp(page, code)
@@ -812,6 +822,10 @@ def _read_phone_input_value(page) -> str:
 
 
 def _force_set_phone_value(page, phone_e164: str) -> bool:
+    logger.info(
+        "[Codex][BrowserUse] 输入操作前：field=phone method=js_setter length=%s",
+        len(phone_e164),
+    )
     script = r"""
     (phone) => {
       const isVisible = (el) => {
@@ -1213,7 +1227,7 @@ def _do_phone_verification_if_present(page) -> None:
             _t_sms = _StepTimer(f"等待手机短信 attempt={attempt}")
             sms_code = sms_provider.wait_for_sms_code(activation_id, http)
             _t_sms.done()
-            logger.info("[Codex][BrowserUse] 手机 OTP 收到：%s", sms_code)
+            logger.info("[Codex][BrowserUse] 手机 OTP 收到，准备输入：length=%s", len(sms_code))
             _clear_otp_inputs(page)
             _type_otp(page, sms_code)
             _bu_delay("otp_input")

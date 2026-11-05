@@ -434,6 +434,7 @@ def _submit_login_password(driver, password: str, timeout: int = 25) -> str:
                 logger.info("[Codex][Browser] 密码输入框出现前已进入后续页面：%s", state)
                 return state
             field = _find_any(driver, selectors, timeout=2)
+            logger.info("[Codex][Browser] 输入操作前：field=password method=send_keys length=%s", len(password))
             field.clear()
             field.send_keys(password)
             human_delay("form")
@@ -1099,6 +1100,10 @@ def _set_phone_value(driver, phone: str, *, timeout: int = 10) -> dict:
     """
     if not _has_strict_add_phone_form(driver):
         raise RuntimeError(f"当前不是 add-phone 手机号输入页，不能填写手机号: state={_phone_page_state(driver)}")
+    logger.info(
+        "[Codex][Browser] 输入操作前：field=phone method=js_setter length=%s",
+        len(phone),
+    )
     result = driver.execute_script(r"""
     const rawPhone = String(arguments[0] || '').trim();
     const e164 = rawPhone.startsWith('+') ? rawPhone : ('+' + rawPhone.replace(/\D+/g, ''));
@@ -1531,7 +1536,7 @@ def _do_phone_verification_if_present(driver) -> bool:
                     activation_id, sms_provider._cfg.SMS_CODE_WAIT, sms_provider._cfg.SMS_POLL_INTERVAL
                 )
                 sms_code = sms_provider.wait_for_sms_code(activation_id, http)
-                logger.info("[Codex][Browser] 已收到手机 OTP")
+                logger.info("[Codex][Browser] 已收到手机 OTP，准备输入：length=%s", len(sms_code))
                 _type_otp(driver, sms_code)
                 logger.info("[Codex][Browser] 已填写手机 OTP")
                 human_delay("otp_input")

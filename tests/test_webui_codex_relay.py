@@ -185,6 +185,127 @@ class CodexRelayWebUiTests(unittest.TestCase):
         phones = self.client.get("/api/codex-relay/phones").get_json()["items"]
         self.assertEqual([phone["available_uses"] for phone in phones], [1, 2])
 
+    def test_phone_pool_can_edit_phone_link_and_available_uses(self):
+        response = self.client.post("/api/codex-relay/phones/import", json={
+            "text": "+14155550123----https://sms.example/old",
+        })
+        self.assertEqual(response.status_code, 200)
+        phone = self.client.get("/api/codex-relay/phones").get_json()["items"][0]
+
+        response = self.client.put(f"/api/codex-relay/phones/{phone['id']}", json={
+            "phone": "+14155550124",
+            "sms_code_url": "https://sms.example/new",
+            "available_uses": 3,
+        })
+
+        self.assertEqual(response.status_code, 200)
+        updated = response.get_json()["phone"]
+        self.assertEqual(updated["phone"], "+14155550124")
+        self.assertEqual(updated["sms_code_url"], "https://sms.example/new")
+        self.assertEqual(updated["available_uses"], 3)
+
+        listed = self.client.get("/api/codex-relay/phones").get_json()["items"][0]
+        self.assertEqual(listed["phone"], "+14155550124")
+        self.assertEqual(listed["sms_code_url"], "https://sms.example/new")
+
+    def test_phone_pool_rejects_editing_reserved_phone(self):
+        self.client.post("/api/codex-relay/phones/import", json={
+            "text": "+14155550123----https://sms.example/code",
+        })
+        phone = self.client.get("/api/codex-relay/phones").get_json()["items"][0]
+        rows = relay._read(relay._PHONES_PATH)
+        rows[0]["reserved_job_ids"] = ["job-1"]
+        rows[0]["invalid"] = True
+        relay._write(relay._PHONES_PATH, rows)
+
+        response = self.client.put(f"/api/codex-relay/phones/{phone['id']}", json={
+            "sms_code_url": "https://sms.example/new",
+            "invalid": False,
+        })
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("任务占用", response.get_json()["error"])
+        stored = relay._read(relay._PHONES_PATH)[0]
+        self.assertTrue(stored["invalid"])
+        self.assertEqual(stored["sms_code_url"], "https://sms.example/code")
+
+    def test_phone_pool_status_can_be_manually_changed(self):
+        self.client.post("/api/codex-relay/phones/import", json={
+            "text": "+14155550123----https://sms.example/code----2",
+        })
+        phone = self.client.get("/api/codex-relay/phones").get_json()["items"][0]
+        relay._mark_phone_invalid(phone["id"], "短信验证码被拒绝")
+
+        response = self.client.put(f"/api/codex-relay/phones/{phone['id']}", json={"invalid": False})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.get_json()["phone"]["invalid"])
+        listed = self.client.get("/api/codex-relay/phones").get_json()["items"][0]
+        self.assertFalse(listed["invalid"])
+        self.assertTrue(listed["candidate"])
+        self.assertEqual(listed["available_uses"], 2)
+        self.assertEqual(listed["invalid_reason"], "")
+        self.assertEqual(listed["invalid_at"], "")
+        stored = relay._read(relay._PHONES_PATH)[0]
+        self.assertFalse(stored["invalid"])
+        self.assertNotIn("invalid_reason", stored)
+        self.assertNotIn("invalid_at", stored)
+
+        response = self.client.put(f"/api/codex-relay/phones/{phone['id']}", json={"invalid": True})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["phone"]["invalid"])
+        self.assertEqual(response.get_json()["phone"]["invalid_reason"], "人工标记失效")
+        listed = self.client.get("/api/codex-relay/phones").get_json()["items"][0]
+        self.assertFalse(listed["candidate"])
+        self.assertEqual(listed["invalid_reason"], "人工标记失效")
+        self.assertTrue(listed["invalid_at"])
+
+    def test_phone_pool_edit_preserves_status_when_omitted(self):
+        self.client.post("/api/codex-relay/phones/import", json={
+            "text": "+14155550123----https://sms.example/code----2",
+        })
+        phone = self.client.get("/api/codex-relay/phones").get_json()["items"][0]
+        relay._mark_phone_invalid(phone["id"], "短信验证码被拒绝")
+        invalid_at = relay._read(relay._PHONES_PATH)[0]["invalid_at"]
+
+        response = self.client.put(f"/api/codex-relay/phones/{phone['id']}", json={"available_uses": 3})
+
+        self.assertEqual(response.status_code, 200)
+        listed = self.client.get("/api/codex-relay/phones").get_json()["items"][0]
+        self.assertTrue(listed["invalid"])
+        self.assertFalse(listed["candidate"])
+        self.assertEqual(listed["available_uses"], 3)
+        self.assertEqual(listed["invalid_reason"], "短信验证码被拒绝")
+        self.assertEqual(listed["invalid_at"], invalid_at)
+
+    def test_phone_pool_restoring_status_keeps_exhausted_phone_unavailable(self):
+        self.client.post("/api/codex-relay/phones/import", json={
+            "text": "+14155550123----https://sms.example/code----0",
+        })
+        phone = self.client.get("/api/codex-relay/phones").get_json()["items"][0]
+        relay._mark_phone_invalid(phone["id"], "短信验证码被拒绝")
+
+        response = self.client.put(f"/api/codex-relay/phones/{phone['id']}", json={"invalid": False})
+
+        self.assertEqual(response.status_code, 200)
+        listed = self.client.get("/api/codex-relay/phones").get_json()["items"][0]
+        self.assertFalse(listed["invalid"])
+        self.assertFalse(listed["candidate"])
+        self.assertEqual(listed["available_uses"], 0)
+
+    def test_phone_pool_status_requires_boolean(self):
+        self.client.post("/api/codex-relay/phones/import", json={
+            "text": "+14155550123----https://sms.example/code",
+        })
+        phone = self.client.get("/api/codex-relay/phones").get_json()["items"][0]
+
+        response = self.client.put(f"/api/codex-relay/phones/{phone['id']}", json={"invalid": "false"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("布尔值", response.get_json()["error"])
+        self.assertFalse(relay._read(relay._PHONES_PATH)[0]["invalid"])
+
     def test_accounts_phones_and_jobs_support_independent_pagination(self):
         self.client.post("/api/codex-relay/import", json={
             "text": "\n".join([

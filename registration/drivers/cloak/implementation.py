@@ -68,7 +68,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
                     human_delay("api")
                     current_otp = None
                     continue
-            logger.info("[Cloak注册][OTP] 收到验证码：%s", current_otp)
+            logger.info("[Cloak注册][OTP] 收到验证码，准备输入：length=%s", len(str(current_otp or "")))
             _clear_otp_inputs(driver)
             _type_otp(driver, current_otp)
             human_delay("otp_input")

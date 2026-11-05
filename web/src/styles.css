@@ -138,6 +138,8 @@ tbody tr:last-child td { border-bottom: 0; }
 td strong { color: var(--ink); font-weight: 650; }
 .table-sub { display: block; margin-top: 3px; color: var(--faint); font-size: 10px; }
 .truncate { white-space: nowrap; }
+.table-link { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; overflow: hidden; color: var(--blue); text-decoration: none; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
+.table-link:hover { color: var(--accent-dark); text-decoration: underline; }
 .check-col { width: 44px; }
 .actions-col { width: 240px; }
 .row-actions { gap: 3px; flex-wrap: wrap; }

@@ -290,6 +290,10 @@ def _human_click(driver, el, *, label: str = "") -> None:
 
 def _human_type_text(driver, el, value: str, *, clear: bool = True) -> None:
     """按字符/小段输入，触发真实 key events；失败时回退 JS setter。"""
+    logger.info(
+        "%s 输入操作前：method=send_keys length=%s clear=%s",
+        _log_prefix(driver), len(value), clear,
+    )
     if not _browser_actions_enabled():
         if clear:
             try:
@@ -327,6 +331,10 @@ def _human_type_text(driver, el, value: str, *, clear: bool = True) -> None:
         while i < len(text):
             # 邮箱/密码整体仍逐字符，但偶尔 2 字符一组，节奏更自然。
             step = 2 if random.random() < 0.12 and i + 1 < len(text) else 1
+            logger.info(
+                "%s 分段输入前：method=send_keys position=%s-%s/%s length=%s",
+                _log_prefix(driver), i + 1, i + step, len(text), step,
+            )
             el.send_keys(text[i:i + step])
             i += step
             human_delay("keystroke")
@@ -338,7 +346,7 @@ def _human_type_text(driver, el, value: str, *, clear: bool = True) -> None:
             el,
         )
     except Exception as exc:
-        logger.debug("%s 人工化输入失败，回退 JS setter err=%s", _log_prefix(driver), exc)
+        logger.debug("%s 人工化输入失败，回退 JS setter error=%s", _log_prefix(driver), type(exc).__name__)
         _set_element_value(driver, el, value)
 
 
@@ -383,6 +391,7 @@ def _click_any(driver, selectors: list[str], timeout: int | None = None) -> None
 
 def _type_any(driver, selectors: list[str], value: str, timeout: int | None = None, clear: bool = True) -> None:
     el = _find_any(driver, selectors, timeout)
+    logger.info("%s 字段输入前：selectors=%s length=%s", _log_prefix(driver), selectors, len(value))
     _human_type_text(driver, el, value, clear=clear)
 
 
@@ -640,6 +649,7 @@ def _current_email_input_value(driver) -> str:
 
 def _stabilize_email_input_before_submit(driver, email: str) -> dict:
     """提交前把 DOM value / React 受控状态 / blur-change 状态统一稳定下来。"""
+    logger.info("%s 输入操作前：field=email method=js_stabilize length=%s", _log_prefix(driver), len(email))
     try:
         return driver.execute_script(r"""
         const email = String(arguments[0] || '').trim();
@@ -683,6 +693,7 @@ def _stabilize_email_input_before_submit(driver, email: str) -> dict:
 
 def _submit_email_form_stable(driver, email: str) -> dict:
     """第一次提交就按“补交成功”的方式执行：稳定 value 后 Enter + DOM click。"""
+    logger.info("%s 输入操作前：field=email method=js_form_submit length=%s", _log_prefix(driver), len(email))
     try:
         return driver.execute_script(r"""
         const email = String(arguments[0] || '').trim();
@@ -1042,6 +1053,35 @@ def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
 def _type_otp(driver, code: str) -> None:
     from selenium.webdriver.common.by import By
 
+    code = str(code or "")
+    expected_length = len(code)
+    ascii_digit_count = sum(char in "0123456789" for char in code)
+    logger.info(
+        "%s OTP 输入前：length=%s ascii_digits=%s",
+        _log_prefix(driver), expected_length, ascii_digit_count,
+    )
+
+    def log_readback(elements, mode: str) -> None:
+        try:
+            lengths = [len(str(element.get_property("value") or "")) for element in elements]
+        except Exception as exc:
+            logger.warning(
+                "%s OTP 输入后读回失败：mode=%s error=%s",
+                _log_prefix(driver), mode, type(exc).__name__,
+            )
+            return
+        actual_length = sum(lengths)
+        logger.info(
+            "%s OTP 输入后读回：mode=%s field_count=%s field_lengths=%s actual_length=%s expected_length=%s",
+            _log_prefix(driver), mode, len(lengths), ",".join(map(str, lengths)),
+            actual_length, expected_length,
+        )
+        if actual_length != expected_length:
+            logger.warning(
+                "%s OTP 输入长度不匹配：expected=%s actual=%s mode=%s",
+                _log_prefix(driver), expected_length, actual_length, mode,
+            )
+
     # 单输入框
     for selector in [
         "input[autocomplete='one-time-code']",
@@ -1051,7 +1091,9 @@ def _type_otp(driver, code: str) -> None:
     ]:
         els = [e for e in driver.find_elements(By.CSS_SELECTOR, selector) if _visible(e)]
         if len(els) == 1:
+            logger.info("%s OTP 输入操作前：mode=single selector=%s", _log_prefix(driver), selector)
             _human_type_text(driver, els[0], code, clear=True)
+            log_readback(els, "single")
             return
 
     # 6 个分格输入框
@@ -1062,13 +1104,22 @@ def _type_otp(driver, code: str) -> None:
         if any(x in attrs.lower() for x in ("numeric", "one-time", "code", "otp", "tel")):
             numeric_boxes.append(e)
     if len(numeric_boxes) >= len(code):
-        for e, ch in zip(numeric_boxes, code):
+        logger.info(
+            "%s OTP 输入操作前：mode=segmented field_count=%s expected_length=%s",
+            _log_prefix(driver), len(numeric_boxes), expected_length,
+        )
+        for index, (e, ch) in enumerate(zip(numeric_boxes, code), 1):
+            logger.info(
+                "%s OTP 分格输入前：position=%s/%s",
+                _log_prefix(driver), index, expected_length,
+            )
             if _browser_actions_enabled():
                 _human_scroll_to(driver, e)
                 time.sleep(random.uniform(0.04, 0.18))
             e.send_keys(ch)
             if _browser_actions_enabled():
                 human_delay("keystroke")
+        log_readback(numeric_boxes[:expected_length], "segmented")
         return
 
     raise RuntimeError("找不到 OTP 输入框")
@@ -1285,6 +1336,7 @@ def _is_profile_like(snapshot: dict) -> bool:
 
 def _set_element_value(driver, el, value: str) -> None:
     """兼容 React 受控输入框：用原生 setter 设置值并派发 input/change。"""
+    logger.info("%s 输入操作前：method=js_setter length=%s", _log_prefix(driver), len(value))
     driver.execute_script(r"""
     const el = arguments[0];
     const value = String(arguments[1]);
@@ -1341,7 +1393,10 @@ def _select_or_type(driver, selectors: list[str], value: str, timeout: int = 3) 
             _human_type_text(driver, el, str(value), clear=True)
         return True
     except Exception as exc:
-        logger.debug('%s 填写字段失败 selectors=%s value=%s err=%s', _log_prefix(driver), selectors, value, exc)
+        logger.debug(
+            '%s 填写字段失败 selectors=%s length=%s error=%s',
+            _log_prefix(driver), selectors, len(str(value)), type(exc).__name__,
+        )
         return False
 
 
@@ -1353,6 +1408,10 @@ def _fill_birthday_or_age(driver, birthday: str, age: int) -> str | None:
     返回 age / birthday / ymd / react_select / spinbutton / None。
     """
     y, m, d = birthday.split('-')
+    logger.info(
+        "%s 输入操作前：field=birthday_or_age method=js_setter birthday_length=%s age_length=%s",
+        _log_prefix(driver), len(birthday), len(str(age)),
+    )
     result = driver.execute_script(r"""
     const birthday = String(arguments[0]);
     const year = String(arguments[1]);
@@ -1468,9 +1527,14 @@ def _fill_birthday_or_age(driver, birthday: str, age: int) -> str | None:
             time.sleep(0.1)
             el.send_keys(mod, 'a')
             time.sleep(0.05)
+            logger.info(
+                "%s 输入操作前：method=spinbutton selector=%s length=%s",
+                _log_prefix(driver), selector, len(str(value)),
+            )
             el.send_keys(str(value))
             time.sleep(0.1)
             driver.execute_script("arguments[0].dispatchEvent(new Event('input', {bubbles:true})); arguments[0].dispatchEvent(new Event('change', {bubbles:true})); arguments[0].blur();", el)
+        logger.info("%s 输入操作前：field=birthday method=js_hidden length=%s", _log_prefix(driver), len(birthday))
         driver.execute_script(r"""
         const hidden = document.querySelector('input[name="birthday"]');
         if (hidden) {
@@ -1812,9 +1876,9 @@ def _complete_profile_page(driver, name: str, birthday: str, timeout: int = 45) 
         birth_ok = bool(birth_mode)
         if birth_ok:
             if birth_mode == 'age':
-                logger.info("%s 已填写年龄字段：%s", _log_prefix(driver), age)
+                logger.info("%s 已填写年龄字段：length=%s", _log_prefix(driver), len(str(age)))
             else:
-                logger.info("%s 已填写生日字段 mode=%s value=%s", _log_prefix(driver), birth_mode, birthday)
+                logger.info("%s 已填写生日字段 mode=%s length=%s", _log_prefix(driver), birth_mode, len(birthday))
 
         if not name_ok or not birth_ok:
             logger.warning('%s 资料页字段未填完整 name_ok=%s birth_ok=%s snapshot=%s', _log_prefix(driver), name_ok, birth_ok, snap)
@@ -2032,7 +2096,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                     human_delay("api")
                     current_otp = None
                     continue
-            logger.info("[Roxy注册][OTP] 收到验证码：%s", current_otp)
+            logger.info("[Roxy注册][OTP] 收到验证码，准备输入：length=%s", len(str(current_otp or "")))
             _clear_otp_inputs(driver)
             _type_otp(driver, current_otp)
             logger.info("[Roxy注册][OTP] 已填写邮箱验证码")

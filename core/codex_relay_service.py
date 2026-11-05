@@ -857,6 +857,7 @@ def list_phones(q: str = "", status: str = "") -> list[dict]:
                 "available_uses": available_uses,
                 "invalid": invalid,
                 "invalid_reason": row.get("invalid_reason") or "",
+                "invalid_at": row.get("invalid_at") or "",
                 "candidate": not invalid and len(reserved_ids) < available_uses,
                 "import_seq": int(row.get("seq") or 0),
                 "updated_at": row.get("updated_at"),
@@ -893,6 +894,82 @@ def delete_phones(phone_ids: list[str]) -> int:
         kept = [row for row in phones if row.get("id") not in ids]
         _write(_PHONES_PATH, kept)
         return len(phones) - len(kept)
+
+
+def update_phone(phone_id: str, data: dict) -> dict:
+    """Update one phone-pool entry without breaking existing assignments."""
+    phone_id = str(phone_id or "").strip()
+    if not phone_id:
+        raise ValueError("手机号 ID 不能为空")
+    data = data if isinstance(data, dict) else {}
+
+    with _LOCK:
+        accounts = _read(_ACCOUNTS_PATH)
+        phones = _read(_PHONES_PATH)
+        _ensure_assignments_locked(accounts, phones)
+        row = next((item for item in phones if str(item.get("id") or "") == phone_id), None)
+        if row is None:
+            raise ValueError("手机号不存在")
+        if _active_reservation_ids(row):
+            raise ValueError("任务占用中的手机号不能编辑")
+
+        current_phone = _normalize_phone(row.get("phone") or "")
+        phone_value = _normalize_phone(data.get("phone") if "phone" in data else current_phone)
+        sms_url = str(data.get("sms_code_url") if "sms_code_url" in data else row.get("sms_code_url") or "").strip()
+        assigned_ids = _id_list(row.get("assigned_account_ids") or row.get("assigned_account_id"))
+
+        if not 7 <= len(phone_value.lstrip("+")) <= 15:
+            raise ValueError("手机号长度错误")
+        if not _valid_url(sms_url):
+            raise ValueError("短信取码 URL 必须是 http(s) 地址")
+        if phone_value != current_phone and assigned_ids:
+            raise ValueError("已绑定账号的手机号不能修改")
+        if phone_value != current_phone and any(
+            item is not row and _phone_key(item.get("phone")) == _phone_key(phone_value)
+            for item in phones
+        ):
+            raise ValueError("手机号已存在")
+
+        if "available_uses" in data:
+            try:
+                available_uses = int(data.get("available_uses"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("手机号可用次数必须是 0、1、2 或 3") from exc
+            if available_uses not in range(_PHONE_AVAILABLE_MAX + 1):
+                raise ValueError("手机号可用次数必须是 0、1、2 或 3")
+        else:
+            try:
+                available_uses = int(row.get("available_uses"))
+            except (TypeError, ValueError):
+                available_uses = _PHONE_AVAILABLE_DEFAULT
+            available_uses = max(0, min(_PHONE_AVAILABLE_MAX, available_uses))
+
+        if "invalid" in data and type(data["invalid"]) is not bool:
+            raise ValueError("号码失效状态必须是布尔值")
+
+        row["phone"] = phone_value
+        row["sms_code_url"] = sms_url
+        row["available_uses"] = available_uses
+        if data.get("invalid") is True and not row.get("invalid"):
+            row["invalid_reason"] = "人工标记失效"
+            row["invalid_at"] = _now()
+        elif data.get("invalid") is False:
+            row.pop("invalid_reason", None)
+            row.pop("invalid_at", None)
+        if "invalid" in data:
+            row["invalid"] = data["invalid"]
+        row["updated_at"] = _now()
+        _write(_ACCOUNTS_PATH, accounts)
+        _write(_PHONES_PATH, phones)
+        return {
+            "id": row.get("id"),
+            "phone": row.get("phone") or "",
+            "sms_code_url": row.get("sms_code_url") or "",
+            "available_uses": row.get("available_uses"),
+            "invalid": bool(row.get("invalid")),
+            "invalid_reason": row.get("invalid_reason") or "",
+            "invalid_at": row.get("invalid_at") or "",
+        }
 
 
 def adjust_phone_available_uses(phone_ids: list[str], delta: int) -> dict:
@@ -3354,7 +3431,7 @@ def _run_job(
 
         def sms_failure_provider(_activation_id):
             if phone_state.get("phone_id") and not _stop_event(job_id).is_set():
-                _mark_phone_invalid(phone_state["phone_id"], "短信接码失败或取码 URL 失效")
+                _mark_phone_invalid(phone_state["phone_id"], "短信验证未通过，需核验号码、接码链接或验证码")
 
         def sms_success_provider():
             if phone_state.get("phone_id") and not phone_state.get("consumed"):

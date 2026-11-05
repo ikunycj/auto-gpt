@@ -2420,6 +2420,14 @@ def create_app(auth_code: str | None = None) -> Flask:
             return jsonify(_paginate_items(rows, page=max(1, int(page_arg or 1)), page_size=page_size_arg or 20))
         return jsonify({"ok": True, "items": rows, "total": len(rows)})
 
+    @app.put("/api/codex-relay/phones/<phone_id>")
+    def api_codex_relay_update_phone(phone_id: str):
+        data = request.get_json(silent=True) or {}
+        try:
+            return jsonify({"ok": True, "phone": codex_relay_service.update_phone(phone_id, data)})
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
     @app.delete("/api/codex-relay/phones")
     def api_codex_relay_delete_phones():
         data = request.get_json(silent=True) or {}

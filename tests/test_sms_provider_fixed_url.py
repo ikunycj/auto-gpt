@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import unittest
+import json
 from unittest.mock import patch
 
 from config import codex as codex_config
@@ -25,6 +26,18 @@ class _Http:
 
 
 class FixedUrlSmsProviderTests(unittest.TestCase):
+    def test_fixed_sms_parser_extracts_six_digits_from_api_json(self):
+        body = json.dumps({
+            "code": True,
+            "message": "Your OpenAI verification code is: 102669",
+            "expireTime": "2026-11-16 14:21:45",
+        })
+
+        code = sms_provider._fixed_sms_code(body)
+
+        self.assertEqual(code, "102669")
+        self.assertEqual(len(code), 6)
+
     def test_config_is_registered_as_secret_webui_fields(self):
         self.assertIn("FIXED_SMS_CODE_URL", env_loader.SECRET_ENV_KEYS)
         fields = {field["key"]: field for field in config_editor.EDITABLE_FIELDS}

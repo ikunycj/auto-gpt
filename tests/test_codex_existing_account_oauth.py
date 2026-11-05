@@ -7,6 +7,8 @@ import pytest
 
 from core import codex_oauth
 from core import roxy_codex_oauth as browser_oauth
+from registration.drivers.browser_use import implementation as browser_use_driver
+from registration.drivers.roxy import implementation as roxy_driver
 
 
 class FakeDriver:
@@ -21,6 +23,178 @@ class FakeChallengeDriver(FakeDriver):
 
     def execute_script(self, _script):
         return ["Just a moment...", "Performing security verification"]
+
+
+class FakeOtpInput:
+    def __init__(self, attrs=None):
+        self.attrs = attrs or {}
+        self.value = ""
+
+    def is_displayed(self):
+        return True
+
+    def is_enabled(self):
+        return True
+
+    def get_attribute(self, name):
+        return self.attrs.get(name, "")
+
+    def get_property(self, name):
+        return self.value if name == "value" else None
+
+    def send_keys(self, value):
+        self.value += str(value)
+
+    def fill(self, value):
+        self.value = str(value)
+
+    def input_value(self, timeout=0):
+        return self.value
+
+
+class FakeOtpDriver:
+    def __init__(self, inputs, single_input=False):
+        self.inputs = inputs
+        self.single_input = single_input
+
+    def find_elements(self, _by, selector):
+        if selector == "input":
+            return self.inputs
+        if self.single_input and selector == "input[autocomplete='one-time-code']":
+            return self.inputs
+        return []
+
+
+def test_roxy_otp_logs_expected_and_readback_lengths_without_logging_code(caplog, monkeypatch):
+    otp_input = FakeOtpInput()
+    input_events = []
+
+    def type_truncated_code(_driver, element, code, *, clear):
+        input_events.append(any("OTP 输入操作前" in record.message for record in caplog.records))
+        element.value = code[:-1]
+
+    monkeypatch.setattr(roxy_driver, "_human_type_text", type_truncated_code)
+    with caplog.at_level("INFO", logger=roxy_driver.logger.name):
+        roxy_driver._type_otp(FakeOtpDriver([otp_input], single_input=True), "102669")
+
+    messages = [record.message for record in caplog.records]
+    assert input_events == [True]
+    assert any("OTP 输入前：length=6 ascii_digits=6" in message for message in messages)
+    assert any("OTP 输入后读回：mode=single" in message and "actual_length=5" in message for message in messages)
+    assert any("OTP 输入长度不匹配：expected=6 actual=5" in message for message in messages)
+    assert "102669" not in caplog.text
+
+
+def test_roxy_otp_logs_before_each_segmented_character(caplog, monkeypatch):
+    inputs = [FakeOtpInput({"inputmode": "numeric", "aria-label": f"digit {index}"}) for index in range(6)]
+    monkeypatch.setattr(roxy_driver, "_browser_actions_enabled", lambda: False)
+
+    with caplog.at_level("INFO", logger=roxy_driver.logger.name):
+        roxy_driver._type_otp(FakeOtpDriver(inputs), "102669")
+
+    messages = [record.message for record in caplog.records]
+    before_character = [message for message in messages if "OTP 分格输入前" in message]
+    assert len(before_character) == 6
+    assert all(f"position={index}/6" in message for index, message in enumerate(before_character, 1))
+    assert any("OTP 输入后读回：mode=segmented" in message and "actual_length=6" in message for message in messages)
+    assert "102669" not in caplog.text
+
+
+def test_roxy_otp_readback_failure_is_logged_without_exposing_values(caplog, monkeypatch):
+    otp_input = FakeOtpInput()
+
+    def unavailable_property(_name):
+        raise RuntimeError("private-input-value")
+
+    monkeypatch.setattr(otp_input, "get_property", unavailable_property)
+    monkeypatch.setattr(roxy_driver, "_human_type_text", lambda *_args, **_kwargs: None)
+
+    with caplog.at_level("INFO", logger=roxy_driver.logger.name):
+        roxy_driver._type_otp(FakeOtpDriver([otp_input], single_input=True), "102669")
+
+    assert "OTP 输入后读回失败：mode=single error=RuntimeError" in caplog.text
+    assert "actual_length=" not in caplog.text
+    assert "private-input-value" not in caplog.text
+    assert "102669" not in caplog.text
+
+
+def test_roxy_text_input_logs_before_each_keystroke_without_logging_text(caplog, monkeypatch):
+    otp_input = FakeOtpInput()
+    input_events = []
+    send_keys = otp_input.send_keys
+
+    def capture_before_input(value):
+        input_events.append(any("输入操作前" in record.message for record in caplog.records))
+        send_keys(value)
+
+    monkeypatch.setattr(otp_input, "send_keys", capture_before_input)
+    monkeypatch.setattr(roxy_driver, "_browser_actions_enabled", lambda: False)
+
+    with caplog.at_level("INFO", logger=roxy_driver.logger.name):
+        roxy_driver._human_type_text(FakeOtpDriver([otp_input]), otp_input, "private-text", clear=False)
+
+    assert input_events == [True]
+    assert "length=12 clear=False" in caplog.text
+    assert "private-text" not in caplog.text
+
+
+def test_browser_use_otp_logs_before_filling_and_reports_truncation(caplog, monkeypatch):
+    otp_input = FakeOtpInput()
+    input_events = []
+
+    def fill_truncated_code(_page, _selectors, code, timeout_ms):
+        input_events.append(any("[OTP] 输入操作前" in record.message for record in caplog.records))
+        otp_input.fill(code[:-1])
+        return True
+
+    monkeypatch.setattr(browser_use_driver, "_fill_first", fill_truncated_code)
+    monkeypatch.setattr(browser_use_driver, "_visible_locator", lambda *_args, **_kwargs: otp_input)
+
+    with caplog.at_level("INFO", logger=browser_use_driver.logger.name):
+        browser_use_driver._type_otp(object(), "102669")
+
+    assert input_events == [True]
+    assert "[OTP] 输入前：length=6 ascii_digits=6" in caplog.text
+    assert "actual_length=5 expected_length=6" in caplog.text
+    assert "[OTP] 输入长度不匹配：expected=6 actual=5 mode=single" in caplog.text
+    assert "102669" not in caplog.text
+
+
+def test_browser_use_text_input_logs_before_fill_without_logging_text(caplog, monkeypatch):
+    input_events = []
+    locator = SimpleNamespace(
+        scroll_into_view_if_needed=lambda **_kwargs: None,
+        click=lambda **_kwargs: None,
+        fill=lambda _value, **_kwargs: input_events.append(
+            any("输入操作前" in record.message for record in caplog.records)
+        ),
+    )
+    monkeypatch.setattr(browser_use_driver, "_visible_locator", lambda *_args, **_kwargs: locator)
+
+    with caplog.at_level("INFO", logger=browser_use_driver.logger.name):
+        assert browser_use_driver._fill_first(object(), ["input[name='email']"], "private@example.com")
+
+    assert input_events == [True]
+    assert "length=19" in caplog.text
+    assert "private@example.com" not in caplog.text
+
+
+def test_browser_use_otp_logs_segmented_input_progress(caplog, monkeypatch):
+    inputs = [FakeOtpInput() for _ in range(6)]
+    boxes = SimpleNamespace(count=lambda: len(inputs), nth=lambda index: inputs[index])
+    page = SimpleNamespace(locator=lambda _selector: boxes)
+    monkeypatch.setattr(browser_use_driver, "_fill_first", lambda *_args, **_kwargs: False)
+
+    with caplog.at_level("INFO", logger=browser_use_driver.logger.name):
+        browser_use_driver._type_otp(page, "102669")
+
+    messages = [record.message for record in caplog.records]
+    before_character = [message for message in messages if "[OTP] 分格输入前" in message]
+    assert len(before_character) == 6
+    assert all(f"position={index}/6" in message for index, message in enumerate(before_character, 1))
+    assert [element.value for element in inputs] == list("102669")
+    assert "mode=segmented field_count=6 field_lengths=1,1,1,1,1,1 actual_length=6 expected_length=6" in caplog.text
+    assert "102669" not in caplog.text
 
 
 def test_password_login_errors_are_not_treated_as_already_logged_in(monkeypatch):

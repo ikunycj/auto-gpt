@@ -14,11 +14,18 @@ class _Keyboard:
 
 
 class _Locator:
-    def __init__(self):
+    def __init__(self, value=""):
         self.clicks = 0
+        self.value = value
 
     def click(self, timeout=0):
         self.clicks += 1
+
+    def evaluate(self, expression, arg=None, timeout=0):
+        assert expression == "(el, propertyName) => el[propertyName]"
+        if arg == "value":
+            return self.value
+        return None
 
 
 class _Page:
@@ -51,6 +58,15 @@ def test_send_keys_maps_selenium_backspace_to_keyboard_key():
 
     assert page.keyboard.pressed == ["Backspace"]
     assert page.keyboard.typed == []
+
+
+def test_get_property_reads_live_dom_value_for_otp_diagnostics():
+    locator = _Locator(value="12345")
+    element = CloakElement(_Page(), locator=locator)
+
+    assert element.get_property("value") == "12345"
+    locator.value = "123456"
+    assert element.get_property("value") == "123456"
 
 
 def test_window_controls_minimize_and_restore_the_current_cloak_window():

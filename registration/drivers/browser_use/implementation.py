@@ -173,12 +173,20 @@ def _fill_first(page, selectors: list[str], value: str, timeout_ms: int | None =
             try:
                 loc.scroll_into_view_if_needed(timeout=2000)
                 loc.click(timeout=2000)
+                logger.info(
+                    "[%s] 输入操作前：method=fill selectors=%s length=%s",
+                    _log_provider_label(), selectors, len(value),
+                )
                 loc.fill(value, timeout=5000)
                 return True
             except Exception as exc:
                 last_err = exc
                 # React 受控输入兜底
                 try:
+                    logger.info(
+                        "[%s] 输入操作前：method=js_setter selectors=%s length=%s",
+                        _log_provider_label(), selectors, len(value),
+                    )
                     loc.evaluate(
                         """(el, value) => {
                           const proto = el.tagName === 'TEXTAREA'
@@ -196,7 +204,7 @@ def _fill_first(page, selectors: list[str], value: str, timeout_ms: int | None =
                     last_err = exc2
         time.sleep(0.15 if _fast_mode() else 0.3)
     if last_err:
-        logger.debug("[BrowserUse] fill failed: %s", last_err)
+        logger.debug("[BrowserUse] fill failed: %s", type(last_err).__name__)
     return False
 
 
@@ -667,21 +675,58 @@ def _type_otp(page, code: str) -> None:
     code = str(code or "").strip()
     if not code:
         raise RuntimeError("OTP 为空")
+    expected_length = len(code)
+    ascii_digit_count = sum(char in "0123456789" for char in code)
+    logger.info(
+        "[%s][OTP] 输入前：length=%s ascii_digits=%s",
+        _log_provider_label(), expected_length, ascii_digit_count,
+    )
+
+    def log_readback(elements, mode: str) -> None:
+        try:
+            lengths = [len(element.input_value(timeout=1000)) for element in elements]
+        except Exception as exc:
+            logger.warning(
+                "[%s][OTP] 输入后读回失败：mode=%s error=%s",
+                _log_provider_label(), mode, type(exc).__name__,
+            )
+            return
+        actual_length = sum(lengths)
+        logger.info(
+            "[%s][OTP] 输入后读回：mode=%s field_count=%s field_lengths=%s actual_length=%s expected_length=%s",
+            _log_provider_label(), mode, len(lengths), ",".join(map(str, lengths)),
+            actual_length, expected_length,
+        )
+        if actual_length != expected_length:
+            logger.warning(
+                "[%s][OTP] 输入长度不匹配：expected=%s actual=%s mode=%s",
+                _log_provider_label(), expected_length, actual_length, mode,
+            )
 
     # 单框
+    single_selectors = [
+        "input[name='code']",
+        "input[autocomplete='one-time-code']",
+        "input[name='otp']",
+        "input[aria-label*='code' i]",
+        "input[placeholder*='code' i]",
+        "input[inputmode='numeric']",
+    ]
+    logger.info(
+        "[%s][OTP] 输入操作前：mode=single expected_length=%s",
+        _log_provider_label(), expected_length,
+    )
     if _fill_first(
         page,
-        [
-            "input[name='code']",
-            "input[autocomplete='one-time-code']",
-            "input[name='otp']",
-            "input[aria-label*='code' i]",
-            "input[placeholder*='code' i]",
-            "input[inputmode='numeric']",
-        ],
+        single_selectors,
         code,
         timeout_ms=5000,
     ):
+        element = _visible_locator(page, single_selectors, timeout_ms=800)
+        if element is None:
+            logger.warning("[%s][OTP] 输入后读回不可用：mode=single reason=input_missing", _log_provider_label())
+        else:
+            log_readback([element], "single")
         return
 
     # 多分框 6 位
@@ -691,8 +736,17 @@ def _type_otp(page, code: str) -> None:
     except Exception:
         count = 0
     if count >= len(code):
+        logger.info(
+            "[%s][OTP] 输入操作前：mode=segmented field_count=%s expected_length=%s",
+            _log_provider_label(), count, expected_length,
+        )
         for i, ch in enumerate(code):
+            logger.info(
+                "[%s][OTP] 分格输入前：position=%s/%s",
+                _log_provider_label(), i + 1, expected_length,
+            )
             boxes.nth(i).fill(ch)
+        log_readback([boxes.nth(i) for i in range(expected_length)], "segmented")
         return
     raise RuntimeError("找不到 OTP 输入框")
 
@@ -921,6 +975,10 @@ def _fill_birthday_fields(page, birthday: str) -> None:
         if loc is None:
             continue
         try:
+            logger.info(
+                "[%s] 输入操作前：field=birthday selectors=%s length=%s",
+                _log_provider_label(), selectors, len(value),
+            )
             tag = (loc.evaluate("el => el.tagName") or "").lower()
             if tag == "select":
                 try:
@@ -931,6 +989,10 @@ def _fill_birthday_fields(page, birthday: str) -> None:
                 loc.fill(value)
         except Exception:
             try:
+                logger.info(
+                    "[%s] 输入操作前：field=birthday method=fill_fallback selectors=%s length=%s",
+                    _log_provider_label(), selectors, len(value),
+                )
                 loc.fill(value)
             except Exception:
                 pass
@@ -995,12 +1057,20 @@ def _fill_spinbutton_birthday(page, birthday: str) -> bool:
             loc.scroll_into_view_if_needed(timeout=1500)
             loc.click(timeout=1500)
             page.keyboard.press("Meta+A")
+            logger.info(
+                "[%s] 输入操作前：method=keyboard selector=%s length=%s",
+                _log_provider_label(), selector, len(str(value)),
+            )
             page.keyboard.type(str(value), delay=10 if _fast_mode() else 40)
             loc.evaluate("el => { el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); el.blur?.(); }")
             ok = True
         except Exception:
             try:
                 page.keyboard.press("Control+A")
+                logger.info(
+                    "[%s] 输入操作前：method=keyboard_fallback selector=%s length=%s",
+                    _log_provider_label(), selector, len(str(value)),
+                )
                 page.keyboard.type(str(value), delay=10 if _fast_mode() else 40)
                 ok = True
             except Exception:
@@ -1026,6 +1096,10 @@ def _fill_spinbutton_birthday(page, birthday: str) -> bool:
 
 def _js_complete_profile(page, name: str, birthday: str) -> dict:
     """JS 兜底处理 about-you/profile：填 name/age/生日/checkbox 并提交。"""
+    logger.info(
+        "[%s] 输入操作前：field=profile method=js_setter name_length=%s birthday_length=%s",
+        _log_provider_label(), len(name), len(birthday),
+    )
     try:
         year, month, day = [int(x) for x in birthday.split("-")]
     except Exception:
@@ -1811,7 +1885,7 @@ def run_browser_use_registration(
                         _restart_email_otp_flow("等待验证码超时，避免点击 resend 导致 500/chrome-error")
                         current_otp = None
                         continue
-                logger.info("[BrowserUse][OTP] 收到验证码：%s", current_otp)
+                logger.info("[BrowserUse][OTP] 收到验证码，准备输入：length=%s", len(str(current_otp or "")))
                 _t_otp_submit = _StepTimer("提交邮箱 OTP")
                 _clear_otp_inputs(page)
                 _type_otp(page, current_otp)
