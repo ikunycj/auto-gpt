@@ -8,7 +8,7 @@ export const statusLabels = {
   available: '可用', used: '已使用', failed: '失败', disabled: '已禁用',
   pending: '排队中', running: '运行中', stopping: '停止中', success: '成功',
   completed: '完成', cancelled: '已取消', stopped: '已停止', partial_success: '部分成功',
-  authorized: '已授权', not_authorized: '未授权', retrying: '补跑中', deactivated: '已禁用',
+  authorized: '已授权', not_authorized: '未授权', reauthorize: '需重新授权', retrying: '补跑中', deactivated: '已禁用',
   queued: '排队中', error: '错误', unknown: '未知', alive: '存活', dead: '失效',
 };
 

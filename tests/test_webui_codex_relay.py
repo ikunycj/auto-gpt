@@ -62,6 +62,20 @@ class CodexRelayWebUiTests(unittest.TestCase):
         self.assertIn("JBSWY3DPEHPK3PXP", serialized)
         self.assertIn("https://sms.example/code", phone_response.get_data(as_text=True))
 
+    def test_account_status_filter_includes_codex_failures(self):
+        self.client.post("/api/codex-relay/import", json={
+            "text": "failed@example.com----https://mail.example/code\nauthorized@example.com----https://mail.example/other",
+        })
+        accounts = relay._read(relay._ACCOUNTS_PATH)
+        relay._update_account(accounts[0]["id"], codex_status="failed", last_status="failed")
+        relay._update_account(accounts[1]["id"], codex_status="authorized", liveness_status="alive")
+
+        failed = self.client.get("/api/codex-relay/accounts?status=failed").get_json()
+        authorized = self.client.get("/api/codex-relay/accounts?status=authorized").get_json()
+
+        self.assertEqual([row["email"] for row in failed["items"]], ["failed@example.com"])
+        self.assertEqual([row["email"] for row in authorized["items"]], ["authorized@example.com"])
+
     def test_verification_requires_matching_wait_state(self):
         relay._write(relay._JOBS_PATH, [{
             "id": "job-1", "email": "user@example.com", "status": "waiting_sms",
@@ -278,6 +292,60 @@ class CodexRelayWebUiTests(unittest.TestCase):
         self.assertEqual(listed["available_uses"], 3)
         self.assertEqual(listed["invalid_reason"], "短信验证码被拒绝")
         self.assertEqual(listed["invalid_at"], invalid_at)
+
+    def test_phone_pool_lists_bound_account_email(self):
+        self.client.post("/api/codex-relay/import", json={
+            "text": "bound@example.com----https://mail.example/code",
+        })
+        self.client.post("/api/codex-relay/phones/import", json={
+            "text": "+14155550123----https://sms.example/code----1",
+        })
+        account = relay._read(relay._ACCOUNTS_PATH)[0]
+        phone = relay._read(relay._PHONES_PATH)[0]
+        relay._bind_verified_phone(
+            account["id"], phone["id"], phone["phone"], phone["sms_code_url"],
+        )
+
+        response = self.client.get("/api/codex-relay/phones")
+
+        self.assertEqual(response.status_code, 200)
+        listed = response.get_json()["items"][0]
+        self.assertEqual(listed["assigned_account_email"], "bound@example.com")
+        self.assertEqual(listed["assigned_account_emails"], ["bound@example.com"])
+
+    def test_phone_pool_delete_removes_unbound_phone(self):
+        self.client.post("/api/codex-relay/phones/import", json={
+            "text": "+14155550123----https://sms.example/code",
+        })
+        phone = self.client.get("/api/codex-relay/phones").get_json()["items"][0]
+
+        response = self.client.delete("/api/codex-relay/phones", json={
+            "phone_ids": [phone["id"]],
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["deleted"], 1)
+        self.assertEqual(self.client.get("/api/codex-relay/phones").get_json()["items"], [])
+
+    def test_phone_pool_delete_rejects_bound_phone(self):
+        self.client.post("/api/codex-relay/import", json={
+            "text": "bound@example.com----https://mail.example/code",
+        })
+        self.client.post("/api/codex-relay/phones/import", json={
+            "text": "+14155550123----https://sms.example/code----1",
+        })
+        account = relay._read(relay._ACCOUNTS_PATH)[0]
+        phone = relay._read(relay._PHONES_PATH)[0]
+        relay._bind_verified_phone(
+            account["id"], phone["id"], phone["phone"], phone["sms_code_url"],
+        )
+
+        response = self.client.delete("/api/codex-relay/phones", json={
+            "phone_ids": [phone["id"]],
+        })
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("已绑定账号", response.get_json()["error"])
 
     def test_phone_pool_restoring_status_keeps_exhausted_phone_unavailable(self):
         self.client.post("/api/codex-relay/phones/import", json={

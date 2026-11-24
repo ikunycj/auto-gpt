@@ -806,9 +806,30 @@ def test_account_filters_cover_provider_status_and_materials(relay_storage):
     )
     rows = relay._read(relay._ACCOUNTS_PATH)
     relay._update_account(rows[0]["id"], codex_status="authorized", liveness_status="alive", quota_status="available", totp_secret="SECRET")
+    relay._update_account(rows[1]["id"], codex_status="failed", last_status="failed")
     assert [row["email"] for row in relay.list_accounts(provider="outlook")] == ["outlook@example.com"]
     assert [row["email"] for row in relay.list_accounts(codex_status="authorized", liveness="alive", quota_status="available", twofa="enabled")] == ["outlook@example.com"]
+    failed = relay.list_accounts(status="failed")
+    assert [row["email"] for row in failed] == ["api@example.com"]
+    assert failed[0]["account_status"] == "failed"
+    assert failed[0]["liveness_status"] == "unknown"
+    assert [row["email"] for row in relay.list_accounts(status="authorized")] == ["outlook@example.com"]
     assert {row["email"] for row in relay.list_accounts(phone_status="unbound")} == {"api@example.com", "outlook@example.com"}
+
+
+def test_unified_account_status_keeps_gpt_liveness_as_a_detail():
+    assert relay._public_account({
+        "codex_status": "authorized", "liveness_status": "alive",
+    })["account_status"] == "authorized"
+    assert relay._public_account({
+        "codex_status": "authorized", "liveness_status": "unknown",
+    })["account_status"] == "authorized"
+    assert relay._public_account({
+        "codex_status": "not_authorized", "last_status": "failed",
+    })["account_status"] == "failed"
+    assert relay._public_account({
+        "codex_status": "authorized", "liveness_status": "dead",
+    })["account_status"] == "deactivated"
 
 
 def test_manual_codes_are_isolated_by_job_and_stage(relay_storage):

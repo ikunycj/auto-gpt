@@ -134,6 +134,18 @@ def _terminal_codex_status(*values: object) -> str:
     return ""
 
 
+def _unified_account_status(codex_status: str, liveness_status: str, last_status: str) -> str:
+    if codex_status == "deactivated" or liveness_status == "dead":
+        return "deactivated"
+    if codex_status == "failed" or last_status == "failed":
+        return "failed"
+    if codex_status == "reauthorize":
+        return "reauthorize"
+    if codex_status == "authorized":
+        return "authorized"
+    return "not_authorized"
+
+
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -652,6 +664,12 @@ def _public_account(row: dict) -> dict:
         codex_status = "deactivated"
     if codex_status not in ("not_authorized", "authorized", "reauthorize", "failed", "deactivated", "deleted"):
         codex_status = "failed" if row.get("last_status") == "failed" else "not_authorized"
+    liveness_status = str(row.get("liveness_status") or "unknown")
+    account_status = _unified_account_status(
+        codex_status,
+        liveness_status,
+        str(row.get("last_status") or ""),
+    )
     chatgpt_password = str(row.get("chatgpt_password") or "")
     mailbox_password = str(row.get("mailbox_password") or "")
     return {
@@ -677,9 +695,10 @@ def _public_account(row: dict) -> dict:
         "phone_verified_at": row.get("phone_verified_at") or "",
         "last_sms_phone": row.get("last_sms_phone") or "",
         "last_sms_code_url": row.get("last_sms_code_url") or "",
+        "account_status": account_status,
         "codex_status": codex_status,
         "codex_authorized_at": row.get("codex_authorized_at") or "",
-        "liveness_status": row.get("liveness_status") or "unknown",
+        "liveness_status": liveness_status,
         "liveness_checked_at": row.get("liveness_checked_at") or "",
         "email_liveness_status": row.get("email_liveness_status") or "unknown",
         "email_liveness_checked_at": row.get("email_liveness_checked_at") or "",
@@ -791,7 +810,7 @@ def list_accounts(
     if q:
         rows = [x for x in rows if q in str(x.get("email") or "").lower()]
     if status:
-        rows = [x for x in rows if x.get("last_status") == status]
+        rows = [x for x in rows if x.get("account_status") == status]
     if provider:
         rows = [x for x in rows if x.get("email_provider") == provider]
     if codex_status:
